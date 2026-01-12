@@ -13,7 +13,7 @@ for T in [
     NetLib.SimpleNetHP, NetLib.ResNetHP,
     # Parameters
     Params, SelfPlayParams, LearningParams, ArenaParams,
-    SimParams, MctsParams, MemAnalysisParams,
+    SimParams, MctsParams, MemAnalysisParams, ProgressiveSimParams,
     # Optimisers
     CyclicNesterov, Adam,
     # Schedules

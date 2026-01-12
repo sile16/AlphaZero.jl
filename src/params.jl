@@ -275,20 +275,61 @@ than good values for middlegame positions).
 end
 
 """
+    ProgressiveSimParams
+
+Parameters for progressive simulation budget during training.
+
+| Parameter    | Type   | Description                                      |
+|:-------------|:-------|:-------------------------------------------------|
+| `sim_min`    | `Int`  | Minimum simulations per turn (early iterations)  |
+| `sim_max`    | `Int`  | Maximum simulations per turn (late iterations)   |
+
+# Explanation
+
+Progressive simulation allocates fewer MCTS simulations in early iterations
+when the neural network is still weak, and gradually increases the budget
+as training progresses. This improves training efficiency by avoiding
+wasted computation on unreliable early-stage evaluations.
+
+The simulation budget for iteration `i` out of `num_iters` total iterations
+is computed using linear interpolation: `sim_min + (sim_max - sim_min) * i / num_iters`
+
+Reference: "MiniZero: Comparative Analysis of AlphaZero and MuZero on Go, Othello, and Atari Games"
+(arXiv:2310.11305)
+"""
+@kwdef struct ProgressiveSimParams
+  sim_min :: Int
+  sim_max :: Int
+end
+
+"""
+Compute the simulation budget for a given iteration.
+
+    compute_sim_budget(params::ProgressiveSimParams, iter::Int, num_iters::Int) :: Int
+
+Returns the number of MCTS simulations to use at iteration `iter`.
+"""
+function compute_sim_budget(params::ProgressiveSimParams, iter::Int, num_iters::Int)
+  t = iter / num_iters
+  return round(Int, params.sim_min + (params.sim_max - params.sim_min) * t)
+end
+
+"""
     Params
 
 The AlphaZero training hyperparameters.
 
-| Parameter                  | Type                                | Default   |
-|:---------------------------|:------------------------------------|:----------|
-| `self_play`                | [`SelfPlayParams`](@ref)            |  -        |
-| `learning`                 | [`LearningParams`](@ref)            |  -        |
-| `arena`                    | `Union{Nothing, ArenaParams}`       |  -        |
-| `memory_analysis`          | `Union{Nothing, MemAnalysisParams}` | `nothing` |
-| `num_iters`                | `Int`                               |  -        |
-| `use_symmetries`           | `Bool`                              | `false`   |
-| `ternary_outcome`          | `Bool`                              | `false`   |
-| `mem_buffer_size`          | `PLSchedule{Int}`                   |  -        |
+| Parameter                  | Type                                     | Default   |
+|:---------------------------|:-----------------------------------------|:----------|
+| `self_play`                | [`SelfPlayParams`](@ref)                 |  -        |
+| `learning`                 | [`LearningParams`](@ref)                 |  -        |
+| `arena`                    | `Union{Nothing, ArenaParams}`            |  -        |
+| `memory_analysis`          | `Union{Nothing, MemAnalysisParams}`      | `nothing` |
+| `progressive_sim`          | `Union{Nothing, ProgressiveSimParams}`   | `nothing` |
+| `num_iters`                | `Int`                                    |  -        |
+| `use_symmetries`           | `Bool`                                   | `false`   |
+| `ternary_outcome`          | `Bool`                                   | `false`   |
+| `mem_buffer_size`          | `PLSchedule{Int}`                        |  -        |
 
 # Explanation
 
@@ -311,6 +352,9 @@ iteration can be decomposed into a self-play phase
   - `memory_analysis`: parameters for the memory analysis step that is
      performed at each iteration (see [`MemAnalysisParams`](@ref)), or
      `nothing` if no analysis is to be performed.
+  - `progressive_sim`: parameters for progressive simulation budget
+     (see [`ProgressiveSimParams`](@ref)), or `nothing` to use constant
+     simulation budget from `self_play.mcts.num_iters_per_turn`.
 
 # AlphaGo Zero Parameters
 
@@ -322,6 +366,7 @@ In the original AlphaGo Zero paper:
 @kwdef struct Params
   self_play :: SelfPlayParams
   memory_analysis :: Union{Nothing, MemAnalysisParams} = nothing
+  progressive_sim :: Union{Nothing, ProgressiveSimParams} = nothing
   learning :: LearningParams
   arena :: Union{Nothing, ArenaParams}
   num_iters :: Int

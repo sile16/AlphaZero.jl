@@ -401,6 +401,7 @@ end
 function print_report(logger::Logger, report::Report.SelfPlay)
   sspeed = format(round(Int, report.samples_gen_speed), commas=true)
   Log.print(logger, "Generating $(sspeed) samples per second on average")
+  Log.print(logger, "MCTS simulations per turn: $(report.num_sims_per_turn)")
   avgdepth = pyfmt(".1f", report.average_exploration_depth)
   Log.print(logger, "Average exploration depth: $avgdepth")
   memf = format(report.mcts_memory_footprint, autoscale=:metric, precision=2)
@@ -472,7 +473,14 @@ end
 
 function Handlers.self_play_started(session::Session)
   ngames = session.env.params.self_play.sim.num_games
-  Log.section(session.logger, 2, "Starting self-play")
+  env = session.env
+  # Compute simulation budget for logging
+  sim_budget = if isnothing(env.params.progressive_sim)
+    env.params.self_play.mcts.num_iters_per_turn
+  else
+    compute_sim_budget(env.params.progressive_sim, env.itc, env.params.num_iters)
+  end
+  Log.section(session.logger, 2, "Starting self-play ($(sim_budget) sims/turn)")
   session.progress = Log.Progress(session.logger, ngames)
 end
 

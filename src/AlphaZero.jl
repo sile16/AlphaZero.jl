@@ -71,6 +71,7 @@ module AlphaZero
   export LearningParams
   export ArenaParams
   export MemAnalysisParams
+  export ProgressiveSimParams, compute_sim_budget
   export SamplesWeighingPolicy, CONSTANT_WEIGHT, LOG_WEIGHT, LINEAR_WEIGHT
 
   # Stats about training

@@ -27,6 +27,7 @@ module Examples
     "grid-world" => GridWorld.Training.experiment,
     "tictactoe" => Tictactoe.Training.experiment,
     "connect-four" => ConnectFour.Training.experiment,
+    "connect-four-progressive" => ConnectFour.TrainingProgressive.experiment,
     "mancala" => Mancala.Training.experiment)
     # "ospiel_ttt" => OSpielTictactoe.Training.experiment
 

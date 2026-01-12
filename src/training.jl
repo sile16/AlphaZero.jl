@@ -275,10 +275,18 @@ end
 function self_play_step!(env::Env, handler)
   params = env.params.self_play
   Handlers.self_play_started(handler)
+  # Compute MCTS params, potentially with progressive simulation budget
+  mcts_params = if isnothing(env.params.progressive_sim)
+    params.mcts
+  else
+    sim_budget = compute_sim_budget(
+      env.params.progressive_sim, env.itc, env.params.num_iters)
+    MctsParams(params.mcts, num_iters_per_turn=sim_budget)
+  end
   make_oracle() =
     Network.copy(env.bestnn, on_gpu=params.sim.use_gpu, test_mode=true)
   simulator = Simulator(make_oracle, self_play_measurements) do oracle
-    return MctsPlayer(env.gspec, oracle, params.mcts)
+    return MctsPlayer(env.gspec, oracle, mcts_params)
   end
   # Run the simulations
   results, elapsed = @timed simulate_distributed(
@@ -293,8 +301,9 @@ function self_play_step!(env::Env, handler)
   edepth = mean([x.edepth for x in results])
   mem_footprint = maximum([x.mem for x in results])
   memsize, memdistinct = simple_memory_stats(env)
+  num_sims = mcts_params.num_iters_per_turn
   report = Report.SelfPlay(
-    speed, edepth, mem_footprint, memsize, memdistinct)
+    speed, edepth, mem_footprint, memsize, memdistinct, num_sims)
   Handlers.self_play_finished(handler, report)
   return report
 end
