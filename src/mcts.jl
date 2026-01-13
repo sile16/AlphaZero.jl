@@ -39,9 +39,20 @@ struct RolloutOracle{GameSpec} <: Function
 end
 
 function rollout!(game, γ=1.)
-  action = rand(GI.available_actions(game))
-  GI.play!(game, action)
-  wr = GI.white_reward(game)
+  if GI.is_chance_node(game)
+    # At chance node: sample outcome by probability
+    outcomes = GI.chance_outcomes(game)
+    probs = [p for (_, p) in outcomes]
+    idx = Util.rand_categorical(probs)
+    outcome, _ = outcomes[idx]
+    GI.apply_chance!(game, outcome)
+    wr = GI.white_reward(game)
+  else
+    # At decision node: pick random action
+    action = rand(GI.available_actions(game))
+    GI.play!(game, action)
+    wr = GI.white_reward(game)
+  end
   if GI.game_terminated(game)
     return wr
   else
@@ -224,22 +235,30 @@ function update_state_info!(env, state, action_id, q)
   stats[action_id] = ActionStats(astats.P, astats.W + q, astats.N + 1)
 end
 
+# Maximum depth for MCTS simulation to prevent stack overflow in long games
+const MAX_SIMULATION_DEPTH = 500
+
 # Run a single MCTS simulation, updating the statistics of all traversed states.
 # Return the estimated Q-value for the current player.
 # Modifies the state of the game environment.
 # Dispatches to chance node handler for stochastic games.
-function run_simulation!(env::Env, game; η, root=true)
+function run_simulation!(env::Env, game; η, root=true, depth=0)
   if GI.game_terminated(game)
     return 0.
+  elseif depth >= MAX_SIMULATION_DEPTH
+    # Depth limit reached: use oracle value estimate to cut off
+    state = GI.current_state(game)
+    (_, V) = env.oracle(state)
+    return V
   elseif GI.is_chance_node(game)
-    return run_simulation_chance!(env, game, η=η, root=root)
+    return run_simulation_chance!(env, game, η=η, root=root, depth=depth)
   else
-    return run_simulation_decision!(env, game, η=η, root=root)
+    return run_simulation_decision!(env, game, η=η, root=root, depth=depth)
   end
 end
 
 # Handle simulation at a decision node (original MCTS logic).
-function run_simulation_decision!(env::Env, game; η, root)
+function run_simulation_decision!(env::Env, game; η, root, depth)
   state = GI.current_state(game)
   actions = GI.available_actions(game)
   info, new_node = state_info(env, state)
@@ -255,7 +274,7 @@ function run_simulation_decision!(env::Env, game; η, root)
     wr = GI.white_reward(game)
     r = wp ? wr : -wr
     pswitch = wp != GI.white_playing(game)
-    qnext = run_simulation!(env, game, η=η, root=false)
+    qnext = run_simulation!(env, game, η=η, root=false, depth=depth+1)
     qnext = pswitch ? -qnext : qnext
     q = r + env.gamma * qnext
     update_state_info!(env, state, action_id, q)
@@ -275,7 +294,7 @@ First visit: Query NN on pre-dice state, return Vest, store ChanceNodeInfo.
 Second visit: Expand ALL outcomes, use expectimax.
 Subsequent visits: Sample by probability, continue with expectimax.
 """
-function run_simulation_chance!(env::Env, game; η, root)
+function run_simulation_chance!(env::Env, game; η, root, depth)
   state = GI.current_state(game)
   wp = GI.white_playing(game)  # Player who will act AFTER the chance event
 
@@ -294,10 +313,10 @@ function run_simulation_chance!(env::Env, game; η, root)
 
   if !info.expanded
     # SECOND VISIT: Expand ALL outcomes at once
-    return expand_chance_node!(env, game, state, info, η)
+    return expand_chance_node!(env, game, state, info, η, depth)
   else
     # SUBSEQUENT VISITS: Use expectimax over expanded outcomes
-    return expectimax_chance!(env, game, state, info, η)
+    return expectimax_chance!(env, game, state, info, η, depth)
   end
 end
 
@@ -305,7 +324,7 @@ end
 Expand all chance outcomes and compute expectimax value.
 This is called on the SECOND visit to a chance node.
 """
-function expand_chance_node!(env::Env, game, state, info::ChanceNodeInfo, η)
+function expand_chance_node!(env::Env, game, state, info::ChanceNodeInfo, η, depth)
   outcomes = GI.chance_outcomes(game)
   wp = GI.white_playing(game)
 
@@ -320,7 +339,7 @@ function expand_chance_node!(env::Env, game, state, info::ChanceNodeInfo, η)
       v = 0.0
     else
       # Recursive simulation from post-chance state
-      v = run_simulation!(env, game_copy, η=η, root=false)
+      v = run_simulation!(env, game_copy, η=η, root=false, depth=depth+1)
     end
 
     push!(new_outcome_stats, ChanceOutcomeStats(prob, v, 1))
@@ -345,7 +364,7 @@ Instead of random sampling, we select the outcome that is most under-visited
 relative to its probability: argmax(prob - visit_fraction). This ensures
 the visit distribution converges to match the true probability distribution.
 """
-function expectimax_chance!(env::Env, game, state, info::ChanceNodeInfo, η)
+function expectimax_chance!(env::Env, game, state, info::ChanceNodeInfo, η, depth)
   outcomes = GI.chance_outcomes(game)
 
   # Select outcome with largest delta: probability - actual visit fraction
@@ -361,7 +380,7 @@ function expectimax_chance!(env::Env, game, state, info::ChanceNodeInfo, η)
   if GI.game_terminated(game_copy)
     v = 0.0
   else
-    v = run_simulation!(env, game_copy, η=η, root=false)
+    v = run_simulation!(env, game_copy, η=η, root=false, depth=depth+1)
   end
 
   # Update the selected outcome's statistics
