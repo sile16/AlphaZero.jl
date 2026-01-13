@@ -57,6 +57,46 @@ In the original AlphaGo Zero paper:
 end
 
 """
+Parameters for a Gumbel MCTS player.
+
+| Parameter                | Type                         | Default             |
+|:-------------------------|:-----------------------------|:--------------------|
+| `num_simulations`        | `Int`                        |  -                  |
+| `gamma`                  | `Float64`                    | `1.`                |
+| `max_considered_actions` | `Int`                        | `16`                |
+| `temperature`            | `AbstractSchedule{Float64}`  | `ConstSchedule(1.)` |
+| `prior_temperature`      | `Float64`                    | `1.`                |
+| `c_scale`                | `Float64`                    | `1.`                |
+| `c_visit`                | `Float64`                    | `50.`               |
+
+# Explanation
+
+A Gumbel MCTS player uses the algorithm from "Policy improvement by planning
+with Gumbel" (Danihelka et al., 2022). Instead of UCT at the root, it:
+
+1. Samples Gumbel noise for each action: g(a) ~ Gumbel(0, 1)
+2. Computes initial scores: σ(a) = log(π(a)) + g(a)
+3. Uses sequential halving to allocate simulations to top-k actions
+4. Selects the action with highest σ(a) + Q_completed(a)
+
+This provides better sample efficiency than standard MCTS, especially
+at low simulation counts.
+
+- `num_simulations`: total simulation budget per move
+- `max_considered_actions`: maximum actions to consider (top-k by σ)
+- `c_scale`, `c_visit`: parameters for Q-value completion interpolation
+"""
+@kwdef struct GumbelMctsParams
+  gamma :: Float64 = 1.
+  num_simulations :: Int
+  max_considered_actions :: Int = 16
+  temperature :: AbstractSchedule{Float64} = ConstSchedule(1.)
+  prior_temperature :: Float64 = 1.
+  c_scale :: Float64 = 1.
+  c_visit :: Float64 = 50.
+end
+
+"""
     SimParams
 
 Parameters for parallel game simulations.
@@ -147,10 +187,17 @@ end
 
 Parameters governing self-play.
 
-| Parameter            | Type                  | Default        |
-|:---------------------|:----------------------|:---------------|
-| `mcts`               | [`MctsParams`](@ref)  |  -             |
-| `sim`                | [`SimParams`](@ref)   |  -             |
+| Parameter            | Type                               | Default        |
+|:---------------------|:-----------------------------------|:---------------|
+| `mcts`               | [`MctsParams`](@ref)               |  -             |
+| `sim`                | [`SimParams`](@ref)                |  -             |
+| `gumbel_mcts`        | `Union{Nothing, GumbelMctsParams}` | `nothing`      |
+
+# Explanation
+
+If `gumbel_mcts` is provided, Gumbel MCTS (sequential halving with Gumbel-max
+trick) will be used for self-play instead of standard MCTS. This can provide
+better sample efficiency, especially at low simulation counts.
 
 # AlphaGo Zero Parameters
 
@@ -160,6 +207,7 @@ of self-play across 200 iterations).
 @kwdef struct SelfPlayParams
   mcts :: MctsParams
   sim :: SimParams
+  gumbel_mcts :: Union{Nothing, GumbelMctsParams} = nothing
 end
 
 """
@@ -330,7 +378,7 @@ In the original AlphaGo Zero paper:
   mem_buffer_size :: PLSchedule{Int}
 end
 
-for T in [MctsParams, SimParams, ArenaParams, SelfPlayParams, LearningParams, Params]
+for T in [MctsParams, GumbelMctsParams, SimParams, ArenaParams, SelfPlayParams, LearningParams, Params]
   Util.generate_update_constructor(T) |> eval
 end
 

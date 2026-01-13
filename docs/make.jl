@@ -20,6 +20,7 @@ makedocs(
       "reference/params.md",
       "reference/game_interface.md",
       "reference/mcts.md",
+      "reference/gumbel_mcts.md",
       "reference/network.md",
       "reference/networks_library.md",
       "reference/player.md",

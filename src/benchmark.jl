@@ -159,6 +159,24 @@ function instantiate(p::Full, gspec::AbstractGameSpec, nn)
 end
 
 """
+    Benchmark.GumbelFull(params) <: Benchmark.Player
+
+Gumbel AlphaZero player that combines Gumbel MCTS (sequential halving +
+Gumbel-max trick) with the learnt network.
+
+Argument `params` has type [`GumbelMctsParams`](@ref).
+"""
+struct GumbelFull <: Player
+  params :: GumbelMctsParams
+end
+
+name(p::GumbelFull) = "Gumbel ($(p.params.num_simulations) sims)"
+
+function instantiate(p::GumbelFull, gspec::AbstractGameSpec, nn)
+  return GumbelMctsPlayer(gspec, nn, p.params)
+end
+
+"""
     Benchmark.NetworkOnly(;τ=1.0) <: Benchmark.Player
 
 Player that uses the policy output by the learnt network directly,

@@ -44,6 +44,11 @@ module AlphaZero
   using .MCTS
   export MCTS
 
+  # Gumbel MCTS implementation (sequential halving with Gumbel-max trick)
+  include("gumbel_mcts.jl")
+  using .GumbelMCTS
+  export GumbelMCTS
+
   # A generic network interface
   include("networks/network.jl")
   using .Network
@@ -66,6 +71,7 @@ module AlphaZero
   include("params.jl")
   export Params
   export MctsParams
+  export GumbelMctsParams
   export SimParams
   export SelfPlayParams
   export LearningParams
@@ -86,6 +92,7 @@ module AlphaZero
   include("play.jl")
   export AbstractPlayer, think, select_move, reset_player!, player_temperature
   export MctsPlayer
+  export GumbelMctsPlayer
   export RandomPlayer
   export NetworkPlayer
   export PlayerWithTemperature

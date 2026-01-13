@@ -113,7 +113,7 @@ as an object of type [`Report.Initial`](@ref).
 function initial_report(env::Env)
   num_network_parameters = Network.num_parameters(env.curnn)
   num_reg_params = Network.num_regularized_parameters(env.curnn)
-  player = MctsPlayer(env.gspec, env.curnn, env.params.self_play.mcts)
+  # Memory footprint is the same for both MCTS variants
   mcts_footprint_per_node = MCTS.memory_footprint_per_node(env.gspec)
   errs, warns = check_params(env.gspec, env.params)
   return Report.Initial(
@@ -267,8 +267,16 @@ end
 
 # To be given as an argument to `Simulator`
 function self_play_measurements(trace, _, player)
-  mem = MCTS.approximate_memory_footprint(player.mcts)
-  edepth = MCTS.average_exploration_depth(player.mcts)
+  if player isa MctsPlayer
+    mem = MCTS.approximate_memory_footprint(player.mcts)
+    edepth = MCTS.average_exploration_depth(player.mcts)
+  elseif player isa GumbelMctsPlayer
+    mem = GumbelMCTS.approximate_memory_footprint(player.mcts)
+    edepth = GumbelMCTS.average_exploration_depth(player.mcts)
+  else
+    mem = 0
+    edepth = 0
+  end
   return (trace=trace, mem=mem, edepth=edepth)
 end
 
@@ -277,9 +285,22 @@ function self_play_step!(env::Env, handler)
   Handlers.self_play_started(handler)
   make_oracle() =
     Network.copy(env.bestnn, on_gpu=params.sim.use_gpu, test_mode=true)
-  simulator = Simulator(make_oracle, self_play_measurements) do oracle
-    return MctsPlayer(env.gspec, oracle, params.mcts)
+
+  # Choose between standard MCTS and Gumbel MCTS
+  use_gumbel = !isnothing(params.gumbel_mcts)
+
+  if use_gumbel
+    simulator = Simulator(make_oracle, self_play_measurements) do oracle
+      return GumbelMctsPlayer(env.gspec, oracle, params.gumbel_mcts)
+    end
+    gamma = params.gumbel_mcts.gamma
+  else
+    simulator = Simulator(make_oracle, self_play_measurements) do oracle
+      return MctsPlayer(env.gspec, oracle, params.mcts)
+    end
+    gamma = params.mcts.gamma
   end
+
   # Run the simulations
   results, elapsed = @timed simulate_distributed(
     simulator, env.gspec, params.sim,
@@ -287,7 +308,7 @@ function self_play_step!(env::Env, handler)
   # Add the collected samples in memory
   new_batch!(env.memory)
   for x in results
-    push_trace!(env.memory, x.trace, params.mcts.gamma)
+    push_trace!(env.memory, x.trace, gamma)
   end
   speed = cur_batch_size(env.memory) / elapsed
   edepth = mean([x.edepth for x in results])
