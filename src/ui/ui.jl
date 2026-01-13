@@ -12,7 +12,6 @@ module UserInterface
 
   using ..AlphaZero
 
-  import Plots
   import JSON3
   using Base: @kwdef
   using Statistics: mean
@@ -26,7 +25,7 @@ module UserInterface
   using .Log
 
   include("explorer.jl")
-  include("plots.jl")
+  include("plots.jl")  # Now handles Plots optionally
   include("json.jl")
   include("session.jl")
 

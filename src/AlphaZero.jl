@@ -185,6 +185,12 @@ module AlphaZero
       include("openspiel_example.jl")
       @info "AlphaZero.jl's OpenSpielWrapper loaded."
     end
+
+    # Optional Plots.jl integration for training visualization
+    @require Plots="91a5bcdd-55d7-5caf-9e0b-520d859cae80" begin
+      @info "Plots.jl detected, visualization support available."
+      # The actual plotting functions are in UserInterface and check isdefined(:Plots)
+    end
   end
 
 
