@@ -16,6 +16,10 @@ const FULL = !CI
   @test true
 end
 
+@testset "Stochastic MCTS" begin
+  include("stochastic_mcts.jl")
+end
+
 @testset "Dummy Runs" begin
   dir = "sessions/test-tictactoe"
   @test dummy_run(experiments["tictactoe"], nostdout=false) == nothing
