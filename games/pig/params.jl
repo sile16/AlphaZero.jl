@@ -1,3 +1,23 @@
+#####
+##### Hold20 Benchmark Player
+#####
+
+struct Hold20Baseline <: Benchmark.Player
+  threshold::Int
+end
+
+Hold20Baseline() = Hold20Baseline(20)
+
+Benchmark.name(p::Hold20Baseline) = "Hold$(p.threshold)"
+
+function Benchmark.instantiate(p::Hold20Baseline, ::AbstractGameSpec, nn)
+  return Hold20Player(p.threshold)
+end
+
+#####
+##### Network Configuration
+#####
+
 Network = NetLib.SimpleNet
 
 netparams = NetLib.SimpleNetHP(
@@ -8,15 +28,15 @@ netparams = NetLib.SimpleNetHP(
 
 self_play = SelfPlayParams(
   sim=SimParams(
-    num_games=500,
-    num_workers=64,
-    batch_size=64,
+    num_games=100,
+    num_workers=32,
+    batch_size=32,
     use_gpu=false,
     reset_every=4,
     flip_probability=0.,
     alternate_colors=false),
   mcts=MctsParams(
-    num_iters_per_turn=200,
+    num_iters_per_turn=50,
     cpuct=1.0,
     temperature=ConstSchedule(1.0),
     dirichlet_noise_ϵ=0.25,
@@ -24,9 +44,9 @@ self_play = SelfPlayParams(
 
 arena = ArenaParams(
   sim=SimParams(
-    num_games=100,
-    num_workers=50,
-    batch_size=50,
+    num_games=50,
+    num_workers=25,
+    batch_size=25,
     use_gpu=false,
     reset_every=1,
     flip_probability=0.,
@@ -51,31 +71,31 @@ learning = LearningParams(
   loss_computation_batch_size=2048,
   nonvalidity_penalty=1.,
   min_checkpoints_per_epoch=0,
-  max_batches_per_checkpoint=2_000,
+  max_batches_per_checkpoint=1_000,
   num_checkpoints=1)
 
 params = Params(
   arena=arena,
   self_play=self_play,
   learning=learning,
-  num_iters=2,
+  num_iters=5,
   memory_analysis=MemAnalysisParams(
     num_game_stages=4),
   ternary_outcome=true,
   use_symmetries=false,  # Pig has no symmetries
-  mem_buffer_size=PLSchedule(50_000))
+  mem_buffer_size=PLSchedule(20_000))
 
 benchmark_sim = SimParams(
   arena.sim;
-  num_games=200,
-  num_workers=50,
-  batch_size=50)
+  num_games=50,
+  num_workers=25,
+  batch_size=25)
 
-# Benchmark against random player
+# Benchmark against Hold20 strategy
 benchmark = [
   Benchmark.Duel(
     Benchmark.Full(self_play.mcts),
-    Benchmark.MctsRollouts(self_play.mcts),
+    Hold20Baseline(),
     benchmark_sim)]
 
 experiment = Experiment(

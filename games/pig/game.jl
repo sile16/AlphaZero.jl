@@ -205,3 +205,32 @@ function GI.heuristic_value(g::GameEnv)
     return (s.p2_score - s.p1_score + s.turn_total) / TARGET_SCORE
   end
 end
+
+#####
+##### Hold20 Baseline Player
+#####
+# Simple strategy: hold when turn_total >= 20, otherwise roll
+
+import AlphaZero: AbstractPlayer, think, reset!
+
+struct Hold20Player <: AbstractPlayer
+  threshold::Int
+end
+
+Hold20Player() = Hold20Player(20)
+
+function think(p::Hold20Player, game)
+  s = GI.current_state(game)
+  actions = [ROLL, HOLD]
+
+  # If turn_total >= threshold, hold; otherwise roll
+  if s.turn_total >= p.threshold
+    π = [0.0, 1.0]  # 100% hold
+  else
+    π = [1.0, 0.0]  # 100% roll
+  end
+
+  return actions, π
+end
+
+reset!(::Hold20Player) = nothing
