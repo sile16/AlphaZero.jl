@@ -362,25 +362,49 @@ end
 """
     policy(env, game)
 
-Return the recommended stochastic policy based on visit counts.
+Return the improved policy based on the Gumbel MuZero formula.
 A call to `explore!` must precede this.
+
+The improved policy is: π'(a) ∝ π(a) * exp(Q_completed(a))
+This gives a softer target than pure visit counts (which are very peaked
+due to sequential halving eliminating most actions).
 """
 function policy(env::Env, game)
   actions = GI.available_actions(game)
+  state = GI.current_state(game)
 
   if isempty(env.root_visits)
     error("GumbelMCTS.explore! must be called before policy")
   end
 
-  # Policy proportional to visit counts (same as standard MCTS)
-  total = sum(env.root_visits)
-  if total == 0
-    # Fallback to uniform if no simulations ran
-    n = length(actions)
-    return actions, ones(n) ./ n
+  # Get priors and value estimate
+  info = env.tree[state]
+  priors = [a.P for a in info.stats]
+  value_est = Float64(info.Vest)
+
+  # Compute completed Q-values for all actions
+  total_visits = sum(env.root_visits)
+
+  # Improved policy: π'(a) ∝ π(a) * exp(Q_completed(a))
+  # For numerical stability, subtract max before exp
+  q_completed = map(1:length(actions)) do idx
+    completed_q(
+      env.root_q_values[idx],
+      env.root_visits[idx],
+      total_visits,
+      value_est,
+      env.c_scale,
+      env.c_visit
+    )
   end
 
-  π = env.root_visits ./ total
+  # Compute improved policy
+  # Use log-sum-exp trick for numerical stability
+  log_improved = log.(max.(priors, 1e-10)) .+ q_completed
+  log_improved_shifted = log_improved .- maximum(log_improved)
+  improved = exp.(log_improved_shifted)
+  π = improved ./ sum(improved)
+
   return actions, π
 end
 

@@ -82,7 +82,7 @@ module Handlers
   function self_play_finished(h, r)  return end
   function memory_analyzed(h, r)     return end
   function learning_started(h)       return end
-  function updates_started(h)        return end
+  function updates_started(h, r)     return end
   function updates_finished(h, r)    return end
   function checkpoint_started(h)     return end
   function checkpoint_game_played(h) return end
