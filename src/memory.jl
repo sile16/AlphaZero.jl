@@ -12,10 +12,14 @@ Type of a training sample. A sample features the following fields:
 - `z::Float64` is the discounted reward cumulated from state `s`
 - `t::Float64` is the (average) number of moves remaining before the end of the game
 - `n::Int` is the number of times the state `s` was recorded
+- `is_chance::Bool` is true if this is a chance node sample (no policy target)
 
 As revealed by the last field `n`, several samples that correspond to the
 same state can be merged, in which case the `π`, `z` and `t`
 fields are averaged together.
+
+For chance nodes (`is_chance=true`), the policy `π` should be empty and the
+sample should only contribute to value training, not policy training.
 """
 struct TrainingSample{State}
   s :: State
@@ -23,7 +27,11 @@ struct TrainingSample{State}
   z :: Float64
   t :: Float64
   n :: Int
+  is_chance :: Bool
 end
+
+# Backward compatibility constructor (non-chance node)
+TrainingSample(s, π, z, t, n) = TrainingSample(s, π, z, t, n, false)
 
 sample_state_type(::Type{<:TrainingSample{S}}) where S = S
 
@@ -70,6 +78,8 @@ Base.length(mem::MemoryBuffer) = length(mem.buf)
 Collect samples out of a game trace and add them to the memory buffer.
 
 Here, `gamma` is the reward discount factor.
+
+For stochastic games, chance node samples are marked with `is_chance=true`.
 """
 function push_trace!(mem::MemoryBuffer, trace, gamma)
   n = length(trace)
@@ -78,10 +88,11 @@ function push_trace!(mem::MemoryBuffer, trace, gamma)
     wr = gamma * wr + trace.rewards[i]
     s = trace.states[i]
     π = trace.policies[i]
+    is_chance = trace.is_chance[i]
     wp = GI.white_playing(GI.init(mem.gspec, s))
     z = wp ? wr : -wr
     t = float(n - i + 1)
-    push!(mem.buf, TrainingSample(s, π, z, t, 1))
+    push!(mem.buf, TrainingSample(s, π, z, t, 1, is_chance))
   end
   mem.cur_batch_size += n
 end
@@ -92,7 +103,8 @@ function merge_samples(samples)
   z = mean(e.z for e in samples)
   n = sum(e.n for e in samples)
   t = mean(e.t for e in samples)
-  return eltype(samples)(s, π, z, t, n)
+  is_chance = samples[1].is_chance  # All merged samples should have same is_chance
+  return eltype(samples)(s, π, z, t, n, is_chance)
 end
 
 # Merge samples that correspond to identical states
@@ -120,7 +132,7 @@ function apply_symmetry(gspec, sample, (symstate, aperm))
   @assert iszero(π[.~symmask])
   π = π[symmask]
   return typeof(sample)(
-    symstate, π, sample.z, sample.t, sample.n)
+    symstate, π, sample.z, sample.t, sample.n, sample.is_chance)
 end
 
 function augment_with_symmetries(gspec, samples)

@@ -89,6 +89,32 @@ end
 Ntot(b::StateInfo) = sum(s.N for s in b.stats)
 
 #####
+##### Chance Node Statistics (for stochastic games)
+#####
+
+"""
+Statistics for a single chance outcome edge.
+"""
+struct ChanceOutcomeStats
+  prob :: Float64   # Probability of this outcome
+  W :: Float64      # Cumulated value for this outcome
+  N :: Int          # Visit count for this outcome
+end
+
+"""
+Information stored for a chance node in the MCTS tree.
+Unlike decision nodes, chance nodes use expectimax aggregation.
+"""
+mutable struct ChanceNodeInfo
+  outcomes :: Vector{ChanceOutcomeStats}  # Stats for each outcome
+  Vest :: Float32                          # Initial NN value estimate (pre-dice)
+  expanded :: Bool                         # Whether all outcomes have been expanded
+end
+
+Ntot(c::ChanceNodeInfo) = sum(o.N for o in c.outcomes)
+is_expanded(c::ChanceNodeInfo) = c.expanded
+
+#####
 ##### MCTS Environment
 #####
 
@@ -124,6 +150,8 @@ of parameter ``α``.
 mutable struct Env{State, Oracle}
   # Store (nonterminal) state statistics assuming the white player is to play
   tree :: Dict{State, StateInfo}
+  # Store chance node statistics (for stochastic games)
+  chance_tree :: Dict{State, ChanceNodeInfo}
   # External oracle to evaluate positions
   oracle :: Oracle
   # Parameters
@@ -135,6 +163,7 @@ mutable struct Env{State, Oracle}
   # Performance statistics
   total_simulations :: Int64
   total_nodes_traversed :: Int64
+  total_chance_nodes_expanded :: Int64
   # Game specification
   gspec :: GI.AbstractGameSpec
 
@@ -142,11 +171,13 @@ mutable struct Env{State, Oracle}
       gamma=1., cpuct=1., noise_ϵ=0., noise_α=1., prior_temperature=1.)
     S = GI.state_type(gspec)
     tree = Dict{S, StateInfo}()
+    chance_tree = Dict{S, ChanceNodeInfo}()
     total_simulations = 0
     total_nodes_traversed = 0
+    total_chance_nodes_expanded = 0
     new{S, typeof(oracle)}(
-      tree, oracle, gamma, cpuct, noise_ϵ, noise_α, prior_temperature,
-      total_simulations, total_nodes_traversed, gspec)
+      tree, chance_tree, oracle, gamma, cpuct, noise_ϵ, noise_α, prior_temperature,
+      total_simulations, total_nodes_traversed, total_chance_nodes_expanded, gspec)
   end
 end
 
@@ -196,33 +227,156 @@ end
 # Run a single MCTS simulation, updating the statistics of all traversed states.
 # Return the estimated Q-value for the current player.
 # Modifies the state of the game environment.
+# Dispatches to chance node handler for stochastic games.
 function run_simulation!(env::Env, game; η, root=true)
   if GI.game_terminated(game)
     return 0.
+  elseif GI.is_chance_node(game)
+    return run_simulation_chance!(env, game, η=η, root=root)
   else
-    state = GI.current_state(game)
-    actions = GI.available_actions(game)
-    info, new_node = state_info(env, state)
-    if new_node
-      return info.Vest
-    else
-      ϵ = root ? env.noise_ϵ : 0.
-      scores = uct_scores(info, env.cpuct, ϵ, η)
-      action_id = argmax(scores)
-      action = actions[action_id]
-      wp = GI.white_playing(game)
-      GI.play!(game, action)
-      wr = GI.white_reward(game)
-      r = wp ? wr : -wr
-      pswitch = wp != GI.white_playing(game)
-      qnext = run_simulation!(env, game, η=η, root=false)
-      qnext = pswitch ? -qnext : qnext
-      q = r + env.gamma * qnext
-      update_state_info!(env, state, action_id, q)
-      env.total_nodes_traversed += 1
-      return q
-    end
+    return run_simulation_decision!(env, game, η=η, root=root)
   end
+end
+
+# Handle simulation at a decision node (original MCTS logic).
+function run_simulation_decision!(env::Env, game; η, root)
+  state = GI.current_state(game)
+  actions = GI.available_actions(game)
+  info, new_node = state_info(env, state)
+  if new_node
+    return info.Vest
+  else
+    ϵ = root ? env.noise_ϵ : 0.
+    scores = uct_scores(info, env.cpuct, ϵ, η)
+    action_id = argmax(scores)
+    action = actions[action_id]
+    wp = GI.white_playing(game)
+    GI.play!(game, action)
+    wr = GI.white_reward(game)
+    r = wp ? wr : -wr
+    pswitch = wp != GI.white_playing(game)
+    qnext = run_simulation!(env, game, η=η, root=false)
+    qnext = pswitch ? -qnext : qnext
+    q = r + env.gamma * qnext
+    update_state_info!(env, state, action_id, q)
+    env.total_nodes_traversed += 1
+    return q
+  end
+end
+
+#####
+##### Chance Node Handling (Stochastic MCTS)
+#####
+
+"""
+Handle simulation at a chance node.
+
+First visit: Query NN on pre-dice state, return Vest, store ChanceNodeInfo.
+Second visit: Expand ALL outcomes, use expectimax.
+Subsequent visits: Sample by probability, continue with expectimax.
+"""
+function run_simulation_chance!(env::Env, game; η, root)
+  state = GI.current_state(game)
+  wp = GI.white_playing(game)  # Player who will act AFTER the chance event
+
+  if !haskey(env.chance_tree, state)
+    # FIRST VISIT: Query NN on pre-dice state for value estimate
+    # Don't expand outcomes yet - just return the value estimate
+    (_, V) = env.oracle(state)
+    outcomes = GI.chance_outcomes(game)
+    outcome_stats = [ChanceOutcomeStats(prob, 0.0, 0) for (_, prob) in outcomes]
+    info = ChanceNodeInfo(outcome_stats, V, false)
+    env.chance_tree[state] = info
+    return V
+  end
+
+  info = env.chance_tree[state]
+
+  if !info.expanded
+    # SECOND VISIT: Expand ALL outcomes at once
+    return expand_chance_node!(env, game, state, info, η)
+  else
+    # SUBSEQUENT VISITS: Use expectimax over expanded outcomes
+    return expectimax_chance!(env, game, state, info, η)
+  end
+end
+
+"""
+Expand all chance outcomes and compute expectimax value.
+This is called on the SECOND visit to a chance node.
+"""
+function expand_chance_node!(env::Env, game, state, info::ChanceNodeInfo, η)
+  outcomes = GI.chance_outcomes(game)
+  wp = GI.white_playing(game)
+
+  new_outcome_stats = ChanceOutcomeStats[]
+
+  for (i, (outcome, prob)) in enumerate(outcomes)
+    game_copy = GI.clone(game)
+    GI.apply_chance!(game_copy, outcome)
+
+    # Check if game terminated after chance
+    if GI.game_terminated(game_copy)
+      v = 0.0
+    else
+      # Recursive simulation from post-chance state
+      v = run_simulation!(env, game_copy, η=η, root=false)
+    end
+
+    push!(new_outcome_stats, ChanceOutcomeStats(prob, v, 1))
+  end
+
+  # Compute expectimax value: weighted average over all outcomes
+  expectimax_value = sum(s.prob * s.W for s in new_outcome_stats)
+
+  # Mark as expanded and update tree
+  info.outcomes = new_outcome_stats
+  info.expanded = true
+  env.total_chance_nodes_expanded += 1
+
+  return expectimax_value
+end
+
+"""
+Select the outcome with the largest visit deficit relative to its probability.
+Called on subsequent visits after the chance node is expanded.
+
+Instead of random sampling, we select the outcome that is most under-visited
+relative to its probability: argmax(prob - visit_fraction). This ensures
+the visit distribution converges to match the true probability distribution.
+"""
+function expectimax_chance!(env::Env, game, state, info::ChanceNodeInfo, η)
+  outcomes = GI.chance_outcomes(game)
+
+  # Select outcome with largest delta: probability - actual visit fraction
+  total_visits = Ntot(info)
+  outcome_idx = argmax(
+    o.prob - (o.N / max(total_visits, 1)) for o in info.outcomes
+  )
+
+  outcome, _ = outcomes[outcome_idx]
+  game_copy = GI.clone(game)
+  GI.apply_chance!(game_copy, outcome)
+
+  if GI.game_terminated(game_copy)
+    v = 0.0
+  else
+    v = run_simulation!(env, game_copy, η=η, root=false)
+  end
+
+  # Update the selected outcome's statistics
+  update_chance_outcome!(info, outcome_idx, v)
+
+  # Return expectimax value: weighted average of mean values across ALL outcomes
+  return sum(o.prob * (o.W / max(o.N, 1)) for o in info.outcomes)
+end
+
+"""
+Update statistics for a specific chance outcome.
+"""
+function update_chance_outcome!(info::ChanceNodeInfo, outcome_idx, value)
+  old = info.outcomes[outcome_idx]
+  info.outcomes[outcome_idx] = ChanceOutcomeStats(old.prob, old.W + value, old.N + 1)
 end
 
 function dirichlet_noise(game, α)
@@ -273,10 +427,11 @@ end
 """
     MCTS.reset!(env)
 
-Empty the MCTS tree.
+Empty the MCTS tree (both decision nodes and chance nodes).
 """
 function reset!(env)
   empty!(env.tree)
+  empty!(env.chance_tree)
   #GC.gc(true)
 end
 
@@ -298,7 +453,7 @@ end
 """
     MCTS.memory_footprint_per_node(gspec)
 
-Return an estimate of the memory footprint of a single MCTS node
+Return an estimate of the memory footprint of a single MCTS decision node
 for the given game (in bytes).
 """
 function memory_footprint_per_node(gspec)
@@ -312,15 +467,36 @@ function memory_footprint_per_node(gspec)
 end
 
 """
+    MCTS.memory_footprint_per_chance_node(gspec)
+
+Return an estimate of the memory footprint of a single MCTS chance node
+for the given game (in bytes).
+"""
+function memory_footprint_per_chance_node(gspec)
+  num_outcomes = GI.num_chance_outcomes(gspec)
+  if num_outcomes == 0
+    return 0
+  end
+  size_key = 2 * (GI.state_memsize(gspec) + sizeof(Int))
+  dummy_stats = ChanceNodeInfo([
+    ChanceOutcomeStats(0, 0, 0) for i in 1:num_outcomes], 0, false)
+  size_stats = Base.summarysize(dummy_stats)
+  return size_key + size_stats
+end
+
+"""
     MCTS.approximate_memory_footprint(env)
 
-Return an estimate of the memory footprint of the MCTS tree (in bytes).
+Return an estimate of the memory footprint of the MCTS tree (in bytes),
+including both decision nodes and chance nodes.
 """
 function approximate_memory_footprint(env::Env)
-  return memory_footprint_per_node(env.gspec) * length(env.tree)
+  decision_size = memory_footprint_per_node(env.gspec) * length(env.tree)
+  chance_size = memory_footprint_per_chance_node(env.gspec) * length(env.chance_tree)
+  return decision_size + chance_size
 end
 
 # Possibly very slow for large trees
-memory_footprint(env::Env) = Base.summarysize(env.tree)
+memory_footprint(env::Env) = Base.summarysize(env.tree) + Base.summarysize(env.chance_tree)
 
 end

@@ -30,9 +30,13 @@ function convert_sample(
   x = GI.vectorize_state(gspec, e.s)
   a = GI.actions_mask(GI.init(gspec, e.s))
   p = zeros(size(a))
-  p[a] = e.π
+  # For chance nodes, policy should be empty (no targets)
+  if !e.is_chance && !isempty(e.π)
+    p[a] = e.π
+  end
   v = [e.z]
-  return (; w, x, a, p, v)
+  is_chance = [e.is_chance ? 1f0 : 0f0]  # Convert to float for batching
+  return (; w, x, a, p, v, is_chance)
 end
 
 function convert_samples(
@@ -46,8 +50,9 @@ function convert_samples(
   A = Flux.batch([e.a for e in ces])
   P = Flux.batch([e.p for e in ces])
   V = Flux.batch([e.v for e in ces])
+  IsChance = Flux.batch([e.is_chance for e in ces])
   f32(arr) = convert(AbstractArray{Float32}, arr)
-  return map(f32, (; W, X, A, P, V))
+  return map(f32, (; W, X, A, P, V, IsChance))
 end
 
 #####
@@ -64,7 +69,7 @@ entropy_wmean(π, w) = -sum(π .* log.(π .+ eps(eltype(π))) .* w) / sum(w)
 
 wmean(x, w) = sum(x .* w) / sum(w)
 
-function losses(nn, params, Wmean, Hp, (W, X, A, P, V))
+function losses(nn, params, Wmean, Hp, (W, X, A, P, V, IsChance))
   # Ideally, we would only apply the L2 penalty to weight parameters and not
   # bias parameters. However, Flux currently cannot differentiate through
   # `Flux.modules`, which is used in the implementation of
@@ -77,14 +82,31 @@ function losses(nn, params, Wmean, Hp, (W, X, A, P, V))
   P̂, V̂, p_invalid = Network.forward_normalized(nn, X, A)
   V = V ./ params.rewards_renormalization
   V̂ = V̂ ./ params.rewards_renormalization
-  Lp = klloss_wmean(P̂, P, W) - Hp
+
+  # Mask for decision nodes only (policy loss should not apply to chance nodes)
+  decision_mask = 1f0 .- IsChance
+  W_decision = W .* decision_mask
+
+  # Policy loss: ONLY for decision nodes
+  # If there are no decision nodes in the batch, skip policy loss
+  Lp = if sum(W_decision) > 0
+    klloss_wmean(P̂, P, W_decision) - Hp
+  else
+    zero(Float32)
+  end
+
+  # Value loss: For ALL nodes (including chance nodes)
   Lv = mse_wmean(V̂, V, W)
+
   Lreg = iszero(creg) ?
     zero(Lv) :
     creg * sum(sum(w .* w) for w in regws)
+
+  # Invalid action penalty: ONLY for decision nodes
   Linv = iszero(cinv) ?
     zero(Lv) :
-    cinv * wmean(p_invalid, W)
+    cinv * wmean(p_invalid, W_decision)
+
   L = (mean(W) / Wmean) * (Lp + Lv + Lreg + Linv)
   return (L, Lp, Lv, Lreg, Linv)
 end
@@ -97,7 +119,7 @@ struct Trainer
   network :: AbstractNetwork
   samples :: AbstractVector{<:TrainingSample}
   params :: LearningParams
-  data :: NamedTuple # (W, X, A, P, V) tuple obtained after converting `samples`
+  data :: NamedTuple # (W, X, A, P, V, IsChance) tuple obtained after converting `samples`
   Wmean :: Float32
   Hp :: Float32
   batches_stream # infinite stateful iterator of training batches
@@ -107,9 +129,16 @@ struct Trainer
     end
     data = convert_samples(gspec, params.samples_weighing_policy, samples)
     network = Network.copy(network, on_gpu=params.use_gpu, test_mode=test_mode)
-    W, X, A, P, V = data
+    W, X, A, P, V, IsChance = data
     Wmean = mean(W)
-    Hp = entropy_wmean(P, W)
+    # Compute entropy only for decision nodes
+    decision_mask = 1f0 .- IsChance
+    W_decision = W .* decision_mask
+    Hp = if sum(W_decision) > 0
+      entropy_wmean(P, W_decision)
+    else
+      zero(Float32)
+    end
     # Create a batches stream
     batchsize = min(params.batch_size, length(W))
     batches = Flux.DataLoader(data; batchsize, partial=false, shuffle=true)
@@ -159,11 +188,18 @@ end
 function learning_status(tr::Trainer, samples)
   # As done now, this is slighly inefficient as we solve the
   # same neural network inference problem twice
-  W, X, A, P, V = samples
+  W, X, A, P, V, IsChance = samples
   Ls = losses(tr.network, tr.params, tr.Wmean, tr.Hp, samples)
   Ls = Network.convert_output_tuple(tr.network, Ls)
   Pnet, _ = Network.forward_normalized(tr.network, X, A)
-  Hpnet = entropy_wmean(Pnet, W)
+  # Compute entropy only for decision nodes
+  decision_mask = 1f0 .- IsChance
+  W_decision = W .* decision_mask
+  Hpnet = if sum(W_decision) > 0
+    entropy_wmean(Pnet, W_decision)
+  else
+    zero(Float32)
+  end
   Hpnet = Network.convert_output(tr.network, Hpnet)
   return Report.LearningStatus(Report.Loss(Ls...), tr.Hp, Hpnet)
 end

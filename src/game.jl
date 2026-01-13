@@ -166,6 +166,55 @@ baselines such as minmax players.
 function heuristic_value end
 
 #####
+##### Stochastic games / Chance nodes
+#####
+
+"""
+    is_chance_node(game::AbstractGameEnv) :: Bool
+
+Return `true` if the current state is a chance node where nature (randomness)
+must act before any player can make a decision.
+
+A default implementation is provided that returns `false`.
+"""
+function is_chance_node(::AbstractGameEnv)
+  return false
+end
+
+"""
+    chance_outcomes(game::AbstractGameEnv)
+
+Return a vector of `(outcome, probability)` pairs representing all possible
+chance outcomes at the current chance node.
+
+Only called when `is_chance_node(game)` returns `true`.
+The probabilities must sum to 1.0.
+"""
+function chance_outcomes end
+
+"""
+    apply_chance!(game::AbstractGameEnv, outcome)
+
+Apply a chance outcome to the game, transitioning from a chance node
+to either a decision node or another chance node.
+
+Only called when `is_chance_node(game)` returns `true`.
+"""
+function apply_chance! end
+
+"""
+    num_chance_outcomes(::AbstractGameSpec) :: Int
+
+Return the maximum number of chance outcomes possible at any chance node.
+This is used for pre-allocation and memory estimation.
+
+A default implementation is provided that returns `0` (no chance nodes).
+"""
+function num_chance_outcomes(::AbstractGameSpec)
+  return 0
+end
+
+#####
 ##### Symmetries
 #####
 

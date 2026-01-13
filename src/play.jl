@@ -194,6 +194,10 @@ function RandomMctsPlayer(game_spec::AbstractGameSpec, params::MctsParams)
 end
 
 function think(p::MctsPlayer, game)
+  # think() should never be called at a chance node
+  # The game loop should handle chance nodes before calling think
+  @assert !GI.is_chance_node(game) "think() called on a chance node"
+
   if isnothing(p.timeout) # Fixed number of MCTS simulations
     MCTS.explore!(p.mcts, game, p.niters)
   else # Run simulations until timeout
@@ -294,23 +298,47 @@ Simulate a game by an [`AbstractPlayer`](@ref).
 - If the `flip_probability` argument is set to ``p``, the board
   is _flipped_ randomly at every turn with probability ``p``,
   using [`GI.apply_random_symmetry!`](@ref).
+- Supports stochastic games with chance nodes. Chance outcomes are sampled
+  according to their probabilities, and chance node states are recorded
+  with empty policies in the trace.
 """
 function play_game(gspec, player; flip_probability=0.)
   game = GI.init(gspec)
-  trace = Trace(GI.current_state(game))
+  is_initial_chance = GI.is_chance_node(game)
+  trace = Trace(GI.current_state(game), is_chance_node=is_initial_chance)
+
   while true
     if GI.game_terminated(game)
       return trace
     end
-    if !iszero(flip_probability) && rand() < flip_probability
-      GI.apply_random_symmetry!(game)
+
+    if GI.is_chance_node(game)
+      # Handle chance node: sample outcome according to probabilities
+      outcomes = GI.chance_outcomes(game)
+      probs = [p for (_, p) in outcomes]
+      idx = Util.rand_categorical(probs)
+      outcome, _ = outcomes[idx]
+      GI.apply_chance!(game, outcome)
+      wr = GI.white_reward(game)
+      new_state = GI.current_state(game)
+      is_new_chance = !GI.game_terminated(game) && GI.is_chance_node(game)
+      # For chance nodes, push empty policy
+      push!(trace, Float64[], wr, new_state, is_chance=is_new_chance)
+    else
+      # Handle decision node (original logic)
+      if !iszero(flip_probability) && rand() < flip_probability
+        GI.apply_random_symmetry!(game)
+      end
+      actions, π_target = think(player, game)
+      τ = player_temperature(player, game, length(trace))
+      π_sample = apply_temperature(π_target, τ)
+      a = actions[Util.rand_categorical(π_sample)]
+      GI.play!(game, a)
+      wr = GI.white_reward(game)
+      new_state = GI.current_state(game)
+      is_new_chance = !GI.game_terminated(game) && GI.is_chance_node(game)
+      push!(trace, π_target, wr, new_state, is_chance=is_new_chance)
     end
-    actions, π_target = think(player, game)
-    τ = player_temperature(player, game, length(trace))
-    π_sample = apply_temperature(π_target, τ)
-    a = actions[Util.rand_categorical(π_sample)]
-    GI.play!(game, a)
-    push!(trace, π_target, GI.white_reward(game), GI.current_state(game))
   end
 end
 
@@ -361,10 +389,20 @@ function interactive!(game::AbstractGameEnv, player)
   GI.render(game)
   turn = 0
   while !GI.game_terminated(game)
-    action = select_move(player, game, turn)
-    GI.play!(game, action)
+    if GI.is_chance_node(game)
+      # Handle chance node: sample outcome according to probabilities
+      outcomes = GI.chance_outcomes(game)
+      probs = [p for (_, p) in outcomes]
+      idx = Util.rand_categorical(probs)
+      outcome, _ = outcomes[idx]
+      println("Chance outcome: $outcome")
+      GI.apply_chance!(game, outcome)
+    else
+      action = select_move(player, game, turn)
+      GI.play!(game, action)
+      turn += 1
+    end
     GI.render(game)
-    turn += 1
   end
   catch e
     isa(e, Quit) || rethrow(e)
