@@ -53,11 +53,16 @@ mutable struct Session{Env}
   # Temporary state for logging
   progress :: Union{Progress, Nothing}
   report :: SessionReport
+  # Wandb integration
+  wandb_enabled :: Bool
+  wandb_project :: String
 
-  function Session(env, dir, logger, autosave, save_intermediate, benchmark)
+  function Session(env, dir, logger, autosave, save_intermediate, benchmark;
+                   wandb_enabled=false, wandb_project="alphazero")
     return new{typeof(env)}(
       env, dir, logger, autosave, save_intermediate,
-      benchmark, nothing, SessionReport())
+      benchmark, nothing, SessionReport(),
+      wandb_enabled, wandb_project)
   end
 end
 
@@ -269,14 +274,20 @@ Create a new session from an experiment.
     intermediate training environments are saved on disk so that
     the whole training process can be analyzed later. This can
     consume a lot of disk space.
+- `use_wandb=false`: enable Weights & Biases logging
+- `wandb_project="alphazero"`: wandb project name
+- `wandb_name=nothing`: optional wandb run name (auto-generated if not provided)
 """
 function Session(
     e::Experiment;
     dir=nothing,
     autosave=true,
     nostdout=false,
-    save_intermediate=false)
-  
+    save_intermediate=false,
+    use_wandb=false,
+    wandb_project="alphazero",
+    wandb_name=nothing)
+
   isnothing(dir) && (dir = default_session_dir(e))
   logger = session_logger(dir, nostdout, autosave)
   if valid_session_dir(dir)
@@ -286,14 +297,35 @@ function Session(
     same_json(x, y) = JSON3.write(x) == JSON3.write(y)
     same_json(env.params, e.params) || @info "Using modified parameters"
     @assert same_json(Network.hyperparams(env.bestnn), e.netparams)
-    session = Session(env, dir, logger, autosave, save_intermediate, e.benchmark)
+    session = Session(env, dir, logger, autosave, save_intermediate, e.benchmark;
+                      wandb_enabled=use_wandb, wandb_project=wandb_project)
     session.report = load_session_report(dir, env.itc)
   else
     network = e.mknet(e.gspec, e.netparams)
     env = Env(e.gspec, e.params, network)
-    session = Session(env, dir, logger, autosave, save_intermediate, e.benchmark)
+    session = Session(env, dir, logger, autosave, save_intermediate, e.benchmark;
+                      wandb_enabled=use_wandb, wandb_project=wandb_project)
     Log.section(session.logger, 1, "Initializing a new AlphaZero environment")
   end
+
+  # Initialize wandb if enabled
+  if use_wandb
+    if Wandb.wandb_available()
+      Log.print(logger, "Initializing Weights & Biases logging...")
+      config = Wandb.params_to_config(env.params, env.curnn)
+      config["game"] = e.name
+      Wandb.wandb_init(
+        project=wandb_project,
+        name=isnothing(wandb_name) ? "$(e.name)-$(env.itc)" : wandb_name,
+        config=config
+      )
+      Log.print(logger, "Wandb initialized successfully")
+    else
+      Log.print(logger, crayon"yellow", "Warning: wandb not available, logging disabled")
+      session.wandb_enabled = false
+    end
+  end
+
   return session
 end
 
@@ -538,11 +570,23 @@ function Handlers.iteration_finished(session::Session, report)
   bench = run_benchmark(session)
   save_increment!(session, bench, report)
   flush(Log.logfile(session.logger))
+
+  # Log to wandb
+  if session.wandb_enabled
+    metrics = Wandb.iteration_metrics(report, session.env.itc)
+    merge!(metrics, Wandb.benchmark_metrics(bench))
+    Wandb.wandb_log(metrics; step=session.env.itc)
+  end
 end
 
 function Handlers.training_finished(session::Session)
   Log.section(session.logger, 1, "Training completed")
   close(Log.logfile(session.logger))
+
+  # Finish wandb run
+  if session.wandb_enabled
+    Wandb.wandb_finish()
+  end
 end
 
 #####

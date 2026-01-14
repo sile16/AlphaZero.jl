@@ -9,6 +9,7 @@ module UserInterface
   export Log
   export explore
   export Session, resume!, save
+  export Wandb
 
   using ..AlphaZero
 
@@ -28,6 +29,8 @@ module UserInterface
   include("explorer.jl")
   include("plots.jl")
   include("json.jl")
+  include("wandb.jl")
+  using .Wandb
   include("session.jl")
 
 end
