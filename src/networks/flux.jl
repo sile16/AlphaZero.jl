@@ -8,15 +8,33 @@ export SimpleNet, SimpleNetHP, ResNet, ResNetHP
 
 using ..AlphaZero
 
-using CUDA
 using Base: @kwdef
-
 import Flux
 
-CUDA.allowscalar(false)
+# GPU backend support: CUDA (NVIDIA) or Metal (Apple Silicon)
+using CUDA
+const HAS_CUDA = CUDA.functional()
+
+# Try to load Metal for Apple Silicon
+const HAS_METAL = try
+  using Metal
+  Metal.functional()
+catch
+  false
+end
+
+# Configure GPU backends
+if HAS_CUDA
+  CUDA.allowscalar(false)
+end
+
+# Detect which GPU backend an array is on
 array_on_gpu(::Array) = false
 array_on_gpu(::CuArray) = true
-array_on_gpu(arr) = error("Usupported array type: ", typeof(arr))
+if HAS_METAL
+  array_on_gpu(::Metal.MtlArray) = true
+end
+array_on_gpu(arr) = error("Unsupported array type: ", typeof(arr))
 
 using Flux: relu, softmax, flatten
 using Flux: Chain, Dense, Conv, BatchNorm, SkipConnection
@@ -50,8 +68,8 @@ end
 Network.to_cpu(nn::FluxNetwork) = Flux.cpu(nn)
 
 function Network.to_gpu(nn::FluxNetwork)
-  CUDA.allowscalar(false)
-  return Flux.gpu(nn)
+  HAS_CUDA && CUDA.allowscalar(false)
+  return Flux.gpu(nn)  # Flux.gpu auto-detects backend (CUDA or Metal)
 end
 
 function Network.set_test_mode!(nn::FluxNetwork, mode)
@@ -70,7 +88,7 @@ function Network.train!(callback, nn::FluxNetwork, opt::Adam, loss, data, n)
   for (i, d) in enumerate(data)
     l, grads = Flux.withgradient(nn -> loss(nn, d), nn)
     Flux.update!(opt_state, nn, grads[1])
-    Flux.adjust!(opt_state; eta=lr[i])
+    # Adam uses constant learning rate (no schedule)
     callback(i, l)
   end
 end

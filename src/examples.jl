@@ -14,11 +14,15 @@ module Examples
   include("../games/mancala/main.jl")
   export Mancala
 
+  include("../games/go-9x9/main.jl")
+  export Go9x9
+
   const games = Dict(
     "grid-world" => GridWorld.GameSpec(),
     "tictactoe" => Tictactoe.GameSpec(),
     "connect-four" => ConnectFour.GameSpec(),
-    "mancala" => Mancala.GameSpec())
+    "mancala" => Mancala.GameSpec(),
+    "go-9x9" => Go9x9.GameSpec())
     # "ospiel_ttt" => OSpielTictactoe.GameSpec()
   # ospiel_ttt is added from openspiel_example.jl when OpenSpiel.jl is imported
 
@@ -27,7 +31,8 @@ module Examples
     "grid-world" => GridWorld.Training.experiment,
     "tictactoe" => Tictactoe.Training.experiment,
     "connect-four" => ConnectFour.Training.experiment,
-    "mancala" => Mancala.Training.experiment)
+    "mancala" => Mancala.Training.experiment,
+    "go-9x9" => Go9x9.Training.experiment)
     # "ospiel_ttt" => OSpielTictactoe.Training.experiment
 
 end
