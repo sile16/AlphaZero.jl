@@ -214,6 +214,75 @@ function reset_player!(player::MctsPlayer)
 end
 
 #####
+##### Turn-progressive MCTS player
+#####
+
+"""
+    TurnProgressiveMctsPlayer{MctsEnv} <: AbstractPlayer
+
+A player that selects actions using MCTS with turn-based progressive simulation budget.
+The number of simulations varies based on the turn number within the game, ramping from
+a minimum to a target value.
+
+# Constructors
+
+    TurnProgressiveMctsPlayer(mcts::MCTS.Env; τ, params, iter, num_iters)
+
+Construct a player from an MCTS environment with turn-progressive simulation.
+
+  - `params`: TurnProgressiveSimParams controlling the simulation schedule
+  - `iter`: current training iteration (1 to num_iters)
+  - `num_iters`: total number of training iterations
+"""
+mutable struct TurnProgressiveMctsPlayer{M} <: AbstractPlayer
+  mcts :: M
+  turn_count :: Int
+  params :: TurnProgressiveSimParams
+  iter :: Int
+  num_iters :: Int
+  τ :: AbstractSchedule{Float64}
+  function TurnProgressiveMctsPlayer(mcts::MCTS.Env; τ, params::TurnProgressiveSimParams, iter::Int, num_iters::Int)
+    new{typeof(mcts)}(mcts, 0, params, iter, num_iters, τ)
+  end
+end
+
+# Alternative constructor from game spec and oracle
+function TurnProgressiveMctsPlayer(
+    game_spec::AbstractGameSpec, oracle, mcts_params::MctsParams;
+    turn_params::TurnProgressiveSimParams, iter::Int, num_iters::Int)
+  mcts = MCTS.Env(game_spec, oracle,
+    gamma=mcts_params.gamma,
+    cpuct=mcts_params.cpuct,
+    noise_ϵ=mcts_params.dirichlet_noise_ϵ,
+    noise_α=mcts_params.dirichlet_noise_α,
+    prior_temperature=mcts_params.prior_temperature)
+  return TurnProgressiveMctsPlayer(mcts,
+    τ=mcts_params.temperature,
+    params=turn_params,
+    iter=iter,
+    num_iters=num_iters)
+end
+
+function think(p::TurnProgressiveMctsPlayer, game)
+  # Compute simulation count based on current turn
+  niters = compute_turn_sim_budget(p.params, p.turn_count, p.iter, p.num_iters)
+  # Run MCTS with computed simulation budget
+  MCTS.explore!(p.mcts, game, niters)
+  # Increment turn counter for next call
+  p.turn_count += 1
+  return MCTS.policy(p.mcts, game)
+end
+
+function player_temperature(p::TurnProgressiveMctsPlayer, game, turn)
+  return p.τ[turn]
+end
+
+function reset_player!(player::TurnProgressiveMctsPlayer)
+  MCTS.reset!(player.mcts)
+  player.turn_count = 0
+end
+
+#####
 ##### Network player
 #####
 

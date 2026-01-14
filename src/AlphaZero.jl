@@ -72,6 +72,7 @@ module AlphaZero
   export ArenaParams
   export MemAnalysisParams
   export ProgressiveSimParams, compute_sim_budget
+  export TurnProgressiveSimParams, compute_turn_sim_budget, compute_ramp_turns
   export SamplesWeighingPolicy, CONSTANT_WEIGHT, LOG_WEIGHT, LINEAR_WEIGHT
 
   # Stats about training
@@ -86,7 +87,7 @@ module AlphaZero
   # Players and games
   include("play.jl")
   export AbstractPlayer, think, select_move, reset_player!, player_temperature
-  export MctsPlayer
+  export MctsPlayer, TurnProgressiveMctsPlayer
   export RandomPlayer
   export NetworkPlayer
   export PlayerWithTemperature

@@ -11,13 +11,14 @@ baseline_dir = "sessions/connect-four"
 progressive_dir = "sessions/connect-four-progressive"
 
 # Progressive simulation params (must match what was used)
-SIM_MIN = 100
-SIM_MAX = 600
+SIM_MIN = 2
+SIM_MAX = 1198
 NUM_ITERS = 15
 BASELINE_SIMS = 600
 
 function compute_progressive_sims(iter, num_iters)
-    t = iter / num_iters
+    # Note: itc=0 at start of iter 1, so we use (iter-1) here
+    t = (iter - 1) / num_iters
     return round(Int, SIM_MIN + (SIM_MAX - SIM_MIN) * t)
 end
 

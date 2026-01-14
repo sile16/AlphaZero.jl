@@ -1,5 +1,5 @@
 #####
-##### Training hyperparameters with Progressive Simulation
+##### Training hyperparameters with Turn-Based Progressive Simulation
 #####
 
 Network = NetLib.ResNet
@@ -22,7 +22,7 @@ self_play = SelfPlayParams(
     flip_probability=0.,
     alternate_colors=false),
   mcts=MctsParams(
-    num_iters_per_turn=600,  # This will be overridden by progressive_sim
+    num_iters_per_turn=600,  # This is the target, actual sims vary by turn
     cpuct=2.0,
     prior_temperature=1.0,
     temperature=PLSchedule([0, 20, 30], [1.0, 1.0, 0.3]),
@@ -57,13 +57,20 @@ learning = LearningParams(
   max_batches_per_checkpoint=2000,
   num_checkpoints=1)
 
-# Progressive simulation: start with 2 sims/turn, increase to 1198
-# Same total budget as baseline 600 constant (sum over 15 iters = 9000)
-# Formula: (sim_min + sim_max) * num_iters / 2 = 600 * num_iters
-# => sim_min + sim_max = 1200 => 2 + 1198 = 1200
-progressive_sim = ProgressiveSimParams(
-  sim_min=2,
-  sim_max=1198)
+# Turn-based progressive simulation:
+# - Early in game: few sims (2)
+# - Ramp up to target (600) over N turns
+# - N decreases with training iteration:
+#   - Iter 1: reach target by turn 30 (slow ramp, most moves low sims)
+#   - Iter 15: reach target by turn 3 (fast ramp, nearly constant)
+#
+# Intuition: Opening moves are pattern-based, mid/late game needs tactical depth.
+# As network improves, it learns openings faster so we can ramp up quicker.
+turn_progressive_sim = TurnProgressiveSimParams(
+  turn_sim_min=2,
+  turn_sim_target=600,
+  ramp_turns_initial=30,
+  ramp_turns_final=3)
 
 params = Params(
   arena=arena,
@@ -73,7 +80,7 @@ params = Params(
   ternary_outcome=true,
   use_symmetries=true,
   memory_analysis=nothing,
-  progressive_sim=progressive_sim,
+  turn_progressive_sim=turn_progressive_sim,
   mem_buffer_size=PLSchedule(
   [      0,        15],
   [400_000, 1_000_000]))
@@ -114,5 +121,5 @@ benchmark = [
 ##### Wrapping up in an experiment
 #####
 
-experiment = Experiment("connect-four-progressive",
+experiment = Experiment("connect-four-turn-progressive",
   GameSpec(), params, Network, netparams, benchmark)

@@ -28,6 +28,7 @@ module Examples
     "tictactoe" => Tictactoe.Training.experiment,
     "connect-four" => ConnectFour.Training.experiment,
     "connect-four-progressive" => ConnectFour.TrainingProgressive.experiment,
+    "connect-four-turn-progressive" => ConnectFour.TrainingTurnProgressive.experiment,
     "mancala" => Mancala.Training.experiment)
     # "ospiel_ttt" => OSpielTictactoe.Training.experiment
 
