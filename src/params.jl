@@ -285,20 +285,130 @@ than good values for middlegame positions).
 end
 
 """
+    ProgressiveSimParams
+
+Parameters for progressive simulation budget during training.
+
+| Parameter    | Type   | Description                                      |
+|:-------------|:-------|:-------------------------------------------------|
+| `sim_min`    | `Int`  | Minimum simulations per turn (early iterations)  |
+| `sim_max`    | `Int`  | Maximum simulations per turn (late iterations)   |
+
+# Explanation
+
+Progressive simulation allocates fewer MCTS simulations in early iterations
+when the neural network is still weak, and gradually increases the budget
+as training progresses. This improves training efficiency by avoiding
+wasted computation on unreliable early-stage evaluations.
+
+The simulation budget for iteration `i` out of `num_iters` total iterations
+is computed using linear interpolation: `sim_min + (sim_max - sim_min) * i / num_iters`
+
+Reference: "MiniZero: Comparative Analysis of AlphaZero and MuZero on Go, Othello, and Atari Games"
+(arXiv:2310.11305)
+"""
+@kwdef struct ProgressiveSimParams
+  sim_min :: Int
+  sim_max :: Int
+end
+
+"""
+Compute the simulation budget for a given iteration.
+
+    compute_sim_budget(params::ProgressiveSimParams, iter::Int, num_iters::Int) :: Int
+
+Returns the number of MCTS simulations to use at iteration `iter`.
+"""
+function compute_sim_budget(params::ProgressiveSimParams, iter::Int, num_iters::Int)
+  t = iter / num_iters
+  return round(Int, params.sim_min + (params.sim_max - params.sim_min) * t)
+end
+
+"""
+    TurnProgressiveSimParams
+
+Parameters for turn-based progressive simulation budget during training.
+This varies simulation count based on BOTH the turn number within a game AND
+the training iteration.
+
+| Parameter             | Type   | Description                                           |
+|:----------------------|:-------|:------------------------------------------------------|
+| `turn_sim_min`        | `Int`  | Minimum sims at game start (default: 2)               |
+| `turn_sim_target`     | `Int`  | Target sims to ramp up to within game                 |
+| `ramp_turns_initial`  | `Int`  | Turns to reach target at iteration 1 (default: 30)    |
+| `ramp_turns_final`    | `Int`  | Turns to reach target at final iteration (default: 3) |
+
+# Explanation
+
+This approach is based on the intuition that:
+1. Early moves in a game may be more pattern-based and need fewer simulations
+2. Mid/late game positions need more tactical depth (more simulations)
+3. As training progresses, the network gets better at openings, so we can
+   ramp up simulation count faster
+
+At iteration 1, simulations ramp from `turn_sim_min` to `turn_sim_target` over
+`ramp_turns_initial` turns. At the final iteration, the ramp completes in just
+`ramp_turns_final` turns (nearly all moves at target sims).
+
+The total simulation budget is designed to match baseline constant simulations
+when averaged over all iterations.
+"""
+@kwdef struct TurnProgressiveSimParams
+  turn_sim_min :: Int = 2
+  turn_sim_target :: Int = 600
+  ramp_turns_initial :: Int = 30
+  ramp_turns_final :: Int = 3
+end
+
+"""
+Compute the number of turns needed to ramp up to target sims at a given iteration.
+
+    compute_ramp_turns(params::TurnProgressiveSimParams, iter::Int, num_iters::Int) :: Float64
+
+Returns the number of game turns after which simulations reach the target.
+"""
+function compute_ramp_turns(params::TurnProgressiveSimParams, iter::Int, num_iters::Int)
+  if num_iters <= 1
+    return Float64(params.ramp_turns_final)
+  end
+  t = (iter - 1) / (num_iters - 1)
+  return params.ramp_turns_initial - (params.ramp_turns_initial - params.ramp_turns_final) * t
+end
+
+"""
+Compute the simulation budget for a given turn within a game.
+
+    compute_turn_sim_budget(params::TurnProgressiveSimParams, turn::Int, iter::Int, num_iters::Int) :: Int
+
+Returns the number of MCTS simulations to use at game turn `turn` during iteration `iter`.
+"""
+function compute_turn_sim_budget(params::TurnProgressiveSimParams, turn::Int, iter::Int, num_iters::Int)
+  ramp_turns = compute_ramp_turns(params, iter, num_iters)
+  if turn >= ramp_turns
+    return params.turn_sim_target
+  else
+    progress = turn / ramp_turns
+    return round(Int, params.turn_sim_min + (params.turn_sim_target - params.turn_sim_min) * progress)
+  end
+end
+
+"""
     Params
 
 The AlphaZero training hyperparameters.
 
-| Parameter                  | Type                                | Default   |
-|:---------------------------|:------------------------------------|:----------|
-| `self_play`                | [`SelfPlayParams`](@ref)            |  -        |
-| `learning`                 | [`LearningParams`](@ref)            |  -        |
-| `arena`                    | `Union{Nothing, ArenaParams}`       |  -        |
-| `memory_analysis`          | `Union{Nothing, MemAnalysisParams}` | `nothing` |
-| `num_iters`                | `Int`                               |  -        |
-| `use_symmetries`           | `Bool`                              | `false`   |
-| `ternary_outcome`          | `Bool`                              | `false`   |
-| `mem_buffer_size`          | `PLSchedule{Int}`                   |  -        |
+| Parameter                  | Type                                         | Default   |
+|:---------------------------|:---------------------------------------------|:----------|
+| `self_play`                | [`SelfPlayParams`](@ref)                     |  -        |
+| `learning`                 | [`LearningParams`](@ref)                     |  -        |
+| `arena`                    | `Union{Nothing, ArenaParams}`                |  -        |
+| `memory_analysis`          | `Union{Nothing, MemAnalysisParams}`          | `nothing` |
+| `progressive_sim`          | `Union{Nothing, ProgressiveSimParams}`       | `nothing` |
+| `turn_progressive_sim`     | `Union{Nothing, TurnProgressiveSimParams}`   | `nothing` |
+| `num_iters`                | `Int`                                        |  -        |
+| `use_symmetries`           | `Bool`                                       | `false`   |
+| `ternary_outcome`          | `Bool`                                       | `false`   |
+| `mem_buffer_size`          | `PLSchedule{Int}`                            |  -        |
 
 # Explanation
 
@@ -321,6 +431,12 @@ iteration can be decomposed into a self-play phase
   - `memory_analysis`: parameters for the memory analysis step that is
      performed at each iteration (see [`MemAnalysisParams`](@ref)), or
      `nothing` if no analysis is to be performed.
+  - `progressive_sim`: parameters for iteration-based progressive simulation budget
+     (see [`ProgressiveSimParams`](@ref)), or `nothing` to use constant
+     simulation budget from `self_play.mcts.num_iters_per_turn`.
+  - `turn_progressive_sim`: parameters for turn-based progressive simulation budget
+     (see [`TurnProgressiveSimParams`](@ref)), which varies simulations based on
+     game turn number AND iteration. Takes precedence over `progressive_sim` if set.
 
 # AlphaGo Zero Parameters
 
@@ -332,6 +448,8 @@ In the original AlphaGo Zero paper:
 @kwdef struct Params
   self_play :: SelfPlayParams
   memory_analysis :: Union{Nothing, MemAnalysisParams} = nothing
+  progressive_sim :: Union{Nothing, ProgressiveSimParams} = nothing
+  turn_progressive_sim :: Union{Nothing, TurnProgressiveSimParams} = nothing
   learning :: LearningParams
   arena :: Union{Nothing, ArenaParams}
   num_iters :: Int

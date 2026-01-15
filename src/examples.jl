@@ -31,6 +31,8 @@ module Examples
     "grid-world" => GridWorld.Training.experiment,
     "tictactoe" => Tictactoe.Training.experiment,
     "connect-four" => ConnectFour.Training.experiment,
+    "connect-four-progressive" => ConnectFour.TrainingProgressive.experiment,
+    "connect-four-turn-progressive" => ConnectFour.TrainingTurnProgressive.experiment,
     "mancala" => Mancala.Training.experiment,
     "pig" => Pig.Training.experiment)
     # "ospiel_ttt" => OSpielTictactoe.Training.experiment

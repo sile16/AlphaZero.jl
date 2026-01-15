@@ -277,9 +277,37 @@ function self_play_step!(env::Env, handler)
   Handlers.self_play_started(handler)
   make_oracle() =
     Network.copy(env.bestnn, on_gpu=params.sim.use_gpu, test_mode=true)
-  simulator = Simulator(make_oracle, self_play_measurements) do oracle
-    return MctsPlayer(env.gspec, oracle, params.mcts)
+
+  # Determine which type of simulation budget to use
+  if !isnothing(env.params.turn_progressive_sim)
+    # Turn-based progressive simulation (varies by turn within game AND iteration)
+    turn_params = env.params.turn_progressive_sim
+    simulator = Simulator(make_oracle, self_play_measurements) do oracle
+      return TurnProgressiveMctsPlayer(
+        env.gspec, oracle, params.mcts;
+        turn_params=turn_params,
+        iter=env.itc + 1,  # itc is 0-indexed, iter should be 1-indexed
+        num_iters=env.params.num_iters)
+    end
+    # For reporting, use target sims (actual sims vary by turn)
+    num_sims_for_report = turn_params.turn_sim_target
+  elseif !isnothing(env.params.progressive_sim)
+    # Iteration-based progressive simulation (constant within game, varies by iteration)
+    sim_budget = compute_sim_budget(
+      env.params.progressive_sim, env.itc, env.params.num_iters)
+    mcts_params = MctsParams(params.mcts, num_iters_per_turn=sim_budget)
+    simulator = Simulator(make_oracle, self_play_measurements) do oracle
+      return MctsPlayer(env.gspec, oracle, mcts_params)
+    end
+    num_sims_for_report = mcts_params.num_iters_per_turn
+  else
+    # Constant simulation budget
+    simulator = Simulator(make_oracle, self_play_measurements) do oracle
+      return MctsPlayer(env.gspec, oracle, params.mcts)
+    end
+    num_sims_for_report = params.mcts.num_iters_per_turn
   end
+
   # Run the simulations
   results, elapsed = @timed simulate_distributed(
     simulator, env.gspec, params.sim,
@@ -294,7 +322,7 @@ function self_play_step!(env::Env, handler)
   mem_footprint = maximum([x.mem for x in results])
   memsize, memdistinct = simple_memory_stats(env)
   report = Report.SelfPlay(
-    speed, edepth, mem_footprint, memsize, memdistinct)
+    speed, edepth, mem_footprint, memsize, memdistinct, num_sims_for_report)
   Handlers.self_play_finished(handler, report)
   return report
 end

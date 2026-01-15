@@ -199,6 +199,8 @@ Report generated after the self-play phase of an iteration.
     self-play phase
 - `memory_num_distinct_boards`: number of distinct board positions in the
     memory buffer at the end of the self-play phase
+- `num_sims_per_turn`: number of MCTS simulations per turn used in this iteration
+    (useful for tracking progressive simulation budget)
 """
 struct SelfPlay
   samples_gen_speed :: Float64
@@ -206,6 +208,7 @@ struct SelfPlay
   mcts_memory_footprint :: Int
   memory_size :: Int
   memory_num_distinct_boards :: Int
+  num_sims_per_turn :: Int
 end
 
 """
