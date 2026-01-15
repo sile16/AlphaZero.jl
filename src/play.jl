@@ -173,7 +173,10 @@ function MctsPlayer(
     cpuct=params.cpuct,
     noise_ϵ=params.dirichlet_noise_ϵ,
     noise_α=params.dirichlet_noise_α,
-    prior_temperature=params.prior_temperature)
+    prior_temperature=params.prior_temperature,
+    chance_mode=params.chance_mode,
+    progressive_widening_alpha=params.progressive_widening_alpha,
+    prior_virtual_visits=params.prior_virtual_visits)
   return MctsPlayer(mcts,
     niters=params.num_iters_per_turn,
     τ=params.temperature,
@@ -182,12 +185,15 @@ end
 
 # MCTS with random oracle
 function RandomMctsPlayer(game_spec::AbstractGameSpec, params::MctsParams)
-  oracle = MCTS.RandomOracle()
+  oracle = MCTS.RandomOracle(game_spec)
   mcts = MCTS.Env(game_spec, oracle,
     cpuct=params.cpuct,
     gamma=params.gamma,
     noise_ϵ=params.dirichlet_noise_ϵ,
-    noise_α=params.dirichlet_noise_α)
+    noise_α=params.dirichlet_noise_α,
+    chance_mode=params.chance_mode,
+    progressive_widening_alpha=params.progressive_widening_alpha,
+    prior_virtual_visits=params.prior_virtual_visits)
   return MctsPlayer(mcts,
     niters=params.num_iters_per_turn,
     τ=params.temperature)

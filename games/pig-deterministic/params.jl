@@ -40,10 +40,7 @@ self_play = SelfPlayParams(
     cpuct=1.0,
     temperature=ConstSchedule(1.0),
     dirichlet_noise_ϵ=0.25,
-    dirichlet_noise_α=1.0,
-    chance_mode=:progressive,           # Progressive widening for chance nodes
-    progressive_widening_alpha=0.5,     # Expand at visits 1,4,9,16,25,36...
-    prior_virtual_visits=1.0))          # Weight for NN prior integration
+    dirichlet_noise_α=1.0))
 
 arena = ArenaParams(
   sim=SimParams(
@@ -85,7 +82,7 @@ params = Params(
   memory_analysis=MemAnalysisParams(
     num_game_stages=4),
   ternary_outcome=true,
-  use_symmetries=false,  # Pig has no symmetries
+  use_symmetries=false,
   mem_buffer_size=PLSchedule(100_000))  # Large buffer so we don't hit limits
 
 # Benchmark sim params - no color alternation so we can track first-player advantage
@@ -118,4 +115,4 @@ benchmark = [
     benchmark_sim_hold20_first)]
 
 experiment = Experiment(
-  "pig", GameSpec(), params, Network, netparams, benchmark)
+  "pig-deterministic", GameSpec(), params, Network, netparams, benchmark)

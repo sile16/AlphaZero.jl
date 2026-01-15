@@ -109,7 +109,7 @@ Statistics for a single chance outcome edge.
 struct ChanceOutcomeStats
   prob :: Float64   # Probability of this outcome
   W :: Float64      # Cumulated value for this outcome
-  N :: Int          # Visit count for this outcome
+  N :: Float64      # Visit count (Float64 to support virtual visits for prior integration)
 end
 
 """
@@ -117,9 +117,16 @@ Information stored for a chance node in the MCTS tree.
 Unlike decision nodes, chance nodes use expectimax aggregation.
 """
 mutable struct ChanceNodeInfo
-  outcomes :: Vector{ChanceOutcomeStats}  # Stats for each outcome
+  outcomes :: Vector{ChanceOutcomeStats}  # Stats for each outcome (sorted by prob for progressive)
+  outcome_order :: Vector{Int}            # Original indices (for mapping back to game outcomes)
   Vest :: Float32                          # Initial NN value estimate (pre-dice)
   expanded :: Bool                         # Whether all outcomes have been expanded
+  num_expanded :: Int                      # Number of outcomes expanded so far (for progressive mode)
+end
+
+# Constructor for backward compatibility
+function ChanceNodeInfo(outcomes::Vector{ChanceOutcomeStats}, Vest::Float32, expanded::Bool)
+  return ChanceNodeInfo(outcomes, collect(1:length(outcomes)), Vest, expanded, expanded ? length(outcomes) : 0)
 end
 
 Ntot(c::ChanceNodeInfo) = sum(o.N for o in c.outcomes)
@@ -171,6 +178,10 @@ mutable struct Env{State, Oracle}
   noise_ϵ :: Float64
   noise_α :: Float64
   prior_temperature :: Float64
+  chance_mode :: Symbol  # :full, :sampling, or :progressive
+  # Progressive widening parameters (for :progressive mode)
+  progressive_widening_alpha :: Float64  # Expand new outcome when N^α > num_expanded
+  prior_virtual_visits :: Float64        # Virtual visits to weight NN prior (like PUCT prior)
   # Performance statistics
   total_simulations :: Int64
   total_nodes_traversed :: Int64
@@ -179,7 +190,8 @@ mutable struct Env{State, Oracle}
   gspec :: GI.AbstractGameSpec
 
   function Env(gspec, oracle;
-      gamma=1., cpuct=1., noise_ϵ=0., noise_α=1., prior_temperature=1.)
+      gamma=1., cpuct=1., noise_ϵ=0., noise_α=1., prior_temperature=1.,
+      chance_mode=:full, progressive_widening_alpha=0.5, prior_virtual_visits=1.0)
     S = GI.state_type(gspec)
     tree = Dict{S, StateInfo}()
     chance_tree = Dict{S, ChanceNodeInfo}()
@@ -188,6 +200,7 @@ mutable struct Env{State, Oracle}
     total_chance_nodes_expanded = 0
     new{S, typeof(oracle)}(
       tree, chance_tree, oracle, gamma, cpuct, noise_ϵ, noise_α, prior_temperature,
+      chance_mode, progressive_widening_alpha, prior_virtual_visits,
       total_simulations, total_nodes_traversed, total_chance_nodes_expanded, gspec)
   end
 end
@@ -290,17 +303,43 @@ end
 """
 Handle simulation at a chance node.
 
-First visit: Query NN on pre-dice state, return Vest, store ChanceNodeInfo.
-Second visit: Expand ALL outcomes, use expectimax.
-Subsequent visits: Sample by probability, continue with expectimax.
+Three modes controlled by env.chance_mode:
+
+:full (default) - Full expectimax:
+  - First visit: Query NN, return V
+  - Second visit: Expand ALL outcomes at once
+  - Subsequent visits: Sample by visit deficit, return weighted average
+
+:sampling - Monte Carlo sampling (faster):
+  - First visit: Query NN, return V, initialize stats with prior
+  - Subsequent visits: Sample ONE outcome by probability, update running average
+
+:progressive - Progressive widening with prior integration:
+  - First visit: Query NN, return V, initialize with prior virtual visits
+  - Subsequent visits: Progressively expand outcomes using N^α > num_expanded
+  - Outcomes expanded in order of probability (highest first)
+  - Unexpanded outcomes use prior value; expanded use actual backed-up values
+  - Prior value treated as virtual visits that get diluted with real samples
 """
 function run_simulation_chance!(env::Env, game; η, root, depth)
   state = GI.current_state(game)
   wp = GI.white_playing(game)  # Player who will act AFTER the chance event
 
+  if env.chance_mode == :sampling
+    return run_simulation_chance_sampling!(env, game, state, η, depth)
+  elseif env.chance_mode == :progressive
+    return run_simulation_chance_progressive!(env, game, state, η, depth)
+  else
+    return run_simulation_chance_full!(env, game, state, η, depth)
+  end
+end
+
+"""
+Full expectimax mode: expand all outcomes on second visit.
+"""
+function run_simulation_chance_full!(env::Env, game, state, η, depth)
   if !haskey(env.chance_tree, state)
     # FIRST VISIT: Query NN on pre-dice state for value estimate
-    # Don't expand outcomes yet - just return the value estimate
     (_, V) = env.oracle(state)
     outcomes = GI.chance_outcomes(game)
     outcome_stats = [ChanceOutcomeStats(prob, 0.0, 0) for (_, prob) in outcomes]
@@ -318,6 +357,211 @@ function run_simulation_chance!(env::Env, game; η, root, depth)
     # SUBSEQUENT VISITS: Use expectimax over expanded outcomes
     return expectimax_chance!(env, game, state, info, η, depth)
   end
+end
+
+"""
+Sampling mode: sample one outcome per visit, use NN prior as starting point.
+Much faster than full expectimax - O(1) per visit instead of O(num_outcomes).
+"""
+function run_simulation_chance_sampling!(env::Env, game, state, η, depth)
+  outcomes = GI.chance_outcomes(game)
+
+  if !haskey(env.chance_tree, state)
+    # FIRST VISIT: Query NN, use prior value, initialize with virtual visit
+    (_, V) = env.oracle(state)
+    # Initialize each outcome with the prior value weighted by probability
+    # This gives us a reasonable starting estimate before any sampling
+    virtual_N = 1.0
+    outcome_stats = [ChanceOutcomeStats(prob, V * prob * virtual_N, virtual_N)
+                     for (_, prob) in outcomes]
+    info = ChanceNodeInfo(outcome_stats, V, true)  # Mark as "expanded" immediately
+    env.chance_tree[state] = info
+    return V
+  end
+
+  info = env.chance_tree[state]
+
+  # Sample ONE outcome according to probability distribution
+  probs = [o.prob for o in info.outcomes]
+  outcome_idx = Util.rand_categorical(probs)
+
+  outcome, _ = outcomes[outcome_idx]
+  game_copy = GI.clone(game)
+  GI.apply_chance!(game_copy, outcome)
+
+  if GI.game_terminated(game_copy)
+    v = 0.0
+  else
+    v = run_simulation!(env, game_copy, η=η, root=false, depth=depth+1)
+  end
+
+  # Update statistics for the sampled outcome
+  update_chance_outcome!(info, outcome_idx, v)
+
+  # Return expectimax value: weighted average of mean values across all outcomes
+  # Each outcome's value is W/N (mean of samples), weighted by probability
+  return sum(o.prob * (o.W / max(o.N, 1)) for o in info.outcomes)
+end
+
+"""
+Progressive widening mode: expand outcomes one at a time, ordered by probability.
+
+Uses progressive widening formula: expand new outcome when N^α > num_expanded
+Integrates NN prior with observed values using virtual visits.
+
+Key insight: The NN prior gives us a value estimate before seeing any outcomes.
+As we expand and visit outcomes, we gradually replace the prior with real data.
+Virtual visits determine how quickly the prior gets "washed out" by real samples.
+
+Reference: Coulom (2007) "Efficient Selectivity and Backup Operators in MCTS"
+"""
+function run_simulation_chance_progressive!(env::Env, game, state, η, depth)
+  outcomes = GI.chance_outcomes(game)
+  α = env.progressive_widening_alpha
+  virtual_visits = env.prior_virtual_visits
+
+  if !haskey(env.chance_tree, state)
+    # FIRST VISIT: Initialize with NN prior, sort outcomes by probability
+    (_, V) = env.oracle(state)
+
+    # Sort outcomes by probability (descending) for expansion order
+    probs = [p for (_, p) in outcomes]
+    sorted_indices = sortperm(probs, rev=true)
+
+    # Initialize stats: all outcomes start with virtual visits from prior
+    # W = V * virtual_visits (so initial mean = V)
+    # N = virtual_visits (treated as "prior observations")
+    outcome_stats = [ChanceOutcomeStats(probs[i], V * virtual_visits, virtual_visits)
+                     for i in sorted_indices]
+
+    info = ChanceNodeInfo(
+      outcome_stats,
+      sorted_indices,      # Store mapping to original indices
+      V,
+      false,               # Not fully expanded yet
+      0                    # No outcomes expanded yet (only have prior)
+    )
+    env.chance_tree[state] = info
+    return V
+  end
+
+  info = env.chance_tree[state]
+  total_visits = Ntot(info) - length(info.outcomes) * virtual_visits  # Real visits only
+
+  # Progressive widening: should we expand a new outcome?
+  num_outcomes = length(info.outcomes)
+  should_expand = !info.expanded && (total_visits + 1)^α > info.num_expanded
+
+  if should_expand && info.num_expanded < num_outcomes
+    # Expand the next outcome (already sorted by probability)
+    return expand_next_progressive!(env, game, outcomes, state, info, η, depth, virtual_visits)
+  else
+    # Visit an already-expanded outcome (or fall back to highest prob if none expanded)
+    return visit_expanded_progressive!(env, game, outcomes, state, info, η, depth, virtual_visits)
+  end
+end
+
+"""
+Expand the next outcome in progressive mode.
+Outcomes are expanded in order of probability (highest first).
+"""
+function expand_next_progressive!(env::Env, game, outcomes, state, info::ChanceNodeInfo, η, depth, virtual_visits)
+  expand_idx = info.num_expanded + 1  # Next outcome to expand (1-indexed in sorted order)
+  original_idx = info.outcome_order[expand_idx]  # Map back to game's outcome order
+
+  outcome, _ = outcomes[original_idx]
+  game_copy = GI.clone(game)
+  GI.apply_chance!(game_copy, outcome)
+
+  if GI.game_terminated(game_copy)
+    v = 0.0
+  else
+    v = run_simulation!(env, game_copy, η=η, root=false, depth=depth+1)
+  end
+
+  # Update statistics: add real visit to the expanded outcome
+  old = info.outcomes[expand_idx]
+  info.outcomes[expand_idx] = ChanceOutcomeStats(old.prob, old.W + v, old.N + 1)
+
+  # Mark this outcome as expanded
+  info.num_expanded += 1
+  if info.num_expanded >= length(info.outcomes)
+    info.expanded = true
+  end
+  env.total_chance_nodes_expanded += 1
+
+  # Return probability-weighted value estimate
+  return compute_progressive_value(info, virtual_visits)
+end
+
+"""
+Visit an already-expanded outcome using visit-deficit selection.
+If no outcomes expanded yet, expand the first (highest probability) one.
+"""
+function visit_expanded_progressive!(env::Env, game, outcomes, state, info::ChanceNodeInfo, η, depth, virtual_visits)
+  if info.num_expanded == 0
+    # Edge case: no outcomes expanded yet, expand the first one
+    return expand_next_progressive!(env, game, outcomes, state, info, η, depth, virtual_visits)
+  end
+
+  # Select among expanded outcomes using visit deficit (like expectimax_chance!)
+  # Only consider the first num_expanded outcomes (which are sorted by probability)
+  expanded_outcomes = @view info.outcomes[1:info.num_expanded]
+  total_expanded_visits = sum(o.N for o in expanded_outcomes) - info.num_expanded * virtual_visits
+
+  # Select outcome with largest deficit: prob - visit_fraction
+  # This ensures visits are distributed according to probability
+  expanded_probs = [o.prob for o in expanded_outcomes]
+  total_expanded_prob = sum(expanded_probs)
+
+  visit_idx = argmax(
+    (expanded_outcomes[i].prob / total_expanded_prob) -
+    ((expanded_outcomes[i].N - virtual_visits) / max(total_expanded_visits, 1))
+    for i in 1:info.num_expanded
+  )
+
+  original_idx = info.outcome_order[visit_idx]
+  outcome, _ = outcomes[original_idx]
+  game_copy = GI.clone(game)
+  GI.apply_chance!(game_copy, outcome)
+
+  if GI.game_terminated(game_copy)
+    v = 0.0
+  else
+    v = run_simulation!(env, game_copy, η=η, root=false, depth=depth+1)
+  end
+
+  # Update statistics
+  old = info.outcomes[visit_idx]
+  info.outcomes[visit_idx] = ChanceOutcomeStats(old.prob, old.W + v, old.N + 1)
+
+  return compute_progressive_value(info, virtual_visits)
+end
+
+"""
+Compute the expected value for a progressive chance node.
+
+For expanded outcomes: use (W / N) as the mean value
+For unexpanded outcomes: use the prior value (Vest)
+
+All outcomes are weighted by their probability.
+The virtual visits are included in W and N, providing smooth prior integration.
+"""
+function compute_progressive_value(info::ChanceNodeInfo, virtual_visits)
+  total_value = 0.0
+
+  for (i, o) in enumerate(info.outcomes)
+    if i <= info.num_expanded
+      # Expanded outcome: use actual mean (includes prior via virtual visits)
+      mean_value = o.W / max(o.N, 1)
+    else
+      # Unexpanded outcome: use prior value
+      mean_value = info.Vest
+    end
+    total_value += o.prob * mean_value
+  end
+
+  return total_value
 end
 
 """
@@ -497,8 +741,12 @@ function memory_footprint_per_chance_node(gspec)
     return 0
   end
   size_key = 2 * (GI.state_memsize(gspec) + sizeof(Int))
-  dummy_stats = ChanceNodeInfo([
-    ChanceOutcomeStats(0, 0, 0) for i in 1:num_outcomes], 0, false)
+  dummy_stats = ChanceNodeInfo(
+    [ChanceOutcomeStats(0.0, 0.0, 0.0) for i in 1:num_outcomes],
+    collect(1:num_outcomes),  # outcome_order
+    Float32(0),               # Vest
+    false,                    # expanded
+    0)                        # num_expanded
   size_stats = Base.summarysize(dummy_stats)
   return size_key + size_stats
 end

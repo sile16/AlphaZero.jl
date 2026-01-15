@@ -54,6 +54,16 @@ In the original AlphaGo Zero paper:
   dirichlet_noise_ϵ :: Float64
   dirichlet_noise_α :: Float64
   prior_temperature :: Float64 = 1.
+  # Chance node handling mode for stochastic games:
+  #   :full - expand all outcomes (full expectimax, expensive)
+  #   :sampling - sample one outcome per visit (Monte Carlo, fast)
+  #   :progressive - progressive widening with prior integration
+  chance_mode :: Symbol = :full
+  # Progressive widening parameters (for :progressive mode)
+  # Expand new outcome when N^α > num_expanded (α=0.5 expands at 1,4,9,16,25,36...)
+  progressive_widening_alpha :: Float64 = 0.5
+  # Virtual visits to weight NN prior (higher = prior persists longer)
+  prior_virtual_visits :: Float64 = 1.0
 end
 
 """
