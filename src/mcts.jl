@@ -464,11 +464,29 @@ end
 """
 Expand the next outcome in progressive mode.
 Outcomes are expanded in order of probability (highest first).
+
+IMPORTANT: We must mark the outcome as expanded BEFORE the recursive call,
+because the recursive simulation can visit the same chance node again.
+Without this, multiple recursive calls could all try to expand the same slot.
 """
 function expand_next_progressive!(env::Env, game, outcomes, state, info::ChanceNodeInfo, η, depth, virtual_visits)
+  # Compute and CLAIM the next slot BEFORE the recursive call
   expand_idx = info.num_expanded + 1  # Next outcome to expand (1-indexed in sorted order)
-  original_idx = info.outcome_order[expand_idx]  # Map back to game's outcome order
 
+  # Safety check: ensure we haven't exceeded the outcomes
+  if expand_idx > length(info.outcomes)
+    # All outcomes already expanded by reentrant calls, just use visit logic
+    return visit_expanded_progressive!(env, game, outcomes, state, info, η, depth, virtual_visits)
+  end
+
+  # Mark this slot as claimed BEFORE the recursive call (reentrancy safety)
+  info.num_expanded += 1
+  if info.num_expanded >= length(info.outcomes)
+    info.expanded = true
+  end
+  env.total_chance_nodes_expanded += 1
+
+  original_idx = info.outcome_order[expand_idx]  # Map back to game's outcome order
   outcome, _ = outcomes[original_idx]
   game_copy = GI.clone(game)
   GI.apply_chance!(game_copy, outcome)
@@ -479,16 +497,9 @@ function expand_next_progressive!(env::Env, game, outcomes, state, info::ChanceN
     v = run_simulation!(env, game_copy, η=η, root=false, depth=depth+1)
   end
 
-  # Update statistics: add real visit to the expanded outcome
+  # Update statistics AFTER the recursive call
   old = info.outcomes[expand_idx]
   info.outcomes[expand_idx] = ChanceOutcomeStats(old.prob, old.W + v, old.N + 1)
-
-  # Mark this outcome as expanded
-  info.num_expanded += 1
-  if info.num_expanded >= length(info.outcomes)
-    info.expanded = true
-  end
-  env.total_chance_nodes_expanded += 1
 
   # Return probability-weighted value estimate
   return compute_progressive_value(info, virtual_visits)
