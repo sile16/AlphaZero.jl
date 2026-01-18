@@ -367,14 +367,14 @@ function run_simulation_chance_sampling!(env::Env, game, state, η, depth)
   outcomes = GI.chance_outcomes(game)
 
   if !haskey(env.chance_tree, state)
-    # FIRST VISIT: Query NN, use prior value, initialize with virtual visit
+    # FIRST VISIT: Query NN, use prior value, initialize with virtual visits
     (_, V) = env.oracle(state)
-    # Initialize each outcome with the prior value weighted by probability
-    # This gives us a reasonable starting estimate before any sampling
-    virtual_N = 1.0
-    outcome_stats = [ChanceOutcomeStats(prob, V * prob * virtual_N, virtual_N)
+    # Initialize each outcome with prior: mean = V, weight = virtual_N
+    # This way: Σ prob × (W/N) = Σ prob × V = V (correct expectation)
+    virtual_N = env.prior_virtual_visits
+    outcome_stats = [ChanceOutcomeStats(prob, V * virtual_N, virtual_N)
                      for (_, prob) in outcomes]
-    info = ChanceNodeInfo(outcome_stats, V, true)  # Mark as "expanded" immediately
+    info = ChanceNodeInfo(outcome_stats, collect(1:length(outcomes)), V, true, length(outcomes))
     env.chance_tree[state] = info
     return V
   end

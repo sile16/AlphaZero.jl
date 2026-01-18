@@ -40,9 +40,8 @@ self_play = SelfPlayParams(
     temperature=ConstSchedule(1.0),
     dirichlet_noise_ϵ=0.25,
     dirichlet_noise_α=0.3,   # Lower alpha for large action space
-    chance_mode=:progressive,           # Progressive widening for chance nodes
-    progressive_widening_alpha=0.5,     # Expand at visits 1,4,9,16,25,36...
-    prior_virtual_visits=1.0))          # Weight for NN prior integration
+    chance_mode=:sampling,   # Sample one outcome per visit with prior integration
+    prior_virtual_visits=1.0))  # Prior weight: 1/(1+k) after k samples
 
 arena = ArenaParams(
   sim=SimParams(

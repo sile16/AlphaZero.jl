@@ -125,3 +125,84 @@ Run full comparison with same wall-clock time:
 - Progressive mode (`chance_mode=:progressive`)
 
 Hypothesis: Progressive should outperform sampling by spending more effort on likely outcomes while maintaining prior information for unexplored outcomes.
+
+---
+
+## Session Management Guidelines
+
+### Preserving Training Data
+
+**DO preserve session data when:**
+- Training ran for a meaningful duration (more than a few minutes)
+- The run completed without obvious code bugs
+- Results are useful for comparison or analysis
+
+**OK to delete session data when:**
+- Short test runs (couple minutes just to verify code works)
+- Obvious code bugs caused incorrect behavior
+- Debugging/development runs with known issues
+
+### Session Documentation
+
+For each meaningful training session, write a short summary including:
+
+1. **Goal**: What hypothesis or question is this testing?
+2. **Configuration**: Key parameters that differ from defaults
+3. **Duration**: Training time and iterations completed
+4. **Results**: Key metrics (win rates, loss values, etc.)
+5. **Conclusions**: What did we learn?
+
+Example:
+```
+Session: backgammon-sampling-v1
+Goal: Test if sampling mode with prior integration outperforms deterministic MCTS
+Config: chance_mode=:sampling, prior_virtual_visits=1.0, 100 iters/turn
+Duration: 4 hours, 150 iterations
+Results: 65% vs GnuBG, 80% vs Random
+Conclusion: [pending comparison with deterministic baseline]
+```
+
+### Session Naming Convention
+
+Use descriptive names: `{game}-{variant}-{date}` or `{game}-{experiment}-v{N}`
+
+Examples:
+- `backgammon-sampling-20260118`
+- `backgammon-progressive-v2`
+- `pig-baseline-comparison`
+
+---
+
+## Key Insights
+
+### Sampling vs Deterministic MCTS (2026-01-18)
+
+Even with O(1) sampling at chance nodes, stochastic MCTS differs fundamentally from deterministic:
+
+**Deterministic MCTS** (hidden stochasticity):
+- Backs up value from ONE sampled path
+- No explicit aggregation across dice outcomes
+- Q(s,a) = average of whatever dice happened to come up
+
+**Stochastic MCTS with sampling**:
+- Samples ONE outcome but backs up EXPECTATION across ALL outcomes
+- `V = Σ prob_i × (W_i / N_i)` at each chance node
+- Prior fills in for unsampled/undersampled outcomes
+- Explicitly computes E[V | all dice]
+
+The key advantage is **explicit expectimax aggregation at backup time**, not just the prior.
+
+### Prior Integration Formula (Fixed 2026-01-18)
+
+Correct formula for mixing prior with samples:
+```
+W_initial = V_prior × virtual_N
+N_initial = virtual_N
+
+After k samples: mean = (V_prior × virtual_N + Σ samples) / (virtual_N + k)
+
+Prior weight: virtual_N / (virtual_N + k)
+Sample weight: k / (virtual_N + k)
+```
+
+Bug fixed: Was using `W = V × prob × virtual_N` (wrong), now `W = V × virtual_N` (correct).
