@@ -36,7 +36,26 @@ function convert_sample(
   end
   v = [e.z]
   is_chance = [e.is_chance ? 1f0 : 0f0]  # Convert to float for batching
-  return (; w, x, a, p, v, is_chance)
+
+  # Multi-head equity targets (if available)
+  if !isnothing(e.equity)
+    eq = e.equity
+    eq_win = [eq.p_win]
+    eq_gw = [eq.p_gammon_win]
+    eq_bgw = [eq.p_bg_win]
+    eq_gl = [eq.p_gammon_loss]
+    eq_bgl = [eq.p_bg_loss]
+    has_equity = [1f0]  # Flag indicating equity targets are present
+  else
+    eq_win = [0f0]
+    eq_gw = [0f0]
+    eq_bgw = [0f0]
+    eq_gl = [0f0]
+    eq_bgl = [0f0]
+    has_equity = [0f0]  # No equity targets
+  end
+
+  return (; w, x, a, p, v, is_chance, eq_win, eq_gw, eq_bgw, eq_gl, eq_bgl, has_equity)
 end
 
 function convert_samples(
@@ -51,8 +70,17 @@ function convert_samples(
   P = Flux.batch([e.p for e in ces])
   V = Flux.batch([e.v for e in ces])
   IsChance = Flux.batch([e.is_chance for e in ces])
+
+  # Multi-head equity targets
+  EqWin = Flux.batch([e.eq_win for e in ces])
+  EqGW = Flux.batch([e.eq_gw for e in ces])
+  EqBGW = Flux.batch([e.eq_bgw for e in ces])
+  EqGL = Flux.batch([e.eq_gl for e in ces])
+  EqBGL = Flux.batch([e.eq_bgl for e in ces])
+  HasEquity = Flux.batch([e.has_equity for e in ces])
+
   f32(arr) = convert(AbstractArray{Float32}, arr)
-  return map(f32, (; W, X, A, P, V, IsChance))
+  return map(f32, (; W, X, A, P, V, IsChance, EqWin, EqGW, EqBGW, EqGL, EqBGL, HasEquity))
 end
 
 #####
@@ -69,7 +97,19 @@ entropy_wmean(π, w) = -sum(π .* log.(π .+ eps(eltype(π))) .* w) / sum(w)
 
 wmean(x, w) = sum(x .* w) / sum(w)
 
-function losses(nn, params, Wmean, Hp, (W, X, A, P, V, IsChance))
+# Binary cross-entropy loss (for multi-head outputs)
+bce_wmean(ŷ, y, w) = -sum((y .* log.(ŷ .+ eps(eltype(y))) .+
+                           (1f0 .- y) .* log.(1f0 .- ŷ .+ eps(eltype(y)))) .* w) / sum(w)
+
+"""
+    losses(nn, params, Wmean, Hp, batch)
+
+Compute training losses for a neural network.
+Supports both single-head and multi-head (equity) networks.
+"""
+function losses(nn, params, Wmean, Hp, batch)
+  W, X, A, P, V, IsChance = batch.W, batch.X, batch.A, batch.P, batch.V, batch.IsChance
+
   # Ideally, we would only apply the L2 penalty to weight parameters and not
   # bias parameters. However, Flux currently cannot differentiate through
   # `Flux.modules`, which is used in the implementation of
@@ -79,13 +119,50 @@ function losses(nn, params, Wmean, Hp, (W, X, A, P, V, IsChance))
   regws = Network.params(nn)
   creg = params.l2_regularization
   cinv = params.nonvalidity_penalty
-  P̂, V̂, p_invalid = Network.forward_normalized(nn, X, A)
-  V = V ./ params.rewards_renormalization
-  V̂ = V̂ ./ params.rewards_renormalization
 
   # Mask for decision nodes only (policy loss should not apply to chance nodes)
   decision_mask = 1f0 .- IsChance
   W_decision = W .* decision_mask
+
+  # Check if this is a multi-head network
+  is_multihead = nn isa FluxLib.FCResNetMultiHead
+
+  if is_multihead
+    # Multi-head forward pass
+    P̂, V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl, p_invalid =
+      FluxLib.forward_normalized_multihead(nn, X, A)
+
+    # Get equity targets
+    EqWin, EqGW, EqBGW, EqGL, EqBGL, HasEquity =
+      batch.EqWin, batch.EqGW, batch.EqBGW, batch.EqGL, batch.EqBGL, batch.HasEquity
+
+    # Weight for samples that have equity targets
+    W_equity = W .* HasEquity
+
+    # Multi-head value losses (binary cross-entropy for each head)
+    if sum(W_equity) > 0
+      Lv_win = bce_wmean(V̂_win, EqWin, W_equity)
+      Lv_gw = bce_wmean(V̂_gw, EqGW, W_equity)
+      Lv_bgw = bce_wmean(V̂_bgw, EqBGW, W_equity)
+      Lv_gl = bce_wmean(V̂_gl, EqGL, W_equity)
+      Lv_bgl = bce_wmean(V̂_bgl, EqBGL, W_equity)
+      Lv = Lv_win + Lv_gw + Lv_bgw + Lv_gl + Lv_bgl
+    else
+      # Fallback: use standard value loss if no equity targets
+      V_normalized = V ./ params.rewards_renormalization
+      equity = FluxLib.compute_equity(V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl)
+      V̂_combined = equity ./ 3f0  # Scale to [-1, 1]
+      Lv = mse_wmean(V̂_combined, V_normalized, W)
+    end
+  else
+    # Standard single-head forward pass
+    P̂, V̂, p_invalid = Network.forward_normalized(nn, X, A)
+    V_normalized = V ./ params.rewards_renormalization
+    V̂ = V̂ ./ params.rewards_renormalization
+
+    # Value loss: For ALL nodes (including chance nodes)
+    Lv = mse_wmean(V̂, V_normalized, W)
+  end
 
   # Policy loss: ONLY for decision nodes
   # If there are no decision nodes in the batch, skip policy loss
@@ -94,9 +171,6 @@ function losses(nn, params, Wmean, Hp, (W, X, A, P, V, IsChance))
   else
     zero(Float32)
   end
-
-  # Value loss: For ALL nodes (including chance nodes)
-  Lv = mse_wmean(V̂, V, W)
 
   Lreg = iszero(creg) ?
     zero(Lv) :
@@ -129,7 +203,7 @@ struct Trainer
     end
     data = convert_samples(gspec, params.samples_weighing_policy, samples)
     network = Network.copy(network, on_gpu=params.use_gpu, test_mode=test_mode)
-    W, X, A, P, V, IsChance = data
+    W, X, A, P, V, IsChance = data.W, data.X, data.A, data.P, data.V, data.IsChance
     Wmean = mean(W)
     # Compute entropy only for decision nodes
     decision_mask = 1f0 .- IsChance
@@ -188,7 +262,7 @@ end
 function learning_status(tr::Trainer, samples)
   # As done now, this is slighly inefficient as we solve the
   # same neural network inference problem twice
-  W, X, A, P, V, IsChance = samples
+  W, X, A, P, V, IsChance = samples.W, samples.X, samples.A, samples.P, samples.V, samples.IsChance
   Ls = losses(tr.network, tr.params, tr.Wmean, tr.Hp, samples)
   Ls = Network.convert_output_tuple(tr.network, Ls)
   Pnet, _ = Network.forward_normalized(tr.network, X, A)

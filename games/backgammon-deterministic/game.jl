@@ -18,8 +18,8 @@ using Random
 using BackgammonNet
 
 # Configuration constants
-const SHORT_GAME = true
-const DOUBLES_ONLY = true
+const SHORT_GAME = true  # Shorter games for faster learning (intentionally different starting position)
+const DOUBLES_ONLY = false  # Full 21 dice outcomes for proper stochastic testing
 
 # Action space: 676 actions (26*26 locations)
 const NUM_ACTIONS = 676
@@ -38,6 +38,7 @@ const BLACK = false  # Player 1
 struct GameSpec <: GI.AbstractGameSpec end
 
 GI.two_players(::GameSpec) = true
+GI.supports_equity_targets(::GameSpec) = true
 
 function GI.actions(::GameSpec)
   return collect(1:NUM_ACTIONS)
@@ -93,6 +94,10 @@ end
 
 GI.white_playing(g::GameEnv) = g.game.current_player == 0
 
+# Direct state access for white_playing - avoids creating GameEnv which may have side effects
+# This is used by push_trace! in memory.jl to determine value perspective
+GI.white_playing(::GameSpec, state::BackgammonNet.BackgammonGame) = state.current_player == 0
+
 function GI.init(::GameSpec)
   game = BackgammonNet.initial_state(; short_game=SHORT_GAME, doubles_only=DOUBLES_ONLY)
   rng = MersenneTwister()
@@ -107,6 +112,7 @@ function GI.game_terminated(g::GameEnv)
 end
 
 function GI.white_reward(g::GameEnv)
+  # BackgammonNet: g.reward > 0 means P0 (white) won, < 0 means P1 (black) won
   return Float64(g.game.reward)
 end
 

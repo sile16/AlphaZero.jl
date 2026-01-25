@@ -1,18 +1,33 @@
 #####
 ##### Weights & Biases (wandb) Integration
 #####
+##### PythonCall is lazy-loaded to avoid conflicts with PyCall (used by gnubg).
+#####
 
 module Wandb
 
-using PythonCall
 using ..AlphaZero: Report, Params, Network
 
-# Lazy-loaded wandb module
-const wandb = Ref{Py}()
+# Lazy-loaded PythonCall and wandb module
+const _pythoncall_loaded = Ref(false)
+const _pyimport = Ref{Function}()
+const _pydict = Ref{Function}()
+const wandb = Ref{Any}()
+
+function ensure_pythoncall_loaded()
+  if !_pythoncall_loaded[]
+    # Import PythonCall lazily to avoid conflicts with PyCall
+    @eval using PythonCall
+    _pyimport[] = PythonCall.pyimport
+    _pydict[] = PythonCall.pydict
+    _pythoncall_loaded[] = true
+  end
+end
 
 function ensure_wandb_loaded()
+  ensure_pythoncall_loaded()
   if !isassigned(wandb)
-    wandb[] = pyimport("wandb")
+    wandb[] = _pyimport[]("wandb")
   end
   return wandb[]
 end
@@ -46,7 +61,7 @@ function wandb_init(; project::String, name=nothing, config=Dict())
   wb.init(
     project=project,
     name=name,
-    config=pydict(config)
+    config=_pydict[](config)
   )
 end
 
@@ -62,9 +77,9 @@ Log metrics to wandb.
 function wandb_log(metrics::Dict; step=nothing)
   wb = ensure_wandb_loaded()
   if isnothing(step)
-    wb.log(pydict(metrics))
+    wb.log(_pydict[](metrics))
   else
-    wb.log(pydict(metrics), step=step)
+    wb.log(_pydict[](metrics), step=step)
   end
 end
 
@@ -124,6 +139,7 @@ function params_to_config(params::Params, network)
     ap = params.arena
     config["arena/num_games"] = ap.sim.num_games
     config["arena/update_threshold"] = ap.update_threshold
+    config["arena/always_replace"] = ap.always_replace
   end
 
   # Progressive simulation parameters (if present)

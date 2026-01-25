@@ -4,7 +4,9 @@ along with a library of standard architectures.
 """
 module FluxLib
 
-export SimpleNet, SimpleNetHP, ResNet, ResNetHP
+export SimpleNet, SimpleNetHP, ResNet, ResNetHP, FCResNet, FCResNetHP
+export FCResNetMultiHead, FCResNetMultiHeadHP
+export EquityOutput, compute_equity, forward_multihead, forward_normalized_multihead
 
 using ..AlphaZero
 
@@ -142,5 +144,7 @@ Network.on_gpu(nn::TwoHeadNetwork) = array_on_gpu(nn.vhead[end].bias)
 
 include("architectures/simplenet.jl")
 include("architectures/resnet.jl")
+include("architectures/fc_resnet.jl")
+include("architectures/fc_resnet_multihead.jl")
 
 end

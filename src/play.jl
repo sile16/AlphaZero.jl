@@ -224,6 +224,64 @@ function reset_player!(player::MctsPlayer)
 end
 
 #####
+##### Gumbel MCTS player
+#####
+
+"""
+    GumbelMctsPlayer{MctsEnv} <: AbstractPlayer
+
+A player that selects actions using Gumbel MCTS (sequential halving with
+Gumbel-max trick).
+
+# Constructors
+
+    GumbelMctsPlayer(mcts::GumbelMCTS.Env; τ)
+
+Construct a player from a Gumbel MCTS environment.
+
+The temperature parameter `τ` can be either a real number or an
+[`AbstractSchedule`](@ref).
+
+    GumbelMctsPlayer(game_spec::AbstractGameSpec, oracle,
+                     params::GumbelMctsParams)
+
+Construct a Gumbel MCTS player from an oracle and a [`GumbelMctsParams`](@ref).
+"""
+struct GumbelMctsPlayer{M} <: AbstractPlayer
+  mcts :: M
+  τ :: AbstractSchedule{Float64}
+  function GumbelMctsPlayer(mcts::GumbelMCTS.Env; τ)
+    new{typeof(mcts)}(mcts, τ)
+  end
+end
+
+# Alternative constructor
+function GumbelMctsPlayer(
+    game_spec::AbstractGameSpec, oracle, params::GumbelMctsParams)
+  mcts = GumbelMCTS.Env(game_spec, oracle,
+    gamma=params.gamma,
+    num_simulations=params.num_simulations,
+    max_considered_actions=params.max_considered_actions,
+    prior_temperature=params.prior_temperature,
+    c_scale=params.c_scale,
+    c_visit=params.c_visit)
+  return GumbelMctsPlayer(mcts, τ=params.temperature)
+end
+
+function think(p::GumbelMctsPlayer, game)
+  GumbelMCTS.explore!(p.mcts, game)
+  return GumbelMCTS.policy(p.mcts, game)
+end
+
+function player_temperature(p::GumbelMctsPlayer, game, turn)
+  return p.τ[turn]
+end
+
+function reset_player!(player::GumbelMctsPlayer)
+  GumbelMCTS.reset!(player.mcts)
+end
+
+#####
 ##### Turn-progressive MCTS player
 #####
 
@@ -384,6 +442,11 @@ function play_game(gspec, player; flip_probability=0.)
 
   while true
     if GI.game_terminated(game)
+      # Set game outcome for multi-head equity training if supported
+      outcome = GI.game_outcome(game)
+      if !isnothing(outcome)
+        set_outcome!(trace, outcome)
+      end
       return trace
     end
 

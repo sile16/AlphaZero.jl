@@ -44,6 +44,21 @@ module AlphaZero
   using .MCTS
   export MCTS
 
+  # Batched MCTS for improved GPU utilization
+  include("batched_mcts.jl")
+  using .BatchedMCTS
+  export BatchedMCTS
+
+  # Async MCTS with continuous GPU inference pipeline
+  include("async_mcts.jl")
+  using .AsyncMCTS
+  export AsyncMCTS
+
+  # Gumbel MCTS implementation (sequential halving with Gumbel-max trick)
+  include("gumbel_mcts.jl")
+  using .GumbelMCTS
+  export GumbelMCTS
+
   # A generic network interface
   include("networks/network.jl")
   using .Network
@@ -57,6 +72,11 @@ module AlphaZero
   using .Batchifier
   export Batchifier
 
+  # Async batchifier for better parallelism
+  include("async_batchifier.jl")
+  using .AsyncBatchifier
+  export AsyncBatchifier
+
   # Schedules
   include("schedule.jl")
   export AbstractSchedule
@@ -66,6 +86,7 @@ module AlphaZero
   include("params.jl")
   export Params
   export MctsParams
+  export GumbelMctsParams
   export SimParams
   export SelfPlayParams
   export LearningParams
@@ -88,6 +109,7 @@ module AlphaZero
   include("play.jl")
   export AbstractPlayer, think, select_move, reset_player!, player_temperature
   export MctsPlayer, TurnProgressiveMctsPlayer
+  export GumbelMctsPlayer
   export RandomPlayer
   export NetworkPlayer
   export PlayerWithTemperature
@@ -149,7 +171,7 @@ module AlphaZero
 
   using .NetLib
   export NetLib
-  export SimpleNet, SimpleNetHP, ResNet, ResNetHP
+  export SimpleNet, SimpleNetHP, ResNet, ResNetHP, FCResNet, FCResNetHP
 
   # A structure that contains the information necessary to replicate a training session
   include("experiments.jl")

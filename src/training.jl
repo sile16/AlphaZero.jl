@@ -239,11 +239,14 @@ function learning_step!(env::Env, handler)
         compare_networks(env.gspec, env.curnn, env.bestnn, ap, handler)
       teval += eval_report.time
       # If eval is good enough, replace network
-      success = (eval_report.avgr >= best_evalr)
+      # If always_replace is set, always accept the new network (eval is just for tracking)
+      success = ap.always_replace || (eval_report.avgr >= best_evalr)
       if success
         nn_replaced = true
         env.bestnn = copy(env.curnn)
-        best_evalr = eval_report.avgr
+        if !ap.always_replace
+          best_evalr = eval_report.avgr
+        end
       end
       checkpoint_report =
         Report.Checkpoint(k * nbatches, eval_report, status, success)
@@ -267,8 +270,13 @@ end
 
 # To be given as an argument to `Simulator`
 function self_play_measurements(trace, _, player)
-  mem = MCTS.approximate_memory_footprint(player.mcts)
-  edepth = MCTS.average_exploration_depth(player.mcts)
+  if player isa GumbelMctsPlayer
+    mem = GumbelMCTS.approximate_memory_footprint(player.mcts)
+    edepth = GumbelMCTS.average_exploration_depth(player.mcts)
+  else
+    mem = MCTS.approximate_memory_footprint(player.mcts)
+    edepth = MCTS.average_exploration_depth(player.mcts)
+  end
   return (trace=trace, mem=mem, edepth=edepth)
 end
 
@@ -279,7 +287,13 @@ function self_play_step!(env::Env, handler)
     Network.copy(env.bestnn, on_gpu=params.sim.use_gpu, test_mode=true)
 
   # Determine which type of simulation budget to use
-  if !isnothing(env.params.turn_progressive_sim)
+  if !isnothing(params.gumbel_mcts)
+    # Gumbel MCTS (sequential halving with Gumbel-max trick)
+    simulator = Simulator(make_oracle, self_play_measurements) do oracle
+      return GumbelMctsPlayer(env.gspec, oracle, params.gumbel_mcts)
+    end
+    num_sims_for_report = params.gumbel_mcts.num_simulations
+  elseif !isnothing(env.params.turn_progressive_sim)
     # Turn-based progressive simulation (varies by turn within game AND iteration)
     turn_params = env.params.turn_progressive_sim
     simulator = Simulator(make_oracle, self_play_measurements) do oracle

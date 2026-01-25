@@ -67,6 +67,42 @@ In the original AlphaGo Zero paper:
 end
 
 """
+Parameters for Gumbel MCTS (sequential halving with Gumbel-max trick).
+
+Based on "Policy improvement by planning with Gumbel" (Danihelka et al., 2022).
+
+| Parameter                | Type                         | Default             |
+|:-------------------------|:-----------------------------|:--------------------|
+| `num_simulations`        | `Int`                        |  -                  |
+| `gamma`                  | `Float64`                    | `1.`                |
+| `max_considered_actions` | `Int`                        | `16`                |
+| `temperature`            | `AbstractSchedule{Float64}`  | `ConstSchedule(1.)` |
+| `prior_temperature`      | `Float64`                    | `1.`                |
+| `c_scale`                | `Float64`                    | `1.`                |
+| `c_visit`                | `Float64`                    | `50.`               |
+
+# Explanation
+
+Gumbel MCTS uses the Gumbel-max trick for action selection at the root,
+combined with sequential halving to efficiently allocate simulations.
+This can achieve similar policy improvement to standard MCTS with fewer
+simulations (e.g., 16-50 instead of 100-800).
+
+The `c_scale` and `c_visit` parameters control Q-value completion,
+which interpolates between the value estimate (for unvisited actions)
+and the empirical Q-value (for visited actions).
+"""
+@kwdef struct GumbelMctsParams
+  gamma :: Float64 = 1.
+  num_simulations :: Int
+  max_considered_actions :: Int = 16
+  temperature :: AbstractSchedule{Float64} = ConstSchedule(1.)
+  prior_temperature :: Float64 = 1.
+  c_scale :: Float64 = 1.
+  c_visit :: Float64 = 50.
+end
+
+"""
     SimParams
 
 Parameters for parallel game simulations.
@@ -108,6 +144,10 @@ and benchmarking.
   reset_every :: Union{Nothing, Int} = 1
   flip_probability :: Float64 = 0.
   alternate_colors :: Bool = false
+  # Async batching parameters (for better parallelism)
+  use_async_batchifier :: Bool = false
+  async_min_batch :: Int = 1
+  async_timeout_ns :: Int = 1_000_000  # 1ms default
 end
 
 """
@@ -122,6 +162,7 @@ the current neural network with the best one seen so far
 | `mcts`               | [`MctsParams`](@ref)  |  -             |
 | `sim`                | [`SimParams`](@ref)   |  -             |
 | `update_threshold`   | `Float64`             |  -             |
+| `always_replace`     | `Bool`                | `false`        |
 
 # Explanation (two-player games)
 
@@ -150,6 +191,7 @@ and the `update_threshold` parameter is set to a value that corresponds to a
   mcts :: MctsParams
   sim :: SimParams
   update_threshold :: Float64
+  always_replace :: Bool = false  # If true, always replace network (eval is just for tracking)
 end
 
 """
@@ -157,10 +199,17 @@ end
 
 Parameters governing self-play.
 
-| Parameter            | Type                  | Default        |
-|:---------------------|:----------------------|:---------------|
-| `mcts`               | [`MctsParams`](@ref)  |  -             |
-| `sim`                | [`SimParams`](@ref)   |  -             |
+| Parameter            | Type                                 | Default        |
+|:---------------------|:-------------------------------------|:---------------|
+| `mcts`               | [`MctsParams`](@ref)                 |  -             |
+| `sim`                | [`SimParams`](@ref)                  |  -             |
+| `gumbel_mcts`        | `Union{Nothing, GumbelMctsParams}`   | `nothing`      |
+
+# Explanation
+
+If `gumbel_mcts` is provided, Gumbel MCTS (sequential halving with Gumbel-max
+trick) will be used for self-play instead of standard MCTS. This can provide
+better sample efficiency, especially at low simulation counts.
 
 # AlphaGo Zero Parameters
 
@@ -170,6 +219,7 @@ of self-play across 200 iterations).
 @kwdef struct SelfPlayParams
   mcts :: MctsParams
   sim :: SimParams
+  gumbel_mcts :: Union{Nothing, GumbelMctsParams} = nothing
 end
 
 """

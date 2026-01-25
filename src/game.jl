@@ -7,7 +7,7 @@ In two-player zero-sum games, we call `black` the player trying to minimize the 
 """
 module GameInterface
 
-export AbstractGameSpec, AbstractGameEnv
+export AbstractGameSpec, AbstractGameEnv, GameOutcome
 
 using ..AlphaZero: Util
 
@@ -125,6 +125,22 @@ For a one-player game, this function must always return `true`.
 function white_playing end
 
 """
+    white_playing(::AbstractGameSpec, state) :: Bool
+
+Return `true` if white is to play in the given state.
+
+This version operates directly on a state without creating a GameEnv,
+avoiding potential side effects from `set_state!`. Games that use
+canonical (current-player-relative) observations should implement this
+to ensure consistent perspective computation in training.
+
+Default implementation creates a temporary GameEnv, which may have side effects.
+"""
+function white_playing(gspec::AbstractGameSpec, state)
+  return white_playing(init(gspec, state))
+end
+
+"""
     actions_mask(::AbstractGameEnv)
 
 Return a boolean mask indicating what actions are available.
@@ -164,6 +180,73 @@ This function is not needed by AlphaZero but it is useful for building
 baselines such as minmax players.
 """
 function heuristic_value end
+
+#####
+##### Multi-head equity support (for games like backgammon)
+#####
+
+"""
+    GameOutcome
+
+Struct representing the detailed outcome of a game for multi-head training.
+
+| Field | Description |
+|:------|:------------|
+| `white_won :: Bool` | True if white (player 0) won |
+| `is_gammon :: Bool` | True if the win was a gammon (2x) |
+| `is_backgammon :: Bool` | True if the win was a backgammon (3x) |
+"""
+struct GameOutcome
+  white_won :: Bool
+  is_gammon :: Bool
+  is_backgammon :: Bool
+end
+
+"""
+    game_outcome(game::AbstractGameEnv) :: Union{Nothing, GameOutcome}
+
+Return detailed game outcome for multi-head equity training.
+
+Returns `nothing` if the game is not terminated.
+Returns a `GameOutcome` struct with:
+- `white_won`: true if white (player 0) won
+- `is_gammon`: true if the winner won by gammon
+- `is_backgammon`: true if the winner won by backgammon
+
+Default implementation uses `white_reward` to infer outcome:
+- |reward| == 1: single game
+- |reward| == 2: gammon
+- |reward| == 3: backgammon
+
+Games can override this for more accurate detection.
+"""
+function game_outcome(game::AbstractGameEnv)
+  if !game_terminated(game)
+    return nothing
+  end
+
+  reward = white_reward(game)
+  white_won = reward > 0
+  abs_reward = abs(reward)
+
+  # Default interpretation based on reward magnitude
+  is_gammon = abs_reward >= 2
+  is_backgammon = abs_reward >= 3
+
+  return GameOutcome(white_won, is_gammon, is_backgammon)
+end
+
+"""
+    supports_equity_targets(::AbstractGameSpec) :: Bool
+
+Return true if this game supports multi-head equity targets.
+Games that return gammon/backgammon outcomes should override this to return true.
+
+Default returns false.
+"""
+function supports_equity_targets(::AbstractGameSpec)
+  return false
+end
 
 #####
 ##### Stochastic games / Chance nodes

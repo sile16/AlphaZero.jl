@@ -11,6 +11,8 @@ as targets for the neural network.
 
 For stochastic games, the `is_chance` field tracks which states were chance nodes.
 
+The `outcome` field stores the game outcome for multi-head equity training.
+
 # Constructor
 
     Trace(initial_state; is_chance_node=false)
@@ -21,8 +23,9 @@ mutable struct Trace{State}
   policies :: Vector{Vector{Float64}}
   rewards :: Vector{Float64}
   is_chance :: Vector{Bool}  # Track which states were chance nodes
+  outcome :: Union{Nothing, GI.GameOutcome}  # Final game outcome for equity training
   function Trace(init_state; is_chance_node=false)
-    return new{typeof(init_state)}([init_state], [], [], [is_chance_node])
+    return new{typeof(init_state)}([init_state], [], [], [is_chance_node], nothing)
   end
 end
 
@@ -50,6 +53,15 @@ end
 
 function total_reward(t::Trace, gamma=1.)
   return sum([gamma^(i-1) * r for (i, r) in enumerate(t.rewards)])
+end
+
+"""
+    set_outcome!(t::Trace, outcome::GI.GameOutcome)
+
+Set the game outcome for multi-head equity training.
+"""
+function set_outcome!(t::Trace, outcome::GI.GameOutcome)
+  t.outcome = outcome
 end
 
 function debug_trace(gspec::AbstractGameSpec, t::Trace)
