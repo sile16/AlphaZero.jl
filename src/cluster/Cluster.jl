@@ -9,6 +9,7 @@ module Cluster
 
 using Base.Threads
 using Statistics: mean
+using Random
 
 import Flux
 
@@ -86,6 +87,7 @@ end
 
 """
 Thread-based self-play worker.
+Each worker has its own RNG seeded with a unique seed derived from the main seed.
 """
 function run_threaded_worker!(
     worker_id::Int,
@@ -95,8 +97,15 @@ function run_threaded_worker!(
     sample_buffer::ThreadedSampleBuffer,
     running::Ref{Bool},
     network_lock::ReentrantLock,
-    network_version::Ref{Int}
+    network_version::Ref{Int};
+    worker_seed::Union{Nothing, Int}=nothing
 )
+    # Initialize thread-local RNG with worker-specific seed
+    if !isnothing(worker_seed)
+        Random.seed!(worker_seed)
+        @debug "Worker $worker_id: seeded RNG with $worker_seed"
+    end
+
     # Create worker's own network copy (CPU, test mode)
     worker_network = Network.copy(network, on_gpu=false, test_mode=true)
     local_version = 0
@@ -210,6 +219,7 @@ end
 
 Start training using Julia threads for parallel self-play.
 Each worker thread has its own network copy for inference.
+Each worker gets a unique seed derived from the main seed for reproducibility.
 
 Returns the coordinator after training completes.
 """
@@ -228,7 +238,8 @@ function start_cluster_training(
     checkpoint_dir::String = "checkpoints",
     wandb_log::Union{Nothing, Function} = nothing,
     eval_fn::Union{Nothing, Function} = nothing,
-    eval_interval::Int = 10
+    eval_interval::Int = 10,
+    seed::Union{Nothing, Int} = nothing
 )
     # Check threads
     num_threads = nthreads()
@@ -251,13 +262,27 @@ function start_cluster_training(
     network_lock = ReentrantLock()
     network_version = Ref(1)
 
+    # Generate worker seeds from main seed
+    worker_seeds = if !isnothing(seed)
+        # Derive unique seeds for each worker: seed + worker_id * large_prime
+        [seed + i * 104729 for i in 1:num_workers]
+    else
+        fill(nothing, num_workers)
+    end
+
     # Start worker threads
-    @info "Starting $num_workers worker threads"
+    if !isnothing(seed)
+        @info "Starting $num_workers worker threads with seeds derived from $seed"
+    else
+        @info "Starting $num_workers worker threads (unseeded)"
+    end
     worker_tasks = Task[]
     for i in 1:num_workers
+        ws = worker_seeds[i]
         task = Threads.@spawn run_threaded_worker!(
             i, gspec, coord.network, mcts_params,
-            sample_buffer, running, network_lock, network_version
+            sample_buffer, running, network_lock, network_version;
+            worker_seed=ws
         )
         push!(worker_tasks, task)
     end

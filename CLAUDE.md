@@ -218,7 +218,7 @@ julia --project --threads=8 scripts/train_cluster.jl --no-wandb ...
 8. **Thread safety for parallel training**: ReentrantLock essential for sample buffer; version counters for weight sync
 9. **Evaluation variance is high**: 50-game evals show ±0.2 variance; use 1000+ games for reliable comparisons
 10. **Buffer capacity matters**: 100K samples prevents overfitting to recent games
-11. **Reproducibility NOT guaranteed**: Code uses global RNG without seed management; runs are not reproducible (TODO: add --seed flag)
+11. **Reproducibility via --seed flag**: Use `--seed=12345` for reproducible runs; each worker gets a unique derived seed
 12. **Git commit hash logged**: `train_cluster.jl` logs git commit at start and saves to `run_info.txt` for traceability
 
 ### Training Infrastructure
@@ -233,7 +233,7 @@ julia --project --threads=8 scripts/train_cluster.jl --no-wandb ...
 2. ✅ Thread-based parallel training - **DONE** (train_cluster.jl, 4-6x throughput)
 3. ✅ WandB integration - **DONE** (system + training metrics)
 4. ✅ Parallel final evaluation - **DONE** (40-60x speedup)
-5. Add `--seed` flag for reproducibility
+5. ✅ `--seed` flag for reproducibility - **DONE** (thread-local derived seeds)
 6. Multi-machine training using Julia Distributed
 7. GnuBG evaluation integration
 8. Match equity table (MET) integration

@@ -24,6 +24,7 @@ using ArgParse
 using CUDA
 using Dates
 using Distributed
+using Random
 
 # Configure CUDA BEFORE loading AlphaZero
 if CUDA.functional()
@@ -173,6 +174,12 @@ function parse_args()
             default = 1000
         "--final-eval-workers"
             help = "Number of parallel workers for final evaluation (0 = use all threads)"
+            arg_type = Int
+            default = 0
+
+        # Reproducibility
+        "--seed"
+            help = "Random seed for reproducibility (0 = use random seed)"
             arg_type = Int
             default = 0
 
@@ -399,10 +406,19 @@ function main()
         false
     end
 
+    # Initialize random seed for reproducibility
+    seed = args["seed"]
+    if seed == 0
+        seed = rand(UInt32)  # Generate random seed
+    end
+    Random.seed!(seed)
+    @info "Random seed: $seed"
+
     @info "=" ^ 60
     @info "Distributed AlphaZero Training (Julia Distributed)"
     @info "=" ^ 60
     @info "Git commit: $(git_hash[1:min(8, length(git_hash))])$(git_dirty ? " (dirty)" : "")"
+    @info "Seed: $seed"
 
     # Load game
     gspec = get_game_spec(args["game"])
@@ -508,6 +524,7 @@ function main()
                 # Reproducibility
                 "git_commit" => git_hash,
                 "git_dirty" => git_dirty,
+                "seed" => seed,
             )
 
             wandb_init(project=args["wandb_project"], name=run_name, config=config)
@@ -554,6 +571,7 @@ function main()
         println(f, "timestamp: $timestamp")
         println(f, "git_commit: $git_hash")
         println(f, "git_dirty: $git_dirty")
+        println(f, "seed: $seed")
         println(f, "")
         println(f, "# Arguments")
         for (k, v) in sort(collect(args), by=first)
@@ -617,7 +635,8 @@ function main()
             checkpoint_dir=checkpoint_dir,
             wandb_log=wandb_log_fn,
             eval_fn=eval_fn,
-            eval_interval=eval_interval
+            eval_interval=eval_interval,
+            seed=seed
         )
     catch e
         if e isa InterruptException
