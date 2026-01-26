@@ -160,52 +160,42 @@ Plus 6 additional features:
 
 ---
 
-## Priority 4: Distributed Self-Play
+## Priority 4: Distributed Self-Play ✅ IMPLEMENTED
 
-### Current Architecture
+### Status: COMPLETE (2026-01-26)
 
-Single process:
-1. Self-play generates games (CPU-bound with GPU inference)
-2. Training uses collected samples (GPU-bound)
-3. Arena evaluates (CPU-bound)
+Thread-based cluster training implemented with 4-6x throughput improvement.
+See "Cluster Training Experiment Results" section below for details.
 
-### Proposed Architecture
+### Implementation Summary
 
-**Central coordinator:**
-- Manages replay buffer
-- Runs training on GPU
-- Distributes latest network weights
+**Thread-Based Architecture** (chosen over Julia Distributed):
+- 6 worker threads for parallel self-play
+- Each worker has own network copy (CPU, test mode)
+- Thread-safe sample buffer with ReentrantLock
+- Main thread handles training on GPU
+- Weight synchronization via version counter
 
-**Self-play workers (multiple):**
-- Receive network weights from coordinator
-- Generate self-play games on CPU
-- Send game data to coordinator
+**Why Threads Instead of Distributed**:
+- Julia Distributed had serialization issues with closures/complex types
+- Thread-based approach simpler for single-machine training
+- Shared memory avoids network transfer overhead
+- Achieved 4-6x throughput improvement (~228 vs ~50 games/min)
 
-**Evaluator workers:**
-- Periodically evaluate against baselines
-- Report metrics
+### Files Added
+- `src/cluster/Cluster.jl` - Main module
+- `src/cluster/worker.jl` - Worker types
+- `src/cluster/coordinator.jl` - Coordinator with replay buffer
+- `src/cluster/types.jl` - Data types
+- `scripts/train_cluster.jl` - Training script
+- `test/test_cluster.jl` - 70 unit tests
 
-### Implementation Options
+### Future: Multi-Machine Training
 
-**Option A: Julia Distributed**
-- Use `Distributed.jl` for workers
-- SharedArrays or remote channels for data transfer
-- Simplest to implement
-
-**Option B: Message Queue**
-- Redis/ZeroMQ for coordination
-- Workers can be on different machines
-- More scalable
-
-**Option C: Ray-style actors**
-- Similar to what DeepMind uses
-- Would need Julia bindings or custom implementation
-
-### Estimated Speedup
-
-With N workers: ~N× self-play throughput (limited by GPU training speed)
-
-Current bottleneck is CPU-bound self-play MCTS, so this should help significantly.
+For multi-machine training, ZMQ-based communication can be added:
+- Workers connect to inference server via TCP
+- Sample submission via PUSH/PULL sockets
+- Weight broadcast via PUB/SUB sockets
 
 ---
 
@@ -303,16 +293,17 @@ For each change:
 
 ## Implementation Priority Order
 
-| # | Feature | Effort | Impact | Dependencies |
-|---|---------|--------|--------|--------------|
-| 1 | Multi-head output | Medium | High | None |
-| 2 | Feature engineering | Low | Medium | None |
-| 3 | GnuBG evaluation setup | Low | High (better metrics) | None |
-| 4 | Reanalyze | Medium | High | None |
-| 5 | Distributed self-play | High | High | Stable base |
-| 6 | MET integration | Medium | Medium | Multi-head |
-| 7 | Doubling cube | High | Medium | MET |
-| 8 | MuZero | Very High | Unknown | Everything else |
+| # | Feature | Effort | Impact | Status |
+|---|---------|--------|--------|--------|
+| 1 | Multi-head output | Medium | High | ✅ DONE |
+| 2 | Distributed self-play | High | High | ✅ DONE (4-6x throughput) |
+| 3 | WandB integration | Low | Medium | ✅ DONE |
+| 4 | Feature engineering | Low | Medium | TODO |
+| 5 | GnuBG evaluation setup | Low | High | TODO |
+| 6 | Reanalyze | Medium | High | TODO |
+| 7 | MET integration | Medium | Medium | TODO |
+| 8 | Doubling cube | High | Medium | TODO |
+| 9 | MuZero | Very High | Unknown | Future |
 
 ---
 
@@ -352,6 +343,7 @@ For each change:
 | 2026-01-24 | SimpleNet 4hr | AZ_first: 0.64 | Good baseline, 128 iterations |
 | 2026-01-24 | FCResNet 4hr | AZ_first: 0.34 | Larger net, only 30 iterations, still learning |
 | 2026-01-25 | **Multi-head 4.6hr** | **AZ_first: 0.58, Combined: 1.23** | **69 iterations, outperforms SimpleNet baseline!** |
+| 2026-01-26 | **Cluster training 57min** | **Combined: 1.212 (1000 games)** | **70 iterations, 98.5% of baseline, 4-6x throughput** |
 
 ---
 
@@ -422,3 +414,90 @@ E = P(win) * (1 + P(g|w) + P(bg|w)) - P(loss) * (1 + P(g|l) + P(bg|l))
 1. Longer training runs
 2. GnuBG evaluation integration
 3. Match equity table (MET) integration
+
+---
+
+## Cluster Training Experiment Results (2026-01-26)
+
+### Configuration
+- **Architecture**: FCResNetMultiHead (width=128, 3 blocks, 250K params)
+- **Training**: 70 iterations in 57 minutes
+- **Workers**: 6 threads for parallel self-play
+- **Session**: `sessions/cluster_20260126_122223`
+- **WandB**: https://wandb.ai/sile16-self/alphazero-jl/runs/m98fgq4s
+
+### Performance Summary
+
+| Iteration | White | Black | Combined | vs Baseline |
+|-----------|-------|-------|----------|-------------|
+| 10 | -0.12 | 1.60 | 0.74 | 60% |
+| 20 | 0.64 | 1.88 | **1.26** | 102% |
+| 30 | 0.44 | 1.80 | 1.12 | 91% |
+| 40 | 0.84 | 1.60 | 1.22 | 99% |
+| 50 | 0.84 | 2.04 | **1.44** | 117% |
+| 60 | 0.52 | 1.84 | 1.18 | 96% |
+| 70 | 0.48 | 1.80 | 1.14 | 93% |
+
+### Final 1000-Game Evaluation (GPU)
+```
+AZ as White (500 games): 0.61
+AZ as Black (500 games): 1.814
+Combined:                1.212
+```
+
+**Baseline**: +1.23 combined reward at 69 iterations
+**Result**: 98.5% of baseline performance
+
+### Training Statistics
+- **Total games**: 11,674
+- **Total samples**: 624,332
+- **Throughput**: ~228 games/minute (vs ~40-50 single-threaded)
+- **Buffer**: 100,000 samples (at capacity by iteration 11)
+
+### Implementation Details
+
+**Thread-Based Architecture** (not Julia Distributed):
+- 6 worker threads for parallel self-play
+- Each worker has own network copy (CPU, test mode)
+- Thread-safe sample buffer with ReentrantLock
+- Main thread handles training on GPU
+- Weight synchronization via version counter
+
+**Why Threads Instead of Distributed**:
+- Julia Distributed had serialization issues with closures/complex types
+- Thread-based approach simpler for single-machine training
+- Shared memory avoids network transfer overhead
+- Still achieves 4-6x throughput improvement
+
+### Files Added
+- `src/cluster/Cluster.jl` - Main module with thread-based training
+- `src/cluster/worker.jl` - Worker types and helpers
+- `src/cluster/coordinator.jl` - Coordinator with replay buffer
+- `src/cluster/types.jl` - Data types (ClusterSample, GameBatch, etc.)
+- `scripts/train_cluster.jl` - Training script with CLI arguments
+- `test/test_cluster.jl` - 70 unit tests (all passing)
+
+### Key Lessons Learned
+
+1. **Julia Distributed serialization is tricky**: Closures referencing complex types (AbstractNetwork, GameSpec) fail to serialize. Thread-based approach is more reliable for single-machine training.
+
+2. **Thread safety matters**: ReentrantLock is essential for sample buffer and weight synchronization. Version counters efficiently signal workers to sync.
+
+3. **GPU memory sharing works**: Training process and workers can share GPU memory when workers use CPU copies with lazy GPU transfers.
+
+4. **Loss values differ between scripts**: Cluster training reports raw combined loss (~4-6), while original script reports decomposed losses. Actual playing strength is comparable.
+
+5. **Evaluation variance is high**: 50-game evaluations show ±0.2 variance. 1000+ games needed for reliable comparisons.
+
+6. **Buffer capacity matters**: Reaching 100K samples by iteration 11 ensures diverse training data. Smaller buffers risk overfitting to recent games.
+
+7. **WandB integration requires PythonCall**: Scripts must `using PythonCall` before calling wandb functions. CondaPkg handles Python dependency management.
+
+### Conclusion
+
+**Cluster training matches baseline performance** with 98.5% of combined reward (1.212 vs 1.23). The thread-based implementation provides:
+- 4-6x throughput improvement (~228 vs ~50 games/min)
+- Comparable model quality
+- Simpler architecture than distributed processes
+
+Ready to extend for multi-machine training using ZMQ when needed.

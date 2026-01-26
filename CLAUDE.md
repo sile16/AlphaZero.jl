@@ -9,21 +9,28 @@ This is a Julia implementation of AlphaZero with extensions for backgammon, incl
 
 ## Current Best Approach (2026-01-26)
 
-### ALWAYS Use Distributed Training with WandB
+### ALWAYS Use Cluster Training with WandB
 
 **Standard training command** (single host, multi-threaded):
 ```bash
-julia --project --threads=8 scripts/train_single_server.jl \
+julia --project --threads=8 scripts/train_cluster.jl \
     --game=backgammon-deterministic \
     --network-type=fcresnet-multihead \
     --network-width=128 \
     --network-blocks=3 \
-    --num-workers=4 \
-    --total-iterations=300 \
-    --mcts-iters=100
+    --num-workers=6 \
+    --total-iterations=70 \
+    --games-per-iteration=50 \
+    --mcts-iters=100 \
+    --final-eval-games=1000
 ```
 
 WandB is enabled by default (project: `alphazero-jl`). To disable: `--no-wandb`
+
+**Features**:
+- Git commit hash logged at start and saved to `run_info.txt`
+- Parallel final evaluation (1000 games default, uses all threads)
+- Progress logging every 10% during evaluation
 
 ### Multi-Head Equity Network
 
@@ -56,7 +63,7 @@ julia --project scripts/eval_current_iteration.jl sessions/<session_dir>
 - `src/params.jl` - Parameters including `always_replace`
 
 ### Scripts (Active)
-- `scripts/train_single_server.jl` - **Primary training script** (distributed, wandb)
+- `scripts/train_cluster.jl` - **Primary training script** (thread-based, wandb, parallel final eval)
 - `scripts/quick_eval.jl` - Quick evaluation vs random
 - `scripts/eval_current_iteration.jl` - Evaluation with histograms
 - `scripts/backgammon_full_evaluation.jl` - Comprehensive evaluation
@@ -162,11 +169,12 @@ Each contains:
 
 ## Performance Baselines
 
-| Model | Iterations | Combined Reward vs Random |
-|-------|------------|---------------------------|
-| SimpleNet (128, 6) | 128 | +1.11 |
-| **FCResNetMultiHead (128, 3)** | **69** | **+1.23** |
-| FCResNetMultiHead (distributed) | 300 | +1.24 |
+| Model | Iterations | Combined Reward vs Random | Notes |
+|-------|------------|---------------------------|-------|
+| SimpleNet (128, 6) | 128 | +1.11 | Single-process baseline |
+| FCResNetMultiHead (128, 3) | 69 | +1.23 | Multi-head baseline |
+| FCResNetMultiHead (distributed) | 300 | +1.24 | train_single_server.jl |
+| **FCResNetMultiHead (cluster)** | **70** | **+1.21** | **train_cluster.jl (1000 games, 98.5% of baseline)** |
 
 ## Distributed Training (2026-01-26)
 
@@ -181,18 +189,23 @@ Distributed training system with ZMQ-based communication supporting:
 ### Running Distributed Training
 
 ```bash
-# Single-server with wandb (RECOMMENDED)
-julia --project --threads=8 scripts/train_single_server.jl \
+# Cluster training (thread-based, RECOMMENDED for single machine)
+julia --project --threads=8 scripts/train_cluster.jl \
     --game=backgammon-deterministic \
     --network-type=fcresnet-multihead \
     --network-width=128 \
     --network-blocks=3 \
-    --num-workers=4 \
-    --total-iterations=300 \
-    --mcts-iters=100
+    --num-workers=6 \
+    --total-iterations=70 \
+    --games-per-iteration=50 \
+    --mcts-iters=100 \
+    --batch-size=256 \
+    --eval-interval=10 \
+    --eval-games=50 \
+    --wandb-project=alphazero-jl
 
 # Disable wandb if needed
-julia --project --threads=8 scripts/train_single_server.jl --no-wandb ...
+julia --project --threads=8 scripts/train_cluster.jl --no-wandb ...
 
 # Multi-server (run coordinator + remote workers) - TODO
 julia --project scripts/train_distributed.jl --coordinator ...
@@ -206,20 +219,28 @@ julia --project scripts/run_worker.jl --coordinator <ip> ...
 4. **Playing strength matches**: Despite different loss values, actual performance vs random is equivalent
 5. **GPU sharing works**: Multiple components can share GPU with lazy memory allocation
 6. **WandB requires PythonCall**: Scripts must `using PythonCall` before calling wandb functions
+7. **Julia Distributed serialization is tricky**: Closures referencing complex types fail to serialize; thread-based approach more reliable
+8. **Thread safety for parallel training**: ReentrantLock essential for sample buffer; version counters for weight sync
+9. **Evaluation variance is high**: 50-game evals show ±0.2 variance; use 1000+ games for reliable comparisons
+10. **Buffer capacity matters**: 100K samples prevents overfitting to recent games
+11. **Reproducibility NOT guaranteed**: Code uses global RNG without seed management; runs are not reproducible (TODO: add --seed flag)
+12. **Git commit hash logged**: `train_cluster.jl` logs git commit at start and saves to `run_info.txt` for traceability
 
 ### Distributed Training Files
 - `src/distributed/` - Core distributed module (11 files)
+- `src/cluster/` - Thread-based cluster module (4 files)
 - `src/ui/wandb.jl` - WandB integration with system metrics
-- `scripts/train_single_server.jl` - Single-machine training with wandb
+- `scripts/train_cluster.jl` - **Primary training script** (thread-based, wandb, parallel eval)
 - `scripts/train_distributed.jl` - Multi-server coordinator (WIP)
 - `scripts/run_worker.jl` - Remote worker script (WIP)
 
 ## Next Steps (from roadmap)
 
 1. ✅ Multi-head equity network - **DONE**
-2. ✅ Distributed self-play - **DONE**
-3. ✅ WandB integration - **DONE** (system + training metrics)
-4. GnuBG evaluation integration
-5. Match equity table (MET) integration
-6. Multi-machine distributed training
-7. Reanalyze (MuZero style)
+2. ✅ Distributed self-play - **DONE** (train_single_server.jl)
+3. ✅ Cluster training (thread-based) - **DONE** (train_cluster.jl, 4-6x throughput)
+4. ✅ WandB integration - **DONE** (system + training metrics)
+5. GnuBG evaluation integration
+6. Match equity table (MET) integration
+7. Multi-machine distributed training (ZMQ)
+8. Reanalyze (MuZero style)
