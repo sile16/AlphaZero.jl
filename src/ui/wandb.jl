@@ -1,41 +1,40 @@
 #####
 ##### Weights & Biases (wandb) Integration
 #####
-##### PythonCall is lazy-loaded to avoid conflicts with PyCall (used by gnubg).
+##### PythonCall must be loaded BEFORE calling wandb functions.
+##### Add `using PythonCall` in your script before using wandb.
 #####
 
 module Wandb
 
 using ..AlphaZero: Report, Params, Network
 
-# Lazy-loaded PythonCall and wandb module
-const _pythoncall_loaded = Ref(false)
-const _pyimport = Ref{Function}()
-const _pydict = Ref{Function}()
-const wandb = Ref{Any}()
-
-function ensure_pythoncall_loaded()
-  if !_pythoncall_loaded[]
-    # Import PythonCall lazily to avoid conflicts with PyCall
-    @eval using PythonCall
-    _pyimport[] = PythonCall.pyimport
-    _pydict[] = PythonCall.pydict
-    _pythoncall_loaded[] = true
-  end
-end
+# Cached wandb module reference
+const _wandb_module = Ref{Any}()
+const _pydict_fn = Ref{Any}()
 
 function ensure_wandb_loaded()
-  ensure_pythoncall_loaded()
-  if !isassigned(wandb)
-    wandb[] = _pyimport[]("wandb")
+  if !isassigned(_wandb_module)
+    # PythonCall should already be loaded by the calling script
+    pc = Base.loaded_modules[Base.PkgId(Base.UUID("6099a3de-0909-46bc-b1f4-468b9a2dfc0d"), "PythonCall")]
+    _pydict_fn[] = pc.pydict
+    _wandb_module[] = pc.pyimport("wandb")
   end
-  return wandb[]
+  return _wandb_module[]
+end
+
+function pydict(d::Dict)
+  if !isassigned(_pydict_fn)
+    ensure_wandb_loaded()
+  end
+  return _pydict_fn[](d)
 end
 
 """
     wandb_available() -> Bool
 
 Check if wandb Python package is available.
+Requires PythonCall to be loaded first.
 """
 function wandb_available()
   try
@@ -50,6 +49,7 @@ end
     wandb_init(; project, name=nothing, config=Dict())
 
 Initialize a new wandb run.
+Requires PythonCall to be loaded first (add `using PythonCall` in your script).
 
 # Arguments
 - `project::String`: The wandb project name
@@ -61,7 +61,7 @@ function wandb_init(; project::String, name=nothing, config=Dict())
   wb.init(
     project=project,
     name=name,
-    config=_pydict[](config)
+    config=pydict(config)
   )
 end
 
@@ -77,9 +77,9 @@ Log metrics to wandb.
 function wandb_log(metrics::Dict; step=nothing)
   wb = ensure_wandb_loaded()
   if isnothing(step)
-    wb.log(_pydict[](metrics))
+    wb.log(pydict(metrics))
   else
-    wb.log(_pydict[](metrics), step=step)
+    wb.log(pydict(metrics), step=step)
   end
 end
 
@@ -286,8 +286,118 @@ function benchmark_metrics(evaluations::Vector{Report.Evaluation})
   return metrics
 end
 
+#####
+##### System metrics collection
+#####
+
+"""
+    system_metrics(; prefix="system", host_id=nothing) -> Dict
+
+Collect system metrics: CPU load, memory usage.
+If host_id is provided, metrics are prefixed with host_id for multi-machine support.
+"""
+function system_metrics(; prefix::String="system", host_id::Union{String,Nothing}=nothing)
+  p = isnothing(host_id) ? prefix : "$(prefix)/$(host_id)"
+  metrics = Dict{String, Any}()
+
+  try
+    # CPU load (1-minute average on Linux)
+    if Sys.islinux()
+      loadavg = open("/proc/loadavg") do f
+        parse(Float64, split(readline(f))[1])
+      end
+      metrics["$(p)/cpu_load_1m"] = loadavg
+    end
+
+    # Memory usage
+    if Sys.islinux()
+      meminfo = Dict{String,Int}()
+      open("/proc/meminfo") do f
+        for line in eachline(f)
+          parts = split(line)
+          if length(parts) >= 2
+            key = replace(parts[1], ":" => "")
+            val = tryparse(Int, parts[2])
+            if !isnothing(val)
+              meminfo[key] = val  # in KB
+            end
+          end
+        end
+      end
+
+      total = get(meminfo, "MemTotal", 0) / 1024 / 1024  # GB
+      free = get(meminfo, "MemFree", 0) / 1024 / 1024
+      available = get(meminfo, "MemAvailable", 0) / 1024 / 1024
+      buffers = get(meminfo, "Buffers", 0) / 1024 / 1024
+      cached = get(meminfo, "Cached", 0) / 1024 / 1024
+
+      used = total - available
+      metrics["$(p)/ram_total_gb"] = total
+      metrics["$(p)/ram_used_gb"] = used
+      metrics["$(p)/ram_used_pct"] = total > 0 ? (used / total) * 100 : 0.0
+    end
+  catch e
+    # Silently ignore errors - system metrics are optional
+  end
+
+  return metrics
+end
+
+"""
+    gpu_metrics(; prefix="system", host_id=nothing, cuda_module=nothing) -> Dict
+
+Collect GPU metrics: memory usage, utilization.
+If host_id is provided, metrics are prefixed with host_id for multi-machine support.
+
+Pass cuda_module=CUDA if CUDA is already loaded in your script.
+Falls back to nvidia-smi if CUDA module not provided.
+"""
+function gpu_metrics(; prefix::String="system", host_id::Union{String,Nothing}=nothing, cuda_module=nothing)
+  p = isnothing(host_id) ? prefix : "$(prefix)/$(host_id)"
+  metrics = Dict{String, Any}()
+
+  try
+    # Try using provided CUDA module first
+    if !isnothing(cuda_module) && cuda_module.functional()
+      total_mem = cuda_module.total_memory()
+      free_mem = cuda_module.available_memory()
+      used_mem = total_mem - free_mem
+
+      metrics["$(p)/gpu_mem_total_gb"] = total_mem / 1e9
+      metrics["$(p)/gpu_mem_used_gb"] = used_mem / 1e9
+      metrics["$(p)/gpu_mem_free_gb"] = free_mem / 1e9
+      metrics["$(p)/gpu_mem_used_pct"] = (used_mem / total_mem) * 100
+    end
+
+    # GPU utilization requires nvidia-smi
+    try
+      result = read(`nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits`, String)
+      util = parse(Float64, strip(result))
+      metrics["$(p)/gpu_utilization_pct"] = util
+    catch
+    end
+  catch e
+    # Silently ignore - GPU metrics are optional
+  end
+
+  return metrics
+end
+
+"""
+    all_system_metrics(; host_id=nothing, cuda_module=nothing) -> Dict
+
+Collect all system metrics (CPU, RAM, GPU).
+Pass cuda_module=CUDA if CUDA is loaded.
+"""
+function all_system_metrics(; host_id::Union{String,Nothing}=nothing, cuda_module=nothing)
+  metrics = system_metrics(host_id=host_id)
+  merge!(metrics, gpu_metrics(host_id=host_id, cuda_module=cuda_module))
+  return metrics
+end
+
 export wandb_available, wandb_init, wandb_log, wandb_finish
 export params_to_config, self_play_metrics, learning_status_metrics
 export learning_metrics, checkpoint_metrics, iteration_metrics, benchmark_metrics
+export system_metrics, gpu_metrics, all_system_metrics
 
 end # module Wandb

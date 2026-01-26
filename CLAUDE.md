@@ -7,7 +7,23 @@ This is a Julia implementation of AlphaZero with extensions for backgammon, incl
 - Stochastic game support (dice rolling)
 - Wandb integration for experiment tracking
 
-## Current Best Approach (2026-01-25)
+## Current Best Approach (2026-01-26)
+
+### ALWAYS Use Distributed Training with WandB
+
+**Standard training command** (single host, multi-threaded):
+```bash
+julia --project --threads=8 scripts/train_single_server.jl \
+    --game=backgammon-deterministic \
+    --network-type=fcresnet-multihead \
+    --network-width=128 \
+    --network-blocks=3 \
+    --num-workers=4 \
+    --total-iterations=300 \
+    --mcts-iters=100
+```
+
+WandB is enabled by default (project: `alphazero-jl`). To disable: `--no-wandb`
 
 ### Multi-Head Equity Network
 
@@ -20,32 +36,13 @@ This is a Julia implementation of AlphaZero with extensions for backgammon, incl
 
 **Results**: Outperforms single-head SimpleNet baseline by 11% in half the iterations.
 
-### Recommended Training Configuration
-
-```julia
-# Use train_multihead_v2.jl as template
-netparams = FluxLib.FCResNetMultiHeadHP(
-    width = 128,
-    num_blocks = 3,
-    depth_phead = 1,
-    depth_vhead = 1,
-    share_value_trunk = true
-)
-
-# Key parameters
-arena = ArenaParams(
-    ...,
-    always_replace = true  # Track eval metrics but always accept new network
-)
-```
-
-### Running Training
+### Evaluation
 
 ```bash
-# With wandb logging (recommended)
-julia --project scripts/train_multihead_v2.jl
+# Quick evaluation vs random player
+julia --project scripts/quick_eval.jl
 
-# Evaluation with reward histograms
+# Detailed evaluation with histograms
 julia --project scripts/eval_current_iteration.jl sessions/<session_dir>
 ```
 
@@ -58,13 +55,14 @@ julia --project scripts/eval_current_iteration.jl sessions/<session_dir>
 - `src/trace.jl` - Trace with outcome storage
 - `src/params.jl` - Parameters including `always_replace`
 
-### Scripts (Active - 9 total)
-- `scripts/train_multihead_v2.jl` - **Primary training script**
-- `scripts/train_multihead_baseline_match.jl` - Baseline comparison
+### Scripts (Active)
+- `scripts/train_single_server.jl` - **Primary training script** (distributed, wandb)
+- `scripts/quick_eval.jl` - Quick evaluation vs random
 - `scripts/eval_current_iteration.jl` - Evaluation with histograms
 - `scripts/backgammon_full_evaluation.jl` - Comprehensive evaluation
 - `scripts/benchmark_gnubg.jl` - GnuBG benchmarking
 - `scripts/GnubgPlayer.jl` - GnuBG integration module
+- `scripts/train_multihead_v2.jl` - Legacy single-process training
 - `scripts/alphazero.jl`, `mcts.jl`, `minmax.jl` - Core utilities
 
 **Archived scripts**: `scripts/archive/` contains 55+ obsolete experimental scripts
@@ -76,33 +74,62 @@ julia --project scripts/eval_current_iteration.jl sessions/<session_dir>
 ### Documentation
 - `notes/backgammon_improvement_roadmap.md` - Detailed experiment results and roadmap
 
-## Wandb Integration
+## WandB Integration
 
-All training runs should use wandb for tracking. Ensure wandb is configured:
+WandB is enabled by default in `train_single_server.jl`. All training runs log to project `alphazero-jl`.
 
+### Setup (one-time)
 ```bash
-# Install wandb in Julia's Python environment
-julia -e 'using CondaPkg; CondaPkg.add("wandb")'
-
-# Or via pip in CondaPkg environment
-pip install wandb
+# wandb is auto-installed via CondaPkg when you first run the script
+# Just need to login once:
 wandb login
 ```
 
-### Current State
-Training scripts log:
-- Initial configuration at start
-- Final metrics at completion
+### Metrics Tracked
 
-### TODO: Per-Iteration Logging
-The `src/ui/wandb.jl` module has helpers for per-iteration metrics:
-- `iteration_metrics(report, iteration)` - Full iteration stats
-- `checkpoint_metrics(report)` - Checkpoint evaluation
-- `learning_metrics(report)` - Learning phase stats
+**Training metrics** (every iteration):
+- `train/loss` - Training loss
+- `train/iteration` - Current iteration
+- `train/iteration_time_s` - Time per iteration
+- `buffer/size` - Replay buffer sample count
+- `buffer/capacity_pct` - Buffer fullness %
+- `games/total` - Total games played
+- `games/per_minute` - Self-play throughput
+- `samples/total` - Total samples generated
+- `workers/active` - Number of workers
 
-To add per-iteration logging, need to either:
-1. Add a handler/callback system to the training loop
-2. Or use custom training script that calls `wandb_log()` after each iteration
+**System metrics** (every 5 iterations):
+- `system/<host_id>/cpu_load_1m` - CPU load average
+- `system/<host_id>/ram_used_gb` - RAM usage
+- `system/<host_id>/ram_used_pct` - RAM usage %
+- `system/<host_id>/gpu_mem_used_gb` - GPU memory usage
+- `system/<host_id>/gpu_mem_used_pct` - GPU memory %
+- `system/<host_id>/gpu_utilization_pct` - GPU utilization
+
+**Summary metrics** (end of training):
+- `summary/total_iterations`
+- `summary/total_games`
+- `summary/total_samples`
+- `summary/total_time_min`
+- `summary/avg_loss`
+
+### Multi-Machine Support (Future)
+
+System metrics include `host_id` prefix to distinguish metrics from different machines.
+When running distributed training across multiple hosts:
+- Each host reports its own system metrics with unique prefix
+- Training metrics come from coordinator only
+- Use `--host-id=<name>` to set custom host identifier
+
+### Module: `src/ui/wandb.jl`
+
+Key functions:
+- `wandb_init(; project, name, config)` - Initialize run
+- `wandb_log(metrics; step)` - Log metrics
+- `wandb_finish()` - Finish run
+- `all_system_metrics(; host_id, cuda_module)` - Collect system/GPU metrics
+
+**Important**: Scripts using wandb must `using PythonCall` before calling wandb functions.
 
 ## Testing
 
@@ -133,7 +160,7 @@ Each contains:
 | **FCResNetMultiHead (128, 3)** | **69** | **+1.23** |
 | FCResNetMultiHead (distributed) | 300 | +1.24 |
 
-## Distributed Training (2026-01-25)
+## Distributed Training (2026-01-26)
 
 ### Overview
 Distributed training system with ZMQ-based communication supporting:
@@ -141,11 +168,12 @@ Distributed training system with ZMQ-based communication supporting:
 - Centralized inference server (optional, for CPU-only workers)
 - Replay buffer manager
 - Training process with GPU learning
+- **WandB integration** for real-time metrics tracking
 
 ### Running Distributed Training
 
 ```bash
-# Single-server (all components share GPU)
+# Single-server with wandb (RECOMMENDED)
 julia --project --threads=8 scripts/train_single_server.jl \
     --game=backgammon-deterministic \
     --network-type=fcresnet-multihead \
@@ -155,7 +183,10 @@ julia --project --threads=8 scripts/train_single_server.jl \
     --total-iterations=300 \
     --mcts-iters=100
 
-# Multi-server (run coordinator + remote workers)
+# Disable wandb if needed
+julia --project --threads=8 scripts/train_single_server.jl --no-wandb ...
+
+# Multi-server (run coordinator + remote workers) - TODO
 julia --project scripts/train_distributed.jl --coordinator ...
 julia --project scripts/run_worker.jl --coordinator <ip> ...
 ```
@@ -166,17 +197,21 @@ julia --project scripts/run_worker.jl --coordinator <ip> ...
 3. **Loss metrics differ**: Distributed script reports raw loss; baseline reports decomposed (Lv+Lp+Lreg)
 4. **Playing strength matches**: Despite different loss values, actual performance vs random is equivalent
 5. **GPU sharing works**: Multiple components can share GPU with lazy memory allocation
+6. **WandB requires PythonCall**: Scripts must `using PythonCall` before calling wandb functions
 
 ### Distributed Training Files
 - `src/distributed/` - Core distributed module (11 files)
-- `scripts/train_single_server.jl` - Single-machine training
-- `scripts/train_distributed.jl` - Multi-server coordinator
-- `scripts/run_worker.jl` - Remote worker script
+- `src/ui/wandb.jl` - WandB integration with system metrics
+- `scripts/train_single_server.jl` - Single-machine training with wandb
+- `scripts/train_distributed.jl` - Multi-server coordinator (WIP)
+- `scripts/run_worker.jl` - Remote worker script (WIP)
 
 ## Next Steps (from roadmap)
 
 1. ✅ Multi-head equity network - **DONE**
-2. GnuBG evaluation integration
-3. Match equity table (MET) integration
-4. ✅ Distributed self-play - **DONE**
-5. Reanalyze (MuZero style)
+2. ✅ Distributed self-play - **DONE**
+3. ✅ WandB integration - **DONE** (system + training metrics)
+4. GnuBG evaluation integration
+5. Match equity table (MET) integration
+6. Multi-machine distributed training
+7. Reanalyze (MuZero style)

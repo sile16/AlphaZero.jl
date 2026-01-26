@@ -44,8 +44,12 @@ end
 using AlphaZero
 using AlphaZero.Distributed
 using AlphaZero: GI, Network, losses, Trace, FluxLib
+using AlphaZero.Wandb
 import Flux
 using Statistics: mean
+
+# Preload PythonCall for wandb (avoids world age issues)
+using PythonCall
 
 # Pre-load game modules at top level to avoid world age issues
 const GAMES_DIR = joinpath(@__DIR__, "..", "games")
@@ -141,9 +145,20 @@ function parse_args()
             arg_type = String
             default = "sessions"
         "--wandb-project"
-            help = "WandB project name"
+            help = "WandB project name (enables wandb logging)"
+            arg_type = String
+            default = "alphazero-jl"
+        "--wandb-run-name"
+            help = "WandB run name (auto-generated if not provided)"
             arg_type = String
             default = nothing
+        "--host-id"
+            help = "Host identifier for multi-machine tracking"
+            arg_type = String
+            default = nothing
+        "--no-wandb"
+            help = "Disable WandB logging"
+            action = :store_true
 
         # Misc
         "--no-gpu"
@@ -218,6 +233,9 @@ mutable struct SingleServerTrainer
     use_gpu::Bool
     session_dir::String
     args::Dict
+    wandb_enabled::Bool
+    host_id::Union{String,Nothing}
+    start_time::Float64
 end
 
 function SingleServerTrainer(gspec, network, args)
@@ -247,6 +265,12 @@ function SingleServerTrainer(gspec, network, args)
     session_dir = joinpath(args["session_dir"], "single_server_$(timestamp)")
     mkpath(session_dir)
 
+    # Determine host_id (for multi-machine tracking)
+    host_id = args["host_id"]
+    if isnothing(host_id)
+        host_id = gethostname()
+    end
+
     return SingleServerTrainer(
         gspec,
         network,
@@ -261,7 +285,10 @@ function SingleServerTrainer(gspec, network, args)
         true,
         !args["no_gpu"] && CUDA.functional(),
         session_dir,
-        args
+        args,
+        !args["no_wandb"] && !isnothing(args["wandb_project"]),  # wandb_enabled
+        host_id,
+        time()  # start_time
     )
 end
 
@@ -534,6 +561,8 @@ function run_training!(trainer::SingleServerTrainer)
 
     total_loss = 0.0
     batches_trained = 0
+    last_games = 0
+    last_time = time()
 
     while trainer.running && trainer.iteration < trainer.args["total_iterations"]
         # Wait for enough samples
@@ -545,6 +574,7 @@ function run_training!(trainer::SingleServerTrainer)
 
         trainer.iteration += 1
         iteration_loss = 0.0
+        iteration_start = time()
 
         # Train for several batches
         for batch_idx in 1:trainer.args["batches_per_iteration"]
@@ -571,6 +601,46 @@ function run_training!(trainer::SingleServerTrainer)
         end
 
         avg_iter_loss = iteration_loss / trainer.args["batches_per_iteration"]
+        iteration_time = time() - iteration_start
+
+        # Calculate games per minute
+        current_time = time()
+        elapsed_since_last = current_time - last_time
+        games_since_last = trainer.total_games - last_games
+        games_per_min = elapsed_since_last > 0 ? (games_since_last / elapsed_since_last) * 60 : 0.0
+
+        # Log to wandb
+        if trainer.wandb_enabled
+            metrics = Dict{String, Any}(
+                "train/loss" => avg_iter_loss,
+                "train/iteration" => trainer.iteration,
+                "train/iteration_time_s" => iteration_time,
+                "train/batches_trained" => batches_trained,
+                "buffer/size" => length(trainer.buffer),
+                "buffer/capacity_pct" => (length(trainer.buffer) / trainer.buffer_capacity) * 100,
+                "games/total" => trainer.total_games,
+                "games/per_minute" => games_per_min,
+                "samples/total" => trainer.total_samples,
+                "workers/active" => trainer.args["num_workers"],
+            )
+
+            # Add system metrics every 5 iterations (not too frequent)
+            if trainer.iteration % 5 == 0
+                cuda_mod = trainer.use_gpu ? CUDA : nothing
+                sys_metrics = all_system_metrics(host_id=trainer.host_id, cuda_module=cuda_mod)
+                merge!(metrics, sys_metrics)
+            end
+
+            try
+                wandb_log(metrics, step=trainer.iteration)
+            catch e
+                @warn "Failed to log to wandb" exception=e
+            end
+        end
+
+        # Update tracking for games/min calculation
+        last_games = trainer.total_games
+        last_time = current_time
 
         # Reclaim GPU memory periodically
         if trainer.use_gpu && trainer.iteration % 10 == 0
@@ -594,6 +664,23 @@ function run_training!(trainer::SingleServerTrainer)
 
     # Final checkpoint
     save_checkpoint(trainer)
+
+    # Log final summary to wandb
+    if trainer.wandb_enabled
+        total_time = time() - trainer.start_time
+        final_metrics = Dict{String, Any}(
+            "summary/total_iterations" => trainer.iteration,
+            "summary/total_games" => trainer.total_games,
+            "summary/total_samples" => trainer.total_samples,
+            "summary/total_time_min" => total_time / 60,
+            "summary/avg_loss" => batches_trained > 0 ? total_loss / batches_trained : 0.0,
+        )
+        try
+            wandb_log(final_metrics)
+        catch e
+            @warn "Failed to log final metrics to wandb" exception=e
+        end
+    end
 
     @info "Training complete: $(trainer.iteration) iterations, $(batches_trained) batches"
 end
@@ -653,12 +740,59 @@ function main()
     @info "  Total iterations: $(args["total_iterations"])"
     @info "  Session dir: $(trainer.session_dir)"
     @info "  GPU enabled: $(trainer.use_gpu)"
+    @info "  Host ID: $(trainer.host_id)"
+    @info "  WandB: $(trainer.wandb_enabled ? args["wandb_project"] : "disabled")"
 
     if trainer.use_gpu
         @info "  GPU memory: $(round(CUDA.available_memory() / 1e9, digits=2)) GB free"
     end
 
     @info "=" ^ 60
+
+    # Initialize wandb
+    if trainer.wandb_enabled
+        @info "Initializing WandB..."
+        try
+            run_name = args["wandb_run_name"]
+            if isnothing(run_name)
+                run_name = "$(args["game"])-$(args["network_type"])-$(Dates.format(now(), "mmdd-HHMM"))"
+            end
+
+            config = Dict{String, Any}(
+                # Game
+                "game" => args["game"],
+                # Network
+                "network_type" => args["network_type"],
+                "network_width" => args["network_width"],
+                "network_blocks" => args["network_blocks"],
+                "network_params" => Network.num_parameters(network),
+                # Training
+                "num_workers" => args["num_workers"],
+                "total_iterations" => args["total_iterations"],
+                "batch_size" => args["batch_size"],
+                "batches_per_iteration" => args["batches_per_iteration"],
+                "learning_rate" => args["learning_rate"],
+                "l2_reg" => args["l2_reg"],
+                # MCTS
+                "mcts_iters" => args["mcts_iters"],
+                "cpuct" => args["cpuct"],
+                # Buffer
+                "buffer_capacity" => args["buffer_capacity"],
+                "min_samples" => args["min_samples"],
+                "games_per_batch" => args["games_per_batch"],
+                # System
+                "host_id" => trainer.host_id,
+                "use_gpu" => trainer.use_gpu,
+                "julia_threads" => Threads.nthreads(),
+            )
+
+            wandb_init(project=args["wandb_project"], name=run_name, config=config)
+            @info "WandB initialized: project=$(args["wandb_project"]), run=$run_name"
+        catch e
+            @warn "Failed to initialize wandb, continuing without logging" exception=e
+            trainer.wandb_enabled = false
+        end
+    end
 
     # Start worker threads
     worker_tasks = Task[]
@@ -698,6 +832,16 @@ function main()
     @info "  Final buffer size: $(length(trainer.buffer))"
     @info "  Session saved to: $(trainer.session_dir)"
     @info "=" ^ 60
+
+    # Finish wandb
+    if trainer.wandb_enabled
+        try
+            wandb_finish()
+            @info "WandB run finished"
+        catch e
+            @warn "Failed to finish wandb" exception=e
+        end
+    end
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
