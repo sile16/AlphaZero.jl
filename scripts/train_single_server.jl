@@ -160,6 +160,20 @@ function parse_args()
             help = "Disable WandB logging"
             action = :store_true
 
+        # Evaluation
+        "--eval-interval"
+            help = "Run evaluation every N iterations (0 to disable)"
+            arg_type = Int
+            default = 10
+        "--eval-games"
+            help = "Number of games per evaluation"
+            arg_type = Int
+            default = 50
+        "--eval-mcts-iters"
+            help = "MCTS iterations for evaluation (default: same as training)"
+            arg_type = Int
+            default = 0
+
         # Misc
         "--no-gpu"
             help = "Disable GPU (CPU only)"
@@ -658,12 +672,71 @@ function run_training!(trainer::SingleServerTrainer)
             save_checkpoint(trainer)
         end
 
+        # Run evaluation periodically
+        eval_interval = trainer.args["eval_interval"]
+        if eval_interval > 0 && trainer.iteration % eval_interval == 0
+            eval_games = trainer.args["eval_games"]
+            eval_mcts = trainer.args["eval_mcts_iters"]
+            if eval_mcts <= 0
+                eval_mcts = trainer.args["mcts_iters"]  # Use training MCTS iters
+            end
+
+            @info "Running evaluation ($eval_games games vs random)..."
+            eval_start = time()
+            avg_white, avg_black, combined = evaluate_vs_random(trainer, eval_games, eval_mcts)
+            eval_time = time() - eval_start
+
+            @info "Eval results: white=$(round(avg_white, digits=3)), black=$(round(avg_black, digits=3)), combined=$(round(combined, digits=3))"
+
+            if trainer.wandb_enabled
+                eval_metrics = Dict{String, Any}(
+                    "eval/vs_random_white" => avg_white,
+                    "eval/vs_random_black" => avg_black,
+                    "eval/vs_random_combined" => combined,
+                    "eval/games" => eval_games,
+                    "eval/time_s" => eval_time,
+                )
+                try
+                    wandb_log(eval_metrics, step=trainer.iteration)
+                catch e
+                    @warn "Failed to log eval metrics to wandb" exception=e
+                end
+            end
+        end
+
         # Brief pause to let workers catch up
         sleep(0.1)
     end
 
     # Final checkpoint
     save_checkpoint(trainer)
+
+    # Final evaluation
+    eval_interval = trainer.args["eval_interval"]
+    if eval_interval > 0
+        eval_games = trainer.args["eval_games"]
+        eval_mcts = trainer.args["eval_mcts_iters"]
+        if eval_mcts <= 0
+            eval_mcts = trainer.args["mcts_iters"]
+        end
+
+        @info "Running final evaluation ($eval_games games vs random)..."
+        avg_white, avg_black, combined = evaluate_vs_random(trainer, eval_games, eval_mcts)
+        @info "Final eval: white=$(round(avg_white, digits=3)), black=$(round(avg_black, digits=3)), combined=$(round(combined, digits=3))"
+
+        if trainer.wandb_enabled
+            eval_metrics = Dict{String, Any}(
+                "eval/final_vs_random_white" => avg_white,
+                "eval/final_vs_random_black" => avg_black,
+                "eval/final_vs_random_combined" => combined,
+            )
+            try
+                wandb_log(eval_metrics)
+            catch e
+                @warn "Failed to log final eval metrics to wandb" exception=e
+            end
+        end
+    end
 
     # Log final summary to wandb
     if trainer.wandb_enabled
@@ -698,6 +771,52 @@ function save_checkpoint(trainer::SingleServerTrainer)
     FluxLib.save_weights(joinpath(checkpoint_dir, "latest.data"), cpu_network)
 
     @info "Saved checkpoint at iteration $(trainer.iteration)"
+end
+
+"""
+Evaluate current network against a random player.
+Returns (avg_reward_as_white, avg_reward_as_black, combined_avg).
+"""
+function evaluate_vs_random(trainer::SingleServerTrainer, num_games::Int, mcts_iters::Int)
+    # Create evaluation network (CPU copy to not interfere with training)
+    eval_network = Network.copy(trainer.network, on_gpu=trainer.use_gpu, test_mode=true)
+
+    # Create MCTS params for evaluation (lower temperature, no noise)
+    eval_mcts = MctsParams(
+        num_iters_per_turn=mcts_iters,
+        cpuct=1.5,
+        temperature=ConstSchedule(0.2),
+        dirichlet_noise_ϵ=0.0,
+        dirichlet_noise_α=0.3,
+        gamma=1.0
+    )
+
+    az_player = MctsPlayer(trainer.gspec, eval_network, eval_mcts)
+    random_player = RandomPlayer()
+
+    games_per_side = num_games ÷ 2
+
+    # Play as white
+    rewards_white = Float64[]
+    for _ in 1:games_per_side
+        trace = play_game(trainer.gspec, TwoPlayers(az_player, random_player))
+        push!(rewards_white, total_reward(trace))
+        reset_player!(az_player)
+    end
+
+    # Play as black
+    rewards_black = Float64[]
+    for _ in 1:games_per_side
+        trace = play_game(trainer.gspec, TwoPlayers(random_player, az_player))
+        push!(rewards_black, -total_reward(trace))  # Negate for black's perspective
+        reset_player!(az_player)
+    end
+
+    avg_white = isempty(rewards_white) ? 0.0 : sum(rewards_white) / length(rewards_white)
+    avg_black = isempty(rewards_black) ? 0.0 : sum(rewards_black) / length(rewards_black)
+    combined = (avg_white + avg_black) / 2
+
+    return (avg_white, avg_black, combined)
 end
 
 """
@@ -742,6 +861,13 @@ function main()
     @info "  GPU enabled: $(trainer.use_gpu)"
     @info "  Host ID: $(trainer.host_id)"
     @info "  WandB: $(trainer.wandb_enabled ? args["wandb_project"] : "disabled")"
+    eval_interval = args["eval_interval"]
+    if eval_interval > 0
+        eval_mcts = args["eval_mcts_iters"] > 0 ? args["eval_mcts_iters"] : args["mcts_iters"]
+        @info "  Eval: every $(eval_interval) iters, $(args["eval_games"]) games, $(eval_mcts) MCTS iters"
+    else
+        @info "  Eval: disabled"
+    end
 
     if trainer.use_gpu
         @info "  GPU memory: $(round(CUDA.available_memory() / 1e9, digits=2)) GB free"
@@ -780,6 +906,10 @@ function main()
                 "buffer_capacity" => args["buffer_capacity"],
                 "min_samples" => args["min_samples"],
                 "games_per_batch" => args["games_per_batch"],
+                # Evaluation
+                "eval_interval" => args["eval_interval"],
+                "eval_games" => args["eval_games"],
+                "eval_mcts_iters" => args["eval_mcts_iters"] > 0 ? args["eval_mcts_iters"] : args["mcts_iters"],
                 # System
                 "host_id" => trainer.host_id,
                 "use_gpu" => trainer.use_gpu,

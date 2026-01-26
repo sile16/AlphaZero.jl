@@ -106,12 +106,20 @@ wandb login
 - `system/<host_id>/gpu_mem_used_pct` - GPU memory %
 - `system/<host_id>/gpu_utilization_pct` - GPU utilization
 
+**Evaluation metrics** (every N iterations, default 10):
+- `eval/vs_random_white` - Avg reward as white vs random
+- `eval/vs_random_black` - Avg reward as black vs random
+- `eval/vs_random_combined` - Combined average
+- `eval/games` - Games per evaluation
+- `eval/time_s` - Evaluation duration
+
 **Summary metrics** (end of training):
 - `summary/total_iterations`
 - `summary/total_games`
 - `summary/total_samples`
 - `summary/total_time_min`
 - `summary/avg_loss`
+- `eval/final_vs_random_*` - Final evaluation results
 
 ### Multi-Machine Support (Future)
 
