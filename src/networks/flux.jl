@@ -147,4 +147,105 @@ include("architectures/resnet.jl")
 include("architectures/fc_resnet.jl")
 include("architectures/fc_resnet_multihead.jl")
 
+#####
+##### Serialization helpers for distributed training
+#####
+
+"""
+    serialize_weights(nn::FluxNetwork) -> Vector{UInt8}
+
+Serialize network weights to bytes for distributed training.
+"""
+function serialize_weights(nn::FluxNetwork)
+    io = IOBuffer()
+    params = Network.params(nn)
+    # Write number of parameter arrays
+    write(io, Int32(length(params)))
+    for p in params
+        arr = Array(p)  # Ensure on CPU
+        # Write dimensions
+        ndims = length(size(arr))
+        write(io, Int32(ndims))
+        for d in size(arr)
+            write(io, Int32(d))
+        end
+        # Write element type indicator (1=Float32, 2=Float64)
+        if eltype(arr) == Float32
+            write(io, UInt8(1))
+        elseif eltype(arr) == Float64
+            write(io, UInt8(2))
+        else
+            error("Unsupported element type: $(eltype(arr))")
+        end
+        # Write data
+        write(io, arr)
+    end
+    return take!(io)
+end
+
+"""
+    deserialize_weights(bytes::Vector{UInt8}) -> Vector{Array}
+
+Deserialize network weights from bytes.
+"""
+function deserialize_weights(bytes::Vector{UInt8})
+    io = IOBuffer(bytes)
+    num_params = read(io, Int32)
+    params = Vector{Array}()
+    sizehint!(params, num_params)
+
+    for _ in 1:num_params
+        # Read dimensions
+        ndims = read(io, Int32)
+        shape = Tuple(read(io, Int32) for _ in 1:ndims)
+        # Read element type
+        type_indicator = read(io, UInt8)
+        T = type_indicator == 1 ? Float32 : Float64
+        # Read data
+        arr = Array{T}(undef, shape)
+        read!(io, arr)
+        push!(params, arr)
+    end
+
+    return params
+end
+
+"""
+    load_weights!(nn::FluxNetwork, weights::Vector{Array})
+
+Load weights into a network.
+"""
+function load_weights!(nn::FluxNetwork, weights::Vector)
+    params = Network.params(nn)
+    @assert length(params) == length(weights) "Parameter count mismatch: got $(length(weights)), expected $(length(params))"
+    for (p, w) in zip(params, weights)
+        copyto!(p, w)
+    end
+    return nn
+end
+
+"""
+    save_weights(path::String, nn::FluxNetwork)
+
+Save network weights to a file.
+"""
+function save_weights(path::String, nn::FluxNetwork)
+    bytes = serialize_weights(nn)
+    write(path, bytes)
+end
+
+"""
+    load_weights(path::String, nn::FluxNetwork)
+
+Load network weights from a file into an existing network.
+"""
+function load_weights(path::String, nn::FluxNetwork)
+    bytes = read(path)
+    weights = deserialize_weights(bytes)
+    load_weights!(nn, weights)
+    return nn
+end
+
+export serialize_weights, deserialize_weights, load_weights!, save_weights, load_weights
+
 end
