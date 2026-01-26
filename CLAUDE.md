@@ -131,11 +131,52 @@ Each contains:
 |-------|------------|---------------------------|
 | SimpleNet (128, 6) | 128 | +1.11 |
 | **FCResNetMultiHead (128, 3)** | **69** | **+1.23** |
+| FCResNetMultiHead (distributed) | 300 | +1.24 |
+
+## Distributed Training (2026-01-25)
+
+### Overview
+Distributed training system with ZMQ-based communication supporting:
+- N self-play workers (local threads or remote servers with GPUs)
+- Centralized inference server (optional, for CPU-only workers)
+- Replay buffer manager
+- Training process with GPU learning
+
+### Running Distributed Training
+
+```bash
+# Single-server (all components share GPU)
+julia --project --threads=8 scripts/train_single_server.jl \
+    --game=backgammon-deterministic \
+    --network-type=fcresnet-multihead \
+    --network-width=128 \
+    --network-blocks=3 \
+    --num-workers=4 \
+    --total-iterations=300 \
+    --mcts-iters=100
+
+# Multi-server (run coordinator + remote workers)
+julia --project scripts/train_distributed.jl --coordinator ...
+julia --project scripts/run_worker.jl --coordinator <ip> ...
+```
+
+### Key Lessons Learned
+1. **Argument syntax**: Use `--arg=value` not `--arg value` when game modules are loaded
+2. **Julia 1.12 world age**: Include game modules at top-level, not in functions
+3. **Loss metrics differ**: Distributed script reports raw loss; baseline reports decomposed (Lv+Lp+Lreg)
+4. **Playing strength matches**: Despite different loss values, actual performance vs random is equivalent
+5. **GPU sharing works**: Multiple components can share GPU with lazy memory allocation
+
+### Distributed Training Files
+- `src/distributed/` - Core distributed module (11 files)
+- `scripts/train_single_server.jl` - Single-machine training
+- `scripts/train_distributed.jl` - Multi-server coordinator
+- `scripts/run_worker.jl` - Remote worker script
 
 ## Next Steps (from roadmap)
 
 1. ✅ Multi-head equity network - **DONE**
 2. GnuBG evaluation integration
 3. Match equity table (MET) integration
-4. Distributed self-play
+4. ✅ Distributed self-play - **DONE**
 5. Reanalyze (MuZero style)

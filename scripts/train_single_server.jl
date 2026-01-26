@@ -47,6 +47,11 @@ using AlphaZero: GI, Network, losses, Trace, FluxLib
 import Flux
 using Statistics: mean
 
+# Pre-load game modules at top level to avoid world age issues
+const GAMES_DIR = joinpath(@__DIR__, "..", "games")
+include(joinpath(GAMES_DIR, "backgammon-deterministic", "main.jl"))
+include(joinpath(GAMES_DIR, "backgammon", "main.jl"))
+
 function parse_args()
     s = ArgParseSettings(
         description="Single-server distributed AlphaZero training",
@@ -158,10 +163,8 @@ function get_game_spec(game_name::String)
     elseif game_name == "tictactoe"
         return Examples.games["tictactoe"]
     elseif game_name == "backgammon-deterministic"
-        include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "main.jl"))
-        return Backgammon.GameSpec()
+        return BackgammonDeterministic.GameSpec()
     elseif game_name == "backgammon"
-        include(joinpath(@__DIR__, "..", "games", "backgammon", "main.jl"))
         return Backgammon.GameSpec()
     else
         error("Unknown game: $game_name. Available: connect-four, tictactoe, backgammon-deterministic, backgammon")
