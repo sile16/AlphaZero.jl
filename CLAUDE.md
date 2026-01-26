@@ -69,7 +69,6 @@ julia --project scripts/eval_current_iteration.jl sessions/<session_dir>
 - `scripts/backgammon_full_evaluation.jl` - Comprehensive evaluation
 - `scripts/benchmark_gnubg.jl` - GnuBG benchmarking
 - `scripts/GnubgPlayer.jl` - GnuBG integration module
-- `scripts/train_multihead_v2.jl` - Legacy single-process training
 - `scripts/alphazero.jl`, `mcts.jl`, `minmax.jl` - Core utilities
 
 **Archived scripts**: `scripts/archive/` contains 55+ obsolete experimental scripts
@@ -173,23 +172,22 @@ Each contains:
 |-------|------------|---------------------------|-------|
 | SimpleNet (128, 6) | 128 | +1.11 | Single-process baseline |
 | FCResNetMultiHead (128, 3) | 69 | +1.23 | Multi-head baseline |
-| FCResNetMultiHead (distributed) | 300 | +1.24 | train_single_server.jl |
 | **FCResNetMultiHead (cluster)** | **70** | **+1.21** | **train_cluster.jl (1000 games, 98.5% of baseline)** |
 
-## Distributed Training (2026-01-26)
+## Training (2026-01-26)
 
 ### Overview
-Distributed training system with ZMQ-based communication supporting:
-- N self-play workers (local threads or remote servers with GPUs)
-- Centralized inference server (optional, for CPU-only workers)
-- Replay buffer manager
-- Training process with GPU learning
+Thread-based parallel training using `train_cluster.jl`:
+- N self-play worker threads (single machine)
+- Shared GPU for training
+- Replay buffer with 100K sample capacity
 - **WandB integration** for real-time metrics tracking
+- **Parallel final evaluation** using all threads
 
-### Running Distributed Training
+### Running Training
 
 ```bash
-# Cluster training (thread-based, RECOMMENDED for single machine)
+# Standard training (single machine, multi-threaded)
 julia --project --threads=8 scripts/train_cluster.jl \
     --game=backgammon-deterministic \
     --network-type=fcresnet-multihead \
@@ -202,14 +200,11 @@ julia --project --threads=8 scripts/train_cluster.jl \
     --batch-size=256 \
     --eval-interval=10 \
     --eval-games=50 \
+    --final-eval-games=1000 \
     --wandb-project=alphazero-jl
 
 # Disable wandb if needed
 julia --project --threads=8 scripts/train_cluster.jl --no-wandb ...
-
-# Multi-server (run coordinator + remote workers) - TODO
-julia --project scripts/train_distributed.jl --coordinator ...
-julia --project scripts/run_worker.jl --coordinator <ip> ...
 ```
 
 ### Key Lessons Learned
@@ -226,21 +221,20 @@ julia --project scripts/run_worker.jl --coordinator <ip> ...
 11. **Reproducibility NOT guaranteed**: Code uses global RNG without seed management; runs are not reproducible (TODO: add --seed flag)
 12. **Git commit hash logged**: `train_cluster.jl` logs git commit at start and saves to `run_info.txt` for traceability
 
-### Distributed Training Files
-- `src/distributed/` - Core distributed module (11 files)
+### Training Infrastructure
+- `scripts/train_cluster.jl` - **Primary training script** (thread-based, wandb, parallel eval)
 - `src/cluster/` - Thread-based cluster module (4 files)
 - `src/ui/wandb.jl` - WandB integration with system metrics
-- `scripts/train_cluster.jl` - **Primary training script** (thread-based, wandb, parallel eval)
-- `scripts/train_distributed.jl` - Multi-server coordinator (WIP)
-- `scripts/run_worker.jl` - Remote worker script (WIP)
+- `src/distributed/` - Multi-server module (WIP, archived)
 
 ## Next Steps (from roadmap)
 
 1. ✅ Multi-head equity network - **DONE**
-2. ✅ Distributed self-play - **DONE** (train_single_server.jl)
-3. ✅ Cluster training (thread-based) - **DONE** (train_cluster.jl, 4-6x throughput)
-4. ✅ WandB integration - **DONE** (system + training metrics)
-5. GnuBG evaluation integration
-6. Match equity table (MET) integration
-7. Multi-machine distributed training (ZMQ)
-8. Reanalyze (MuZero style)
+2. ✅ Thread-based parallel training - **DONE** (train_cluster.jl, 4-6x throughput)
+3. ✅ WandB integration - **DONE** (system + training metrics)
+4. ✅ Parallel final evaluation - **DONE** (40-60x speedup)
+5. Add `--seed` flag for reproducibility
+6. Multi-machine training using Julia Distributed
+7. GnuBG evaluation integration
+8. Match equity table (MET) integration
+9. Reanalyze (MuZero style)
