@@ -9,6 +9,7 @@
 # Configuration:
 # - short_game=true: Faster games with pieces closer to bearing off
 # - doubles_only=true: Only doubles dice rolls (simpler game)
+# - OBSERVATION_TYPE: "minimal" (780), "full" (1612), or "biased" (3172)
 
 import AlphaZero.GI
 using StaticArrays
@@ -21,11 +22,28 @@ using BackgammonNet
 const SHORT_GAME = true  # Shorter games for faster learning (intentionally different starting position)
 const DOUBLES_ONLY = false  # Full 21 dice outcomes for proper stochastic testing
 
+# Observation type: "minimal", "full", or "biased"
+# Can be overridden via environment variable BACKGAMMON_OBS_TYPE
+const OBSERVATION_TYPE = get(ENV, "BACKGAMMON_OBS_TYPE", "full")
+
 # Action space: 676 actions (26*26 locations)
 const NUM_ACTIONS = 676
 
-# Observation size (using observe_full: 86 features)
-const OBS_SIZE = 86
+# Observation sizes from BackgammonNet (channels × OBS_WIDTH)
+const OBS_SIZES = Dict(
+    "minimal" => BackgammonNet.OBS_CHANNELS_MINIMAL * BackgammonNet.OBS_WIDTH,  # 30 × 26 = 780
+    "full" => BackgammonNet.OBS_CHANNELS_FULL * BackgammonNet.OBS_WIDTH,        # 62 × 26 = 1612
+    "biased" => BackgammonNet.OBS_CHANNELS_BIASED * BackgammonNet.OBS_WIDTH     # 122 × 26 = 3172
+)
+const OBS_SIZE = OBS_SIZES[OBSERVATION_TYPE]
+
+# Observation function mapping
+const OBS_FUNCTIONS = Dict(
+    "minimal" => BackgammonNet.observe_minimal,
+    "full" => BackgammonNet.observe_full,
+    "biased" => BackgammonNet.observe_biased
+)
+const OBSERVE_FN = OBS_FUNCTIONS[OBSERVATION_TYPE]
 
 const Player = Bool
 const WHITE = true   # Player 0
@@ -48,7 +66,9 @@ end
 GI.num_chance_outcomes(::GameSpec) = 0
 
 function GI.vectorize_state(::GameSpec, game::BackgammonNet.BackgammonGame)
-  return BackgammonNet.observe_full(game)
+  # Use configured observation function, flatten 3D to 1D
+  obs = OBSERVE_FN(game)
+  return vec(obs)
 end
 
 #####

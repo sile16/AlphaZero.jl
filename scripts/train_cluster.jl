@@ -409,7 +409,7 @@ function main()
     # Initialize random seed for reproducibility
     seed = args["seed"]
     if seed == 0
-        seed = rand(UInt32)  # Generate random seed
+        seed = Int(rand(UInt32))  # Generate random seed as Int for type compatibility
     end
     Random.seed!(seed)
     @info "Random seed: $seed"

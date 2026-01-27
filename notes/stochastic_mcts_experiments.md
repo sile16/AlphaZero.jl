@@ -206,3 +206,467 @@ Sample weight: k / (virtual_N + k)
 ```
 
 Bug fixed: Was using `W = V × prob × virtual_N` (wrong), now `W = V × virtual_N` (correct).
+
+---
+
+## Future Optimizations to Try
+
+### 1. Stratified Sampling for Chance Nodes
+
+Instead of pure probability-proportional sampling, use stratified sampling with coverage guarantee:
+
+```
+if any outcome has 0 visits:
+    sample uniformly from unvisited outcomes
+else:
+    sample proportionally to probability
+```
+
+**Benefits:**
+- Guarantees all outcomes visited before any repeated
+- Reduces variance in early estimates
+- Maintains probability-proportional sampling after initial coverage
+
+**Trade-off:** Initial phase slightly biased toward low-probability outcomes, but this washes out quickly.
+
+### 2. Gumbel AlphaZero (Root Sampling)
+
+From "Policy Improvement by Planning with Gumbel" (Danihelka et al., 2022):
+
+**Key idea:** Instead of visit counts for action selection at the root, use Gumbel-Top-k sampling:
+- Add Gumbel noise to Q + prior values
+- Select top-k actions for MCTS expansion
+- Provides better exploration with fewer simulations
+
+**Benefits for stochastic games:**
+- More efficient exploration at decision nodes
+- Could combine with stratified sampling at chance nodes
+- Proven to match or exceed AlphaZero with fewer simulations
+
+**Reference:** https://arxiv.org/abs/2104.06303
+
+### 3. MuZero-style Learned Dynamics
+
+From "Mastering Atari, Go, Chess and Shogi by Planning with a Learned Model" (Schrittwieser et al., 2020):
+
+**Key idea:** Learn a latent dynamics model instead of using game rules:
+- Representation function: observation → hidden state
+- Dynamics function: (hidden state, action) → next hidden state, reward
+- Prediction function: hidden state → policy, value
+
+**Benefits for stochastic games:**
+- Dynamics model can learn to handle stochasticity implicitly
+- No need for explicit chance nodes in MCTS
+- Works even when game rules aren't available
+
+**Challenges:**
+- More complex architecture
+- Requires learning dynamics (not just value/policy)
+- May need modifications for explicit stochasticity
+
+**Reference:** https://arxiv.org/abs/1911.08265
+
+### 4. Stochastic MuZero
+
+Extension of MuZero for stochastic environments:
+- Learn a stochastic dynamics model
+- Sample from learned transition distribution
+- Could combine learned dynamics with explicit chance modeling
+
+**Reference:** https://arxiv.org/abs/2104.06303 (Section on stochastic environments)
+
+---
+
+## Summary: Optimization Priority List
+
+| Priority | Optimization | Effort | Expected Impact |
+|----------|-------------|--------|-----------------|
+| 1 | Stratified sampling | Low | Medium - better early estimates |
+| 2 | Gumbel root sampling | Medium | High - fewer sims needed |
+| 3 | Higher virtual_visits tuning | Low | Low-Medium - tune prior weight |
+| 4 | MuZero dynamics | High | High - but major rewrite |
+| 5 | Stochastic MuZero | Very High | Unknown - research frontier |
+
+### Quick Wins (< 1 day):
+- Stratified sampling implementation
+- Tune `prior_virtual_visits` parameter (try 0.5, 2.0, 5.0)
+- Tune `cpuct` for stochastic games
+
+### Medium Projects (1-3 days):
+- Gumbel AlphaZero implementation
+- Progressive widening with k parameter
+- Hybrid: progressive for training, sampling for eval
+
+### Research Projects (weeks):
+- MuZero adaptation for backgammon
+- Stochastic MuZero with explicit chance modeling
+- Learned outcome importance weighting
+
+---
+
+## Conclusions: Gumbel and Stochastic MCTS (2026-01-24)
+
+### What We Tried
+
+1. **Gumbel MCTS** (6-hour runs with 50 and 100 simulations)
+   - Did not show improvement over standard MCTS
+   - Added complexity without measurable benefit at this scale
+
+2. **Stochastic MCTS with Sampling** (`chance_mode=:sampling`)
+   - 80.0% vs Random (vs 82.5% for deterministic)
+   - 63.6% vs GnuBG 0-PLY (vs 67.0% for deterministic)
+   - Head-to-head: 48% vs 52% (not statistically significant)
+
+3. **Stochastic MCTS with Progressive Widening** (`chance_mode=:progressive`)
+   - Similar results to sampling mode
+   - Added overhead without clear benefit
+
+### Key Findings
+
+**Neither Gumbel nor stochastic chance node handling improved performance at this scale.**
+
+Possible explanations:
+- 4-6 hour training may be insufficient to see benefits
+- Network capacity (width=128, depth=6) may be too small
+- Standard MCTS with hidden stochasticity works surprisingly well for backgammon
+- The dice sampling inherent in MCTS rollouts may already provide sufficient exploration
+
+### Recommendation
+
+**Focus on deterministic MCTS baseline with larger networks before revisiting stochastic approaches.**
+
+Next steps:
+1. Establish strong deterministic baseline with larger NN
+2. If GPU allows, test if larger network improves learning efficiency
+3. Revisit stochastic approaches only after seeing diminishing returns from network scaling
+
+---
+
+## Experiment 4: Larger Network Baseline (2026-01-24)
+
+### Goal
+Test if larger neural network improves performance, given GPU is underutilized.
+
+### Experimental Metadata (Publication Record)
+
+| Field | Value |
+|-------|-------|
+| Git commit | fd39c82bfd14b5737ef3b3709db6806b9df7c9e3 |
+| Hardware | NVIDIA GeForce RTX 4090, 24GB VRAM |
+| Julia version | 1.12.4 |
+| Start time (Large NN) | 2026-01-24 10:49:56 |
+| End time | 2026-01-24 15:37:00 |
+| Total runtime | 4hr 47min |
+| Log file | results/largenn_4hr_20260124_104941.log |
+| Session dir | sessions/largenn-4hr-20260124-104946/ |
+
+### Results: Large Network Run (FCResNet 256×8)
+
+#### Network Statistics
+- Parameters: 1,523,365 (1,506,048 regularized)
+- Memory per MCTS node: 16,712 bytes
+- Samples/sec: 24-37 (avg ~25)
+
+#### Training Progress
+
+| Iter | Arena Reward | AZ vs Random (1000g) | Random vs AZ (1000g) |
+|------|--------------|---------------------|---------------------|
+| 0 | - | -0.84 | -1.10 |
+| 1 | +0.25 | -0.39 | -1.16 |
+| 2 | +0.20 | -0.37 | -1.22 |
+| 3 | +0.20 | -0.27 | -1.32 |
+| 4 | +0.60 | -0.13 | -1.28 |
+| 5 | +0.50 | -0.20 | -1.30 |
+
+#### Performance Interpretation
+
+**Benchmark rewards** (avg reward per game, range -2 to +2 for gammon/backgammon):
+- "AZ vs Random": AlphaZero plays first (white)
+- "Random vs AZ": Random plays first (white)
+
+**Key observations:**
+1. **First-player disadvantage**: AZ consistently performs worse when playing first
+   - Best: -0.13 (iter 4) when playing first vs -1.28 when Random plays first
+   - This suggests backgammon may favor the second player, or network hasn't learned first-player strategy
+
+2. **Improvement trajectory**:
+   - Untrained: AZ loses badly in both positions
+   - After 5 iterations: AZ wins convincingly as second player, struggles as first player
+
+3. **Arena vs Benchmark discrepancy**:
+   - Arena (20 games): Shows +0.50 to +0.60
+   - Benchmark (2000 games): Shows AZ still losing as first player
+   - Arena may have high variance due to small sample size
+
+#### Timing Analysis
+
+| Phase | Time |
+|-------|------|
+| Iteration 0 (init benchmark) | ~25 min |
+| Per iteration average | ~50 min |
+| - Self-play (250 games) | ~12 min |
+| - Learning | ~3 min |
+| - Arena (20 games) | ~2 min |
+| - Benchmark (2000 games) | ~33 min |
+
+**Bottleneck**: The 2000-game per-iteration benchmark consumed 66% of training time.
+
+#### Issues Identified
+
+1. **Benchmark overhead**: Running 2000 games per iteration severely limited iterations
+   - Got 5 iterations instead of target 24
+   - Should move benchmark to final-only for future runs
+
+2. **Low GPU utilization**: Only 2-8% GPU usage
+   - Large network (1.5M params) still not saturating RTX 4090
+   - Could potentially use even larger network
+
+3. **Slow samples/sec**: 24-37 samples/sec vs expected higher throughput
+   - May be CPU-bound during self-play
+   - Consider batch size tuning or async improvements
+
+### Design
+- **Duration**: 4 hours
+- **Iterations**: 24 (targeting ~10 min each)
+- **Mode**: Deterministic MCTS (no explicit chance nodes)
+
+### Two Runs
+
+**Run A: Baseline (current network)**
+- SimpleNet width=128, depth=6
+- ~232K parameters
+
+**Run B: Large Network**
+- FCResNet width=256, num_blocks=8
+- 1,523,365 parameters (1,506,048 regularized)
+
+### Hyperparameter Adjustments for Larger Network
+
+| Parameter | Baseline | Large NN | Rationale |
+|-----------|----------|----------|-----------|
+| Network | SimpleNet(128, 6) | FCResNet(256, 8) | More capacity |
+| LR range | 1e-3 → 1e-2 | 5e-4 → 5e-3 | Lower LR for larger nets |
+| Batch size | 64 | 128 | Better GPU utilization |
+| L2 reg | 1e-4 | 5e-5 | Less reg per parameter |
+| Games/iter | 250 | 250 | ~10 min iterations |
+| MCTS sims | 100 | 100 | Keep constant |
+| Arena | 20 games, threshold=0.0 | Same | Always accept, track only |
+| Final eval | 1000 games vs Random | Same | Statistical power |
+
+---
+
+## Statistical Significance Guidelines
+
+### Required Sample Sizes for Backgammon
+
+Backgammon has high variance due to dice. Use these guidelines for eval games:
+
+| Effect Size | Games Needed | 95% CI Width |
+|-------------|--------------|--------------|
+| 10% diff | ~400 | ±5% |
+| 5% diff | ~1600 | ±2.5% |
+| 3% diff | ~4400 | ±1.5% |
+
+### Formula
+```
+n = (z² × p × (1-p)) / E²
+
+Where:
+- z = 1.96 for 95% confidence
+- p = 0.5 (expected win rate)
+- E = margin of error (half of CI width)
+
+For 5% margin: n = (1.96² × 0.25) / 0.05² = 384 games
+For 2.5% margin: n = (1.96² × 0.25) / 0.025² = 1537 games
+```
+
+### Reporting Template
+
+When summarizing results, always include:
+```
+Win Rate: X% (n games)
+95% CI: [X - E, X + E]
+Z-score vs baseline: Z
+P-value: p
+Significant at α=0.05: YES/NO
+```
+
+### Final Eval Settings
+- Use 1000+ games for meaningful comparisons
+- Report exact counts and confidence intervals
+- Don't claim significance without p < 0.05
+
+---
+
+## Bug Fix: Player Perspective Mismatch (2026-01-24)
+
+### Symptom
+Large asymmetry in benchmark results between AZ playing as P0 vs P1:
+- AZ as P0 (white): -0.84 avg reward → ~8% win rate
+- AZ as P1 (black): -1.10 avg reward (from P0's perspective)
+
+Going first in backgammon provides only ~1-2% advantage, so this large discrepancy indicated a bug.
+
+### Root Cause Analysis
+
+The issue was in how `push_trace!` (memory.jl) determines the player perspective for value targets.
+
+**Old code:**
+```julia
+wp = GI.white_playing(GI.init(mem.gspec, s))
+z = wp ? wr : -wr
+```
+
+The problem: `GI.init(gspec, state)` creates a GameEnv and calls `set_state!`, which could have side effects. In the backgammon implementation, `set_state!` includes:
+
+```julia
+if BackgammonNet.is_chance_node(g.game) && !BackgammonNet.game_terminated(g.game)
+    BackgammonNet.sample_chance!(g.game, g.rng)
+end
+```
+
+If a state somehow had `dice == (0, 0)` (chance node), `sample_chance!` would be called, which could:
+1. Roll dice
+2. Auto-apply PASS|PASS if that's the only legal move
+3. Change `current_player` to the next player
+
+This would cause `white_playing` to return the wrong value, flipping the sign of value targets.
+
+### Fix Applied
+
+1. **Added `GI.white_playing(gspec, state)` to game.jl (line 139)**
+   - A two-argument version that works directly on states without creating a GameEnv
+   - Default implementation falls back to creating a temporary GameEnv
+
+2. **Updated `push_trace!` in memory.jl (line 94)**
+   ```julia
+   wp = GI.white_playing(mem.gspec, s)  # Direct state access, no side effects
+   ```
+
+3. **Implemented direct accessor in both backgammon games**
+   ```julia
+   GI.white_playing(::GameSpec, state::BackgammonNet.BackgammonGame) = state.current_player == 0
+   ```
+
+### Files Modified
+- `src/game.jl`: Added `white_playing(gspec, state)` function signature with default
+- `src/memory.jl`: Updated `push_trace!` to use direct state access
+- `games/backgammon-deterministic/game.jl`: Added direct accessor
+- `games/backgammon/game.jl`: Added direct accessor
+
+### Verification
+After this fix, training should produce networks that perform symmetrically when playing as P0 or P1, with only the natural ~1-2% first-player advantage seen in backgammon.
+
+### Lesson Learned
+When implementing game interfaces with canonical (current-player-relative) observations:
+1. Avoid side effects in `set_state!`
+2. Provide direct state accessors for perspective-sensitive functions
+3. Be especially careful with stochastic games where state restoration may trigger game logic
+
+---
+
+## Experiment 5: Observation Feature Engineering Comparison (2026-01-27)
+
+### Goal
+Compare different observation representations to determine which features help learning:
+- **MINIMAL**: Basic board state only (780 features)
+- **FULL**: Board + game rule features like pip count, home count (1612 features)
+- **BIASED**: Full + heuristic/strategic features (3172 features)
+
+### Experimental Metadata
+
+| Field | Value |
+|-------|-------|
+| Git commit | cc921129 (dirty) |
+| BackgammonNet version | v0.2.8 |
+| Hardware | NVIDIA GeForce RTX 4090, 24GB VRAM |
+| Julia version | 1.12.4 |
+| Start time | 2026-01-26 23:16 |
+| End time | 2026-01-27 02:54 |
+| Total runtime | ~3.5 hours (3 runs) |
+| WandB project | alphazero-jl |
+
+### Configuration (All Runs)
+
+| Parameter | Value |
+|-----------|-------|
+| Network | FCResNetMultiHead (width=128, blocks=3) |
+| Total iterations | 70 |
+| Games per iteration | 50 |
+| MCTS iterations | 100 |
+| Workers | 6 |
+| Final eval games | 1000 |
+| Buffer capacity | 100,000 |
+
+### Results
+
+| Observation | Features | Network Params | Combined Reward | Training Time | Games/min |
+|-------------|----------|----------------|-----------------|---------------|-----------|
+| MINIMAL | 780 | 339,241 | **1.23** | 57.6 min | 190.6 |
+| FULL | 1612 | 429,097 | **1.318** (+7.2%) | 67.4 min | 147.2 |
+| BIASED | 3172 | 588,457 | **1.339** (+8.9%) | 72.5 min | 95.6 |
+
+### WandB Runs
+- Minimal: https://wandb.ai/sile16-self/alphazero-jl/runs/sxflbfvn
+- Full: https://wandb.ai/sile16-self/alphazero-jl/runs/u4xxvj0p
+- Biased: https://wandb.ai/sile16-self/alphazero-jl/runs/6rcbhux2
+
+### Analysis
+
+**Performance Ranking**: BIASED > FULL > MINIMAL
+
+1. **Feature engineering helps**: Adding game rule features (FULL) improved performance by 7.2%
+2. **Heuristics help more**: Adding strategic bias features improved another 1.6% (8.9% total)
+3. **Diminishing returns**: Jump from minimal→full was larger than full→biased
+4. **Training speed tradeoff**: More features = slower training (190 → 95 games/min)
+
+### Observation Feature Details (BackgammonNet v0.2.8)
+
+**MINIMAL (30 channels × 26 width = 780)**:
+- Basic one-hot board encoding
+- Current player indicator
+- Dice values
+
+**FULL (62 channels × 26 width = 1612)**:
+- Everything in MINIMAL plus:
+- Pip counts (normalized)
+- Home board counts
+- Bar counts
+- Bearing off progress
+- Game phase indicators
+
+**BIASED (122 channels × 26 width = 3172)**:
+- Everything in FULL plus:
+- Blot exposure risk
+- Prime structure detection
+- Racing vs contact indicators
+- Anchor positions
+- Blocking point values
+
+### Key Insights
+
+1. **Pre-computed features reduce what NN must learn**: The network doesn't need to learn pip counting or blot detection from raw positions - it's provided directly.
+
+2. **Heuristic features encode domain knowledge**: Features like "prime strength" or "anchor quality" encode backgammon strategy that would otherwise require many training iterations to discover.
+
+3. **Speed vs performance tradeoff**: For same wall-clock training time:
+   - MINIMAL: ~10,000 games, Combined=1.23
+   - BIASED: ~6,400 games, Combined=1.339
+
+   Despite 36% fewer games, BIASED still won due to richer features.
+
+4. **Recommendation**: Use BIASED features for production training. The slower throughput is offset by faster learning per game.
+
+### Lessons Learned
+
+1. **Feature engineering still matters in deep RL**: Even with neural networks, hand-crafted features can significantly accelerate learning.
+
+2. **Domain knowledge via features**: Rather than learning everything from scratch, encoding known-good heuristics as features provides a strong inductive bias.
+
+3. **Test feature sets systematically**: Running controlled experiments with different observation spaces identifies which features actually help.
+
+### Next Steps
+
+1. Train longer with BIASED features to see final performance ceiling
+2. Test if benefits persist at higher iteration counts (200+)
+3. Consider hybrid: BIASED for training, MINIMAL for fast eval

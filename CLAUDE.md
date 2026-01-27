@@ -238,3 +238,12 @@ julia --project --threads=8 scripts/train_cluster.jl --no-wandb ...
 7. GnuBG evaluation integration
 8. Match equity table (MET) integration
 9. Reanalyze (MuZero style)
+10. Curriculum learning - Progressive training difficulty
+11. Pre-race-net and race-net - Specialized networks for racing positions (when pieces have passed each other)
+12. Exam eval - Known tricky positions for evaluation only (testing MET knowledge, non-obvious rules, NOT for training)
+13. Gym - Training on known board positions with known multi-head value and policy targets (separate from exam, used for training)
+14. Precomputed endgame tables - Avoid running games all the way to completion
+
+**Ideas/Notes:**
+- For stochastic implementation: train a stochastic head that outputs priors for all 21 dice outcomes for V, so we know the prior for all 21 options. Optionally predict which stochastic options will have the highest absolute change in V, use that to sample top-k extreme outcomes for better value estimates.
+- Another idea: use full stochastic node expansion in eval ONLY (doesn't seem to help training) 
