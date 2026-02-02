@@ -14,10 +14,14 @@ Usage:
         --num-workers=4 \\
         --total-iterations=50
 
-    # Multi-machine with SSH (TODO)
+    # With GnuBG evaluation
     julia --project scripts/train_cluster.jl \\
         --game=backgammon-deterministic \\
-        --worker-hosts=worker1,worker2
+        --eval-vs-gnubg \\
+        --num-workers=4
+
+    # View TensorBoard logs
+    tensorboard --logdir=sessions/<session>/tensorboard
 """
 
 using ArgParse
@@ -38,18 +42,28 @@ end
 using AlphaZero
 using AlphaZero.Cluster
 using AlphaZero: GI, Network, FluxLib
-using AlphaZero.Wandb
+using AlphaZero.TensorBoard
 import Flux
 using Statistics: mean
 using Base.Threads
-
-# Preload PythonCall for wandb (avoids world age issues)
-using PythonCall
 
 # Pre-load game modules at top level to avoid world age issues
 const GAMES_DIR = joinpath(@__DIR__, "..", "games")
 include(joinpath(GAMES_DIR, "backgammon-deterministic", "main.jl"))
 include(joinpath(GAMES_DIR, "backgammon", "main.jl"))
+
+# Check if GnuBG evaluation is requested (load GnubgPlayer if so)
+function check_gnubg_mode()
+    return "--eval-vs-gnubg" in ARGS
+end
+
+const LOAD_GNUBG = check_gnubg_mode()
+
+if LOAD_GNUBG
+    @info "Loading GnubgPlayer for evaluation..."
+    include(joinpath(@__DIR__, "GnubgPlayer.jl"))
+    using .GnubgPlayer
+end
 
 function parse_args()
     s = ArgParseSettings(
@@ -136,21 +150,13 @@ function parse_args()
             arg_type = String
             default = "checkpoints"
 
-        # WandB configuration
-        "--wandb-project"
-            help = "WandB project name"
-            arg_type = String
-            default = "alphazero-jl"
-        "--wandb-run-name"
-            help = "WandB run name (auto-generated if not provided)"
-            arg_type = String
-            default = nothing
+        # Logging configuration
         "--host-id"
             help = "Host identifier for multi-machine tracking"
             arg_type = String
             default = nothing
-        "--no-wandb"
-            help = "Disable WandB logging"
+        "--no-tensorboard"
+            help = "Disable TensorBoard logging"
             action = :store_true
 
         # Evaluation
@@ -174,6 +180,19 @@ function parse_args()
             default = 1000
         "--final-eval-workers"
             help = "Number of parallel workers for final evaluation (0 = use all threads)"
+            arg_type = Int
+            default = 0
+
+        # GnuBG evaluation
+        "--eval-vs-gnubg"
+            help = "Evaluate against GnuBG during training (in addition to random)"
+            action = :store_true
+        "--gnubg-ply"
+            help = "GnuBG lookahead depth for evaluation (0=neural net only, 1=1-ply)"
+            arg_type = Int
+            default = 0
+        "--gnubg-eval-games"
+            help = "Number of games per GnuBG evaluation (default: same as --eval-games)"
             arg_type = Int
             default = 0
 
@@ -385,6 +404,83 @@ function parallel_evaluate_vs_random(network, gspec, num_games::Int, mcts_iters:
 end
 
 """
+Evaluate current network against GnuBG (single-threaded).
+Returns Dict with eval metrics.
+"""
+function evaluate_vs_gnubg(network, gspec, num_games::Int, mcts_iters::Int, use_gpu::Bool; gnubg_ply::Int=0)
+    if !LOAD_GNUBG
+        @warn "GnuBG evaluation requested but GnubgPlayer not loaded"
+        return Dict{String, Any}()
+    end
+
+    # Create evaluation network
+    eval_network = Network.copy(network, on_gpu=use_gpu, test_mode=true)
+
+    # Create MCTS params for evaluation (lower temperature, no noise)
+    eval_mcts = MctsParams(
+        num_iters_per_turn=mcts_iters,
+        cpuct=1.5,
+        temperature=ConstSchedule(0.2),
+        dirichlet_noise_ϵ=0.0,
+        dirichlet_noise_α=0.3,
+        gamma=1.0
+    )
+
+    az_player = MctsPlayer(gspec, eval_network, eval_mcts)
+    gnubg_player = GnubgPlayer.GnubgBaseline(ply=gnubg_ply)
+
+    games_per_side = num_games ÷ 2
+
+    # Play as white against GnuBG
+    rewards_white = Float64[]
+    for i in 1:games_per_side
+        trace = play_game(gspec, TwoPlayers(az_player, gnubg_player))
+        push!(rewards_white, total_reward(trace))
+        reset_player!(az_player)
+
+        # Progress reporting
+        if i % max(1, games_per_side ÷ 5) == 0
+            @info "GnuBG eval as white: $i / $games_per_side"
+        end
+    end
+
+    # Play as black against GnuBG
+    rewards_black = Float64[]
+    for i in 1:games_per_side
+        trace = play_game(gspec, TwoPlayers(gnubg_player, az_player))
+        push!(rewards_black, -total_reward(trace))  # Negate for black's perspective
+        reset_player!(az_player)
+
+        # Progress reporting
+        if i % max(1, games_per_side ÷ 5) == 0
+            @info "GnuBG eval as black: $i / $games_per_side"
+        end
+    end
+
+    avg_white = isempty(rewards_white) ? 0.0 : sum(rewards_white) / length(rewards_white)
+    avg_black = isempty(rewards_black) ? 0.0 : sum(rewards_black) / length(rewards_black)
+    combined = (avg_white + avg_black) / 2
+
+    # Calculate win rates
+    wins_white = count(r -> r > 0, rewards_white)
+    wins_black = count(r -> r > 0, rewards_black)
+    wr_white = isempty(rewards_white) ? 0.0 : wins_white / length(rewards_white)
+    wr_black = isempty(rewards_black) ? 0.0 : wins_black / length(rewards_black)
+    wr_combined = (wr_white + wr_black) / 2
+
+    return Dict{String, Any}(
+        "eval/vs_gnubg$(gnubg_ply)ply_white" => avg_white,
+        "eval/vs_gnubg$(gnubg_ply)ply_black" => avg_black,
+        "eval/vs_gnubg$(gnubg_ply)ply_combined" => combined,
+        "eval/vs_gnubg$(gnubg_ply)ply_wr_white" => wr_white,
+        "eval/vs_gnubg$(gnubg_ply)ply_wr_black" => wr_black,
+        "eval/vs_gnubg$(gnubg_ply)ply_wr_combined" => wr_combined,
+        "eval/gnubg_games" => num_games,
+        "eval/gnubg_ply" => gnubg_ply
+    )
+end
+
+"""
 Main entry point.
 """
 function main()
@@ -392,6 +488,12 @@ function main()
 
     if args["verbose"]
         ENV["JULIA_DEBUG"] = "AlphaZero"
+    end
+
+    # GnuBG availability is determined at load time via LOAD_GNUBG constant
+    eval_vs_gnubg = args["eval_vs_gnubg"] && LOAD_GNUBG
+    if args["eval_vs_gnubg"] && !LOAD_GNUBG
+        @warn "GnuBG evaluation was requested but GnubgPlayer failed to load"
     end
 
     # Get git commit hash for reproducibility
@@ -415,7 +517,7 @@ function main()
     @info "Random seed: $seed"
 
     @info "=" ^ 60
-    @info "Distributed AlphaZero Training (Julia Distributed)"
+    @info "AlphaZero Training (TensorBoard logging)"
     @info "=" ^ 60
     @info "Git commit: $(git_hash[1:min(8, length(git_hash))])$(git_dirty ? " (dirty)" : "")"
     @info "Seed: $seed"
@@ -433,8 +535,13 @@ function main()
     @info "Network: $(args["network_type"]) (width=$(args["network_width"]), blocks=$(args["network_blocks"]), params=$num_params)"
 
     # Check if loading from checkpoint
-    if !isnothing(args["load_network"])
-        @info "Will load weights from: $(args["load_network"])"
+    load_network_path = args["load_network"]
+    if !isnothing(load_network_path)
+        @info "Will load weights from: $load_network_path"
+        # Verify file exists
+        if !isfile(load_network_path)
+            error("Checkpoint file not found: $load_network_path")
+        end
     end
 
     # Determine host_id
@@ -456,8 +563,8 @@ function main()
     @info "  GPU enabled: $use_gpu"
     @info "  Host ID: $host_id"
 
-    wandb_enabled = !args["no_wandb"]
-    @info "  WandB: $(wandb_enabled ? args["wandb_project"] : "disabled")"
+    tb_enabled = !args["no_tensorboard"]
+    @info "  TensorBoard: $(tb_enabled ? "enabled" : "disabled")"
 
     eval_interval = args["eval_interval"]
     eval_mcts = args["eval_mcts_iters"] > 0 ? args["eval_mcts_iters"] : args["mcts_iters"]
@@ -475,64 +582,95 @@ function main()
         @info "  Final eval: disabled"
     end
 
+    # GnuBG evaluation config
+    gnubg_ply = args["gnubg_ply"]
+    gnubg_eval_games = args["gnubg_eval_games"] > 0 ? args["gnubg_eval_games"] : args["eval_games"]
+    if eval_vs_gnubg && eval_interval > 0
+        @info "  GnuBG eval: every $eval_interval iters, $gnubg_eval_games games, $(gnubg_ply)-ply"
+    end
+
     if use_gpu
         @info "  GPU memory: $(round(CUDA.available_memory() / 1e9, digits=2)) GB free"
     end
 
     @info "=" ^ 60
 
-    # Initialize wandb
-    if wandb_enabled
-        @info "Initializing WandB..."
-        try
-            run_name = args["wandb_run_name"]
-            if isnothing(run_name)
-                run_name = "cluster-$(args["game"])-$(args["network_type"])-$(Dates.format(now(), "mmdd-HHMM"))"
-            end
+    # Create session directory
+    timestamp = Dates.format(now(), "yyyymmdd_HHMMSS")
+    session_dir = joinpath("sessions", "cluster_$(timestamp)")
+    checkpoint_dir = joinpath(session_dir, args["checkpoint_dir"])
+    tb_dir = joinpath(session_dir, "tensorboard")
+    mkpath(checkpoint_dir)
+    mkpath(tb_dir)
+    @info "Session directory: $session_dir"
 
-            config = Dict{String, Any}(
-                # Game
-                "game" => args["game"],
-                # Network
-                "network_type" => args["network_type"],
-                "network_width" => args["network_width"],
-                "network_blocks" => args["network_blocks"],
-                "network_params" => num_params,
-                # Training
-                "num_workers" => args["num_workers"],
-                "total_iterations" => args["total_iterations"],
-                "games_per_iteration" => args["games_per_iteration"],
-                "batch_size" => args["batch_size"],
-                "learning_rate" => args["learning_rate"],
-                "l2_reg" => args["l2_reg"],
-                # MCTS
-                "mcts_iters" => args["mcts_iters"],
-                "cpuct" => args["cpuct"],
-                # Buffer
-                "buffer_capacity" => args["buffer_capacity"],
-                # Evaluation
-                "eval_interval" => eval_interval,
-                "eval_games" => args["eval_games"],
-                "eval_mcts_iters" => eval_mcts,
-                # Final evaluation
-                "final_eval_games" => final_eval_games,
-                "final_eval_workers" => final_eval_workers,
-                # System
-                "host_id" => host_id,
-                "use_gpu" => use_gpu,
-                "training_mode" => "cluster",
-                # Reproducibility
-                "git_commit" => git_hash,
-                "git_dirty" => git_dirty,
-                "seed" => seed,
-            )
+    # Initialize TensorBoard
+    if tb_enabled
+        run_name = "$(args["game"])-$(args["network_type"])-$(Dates.format(now(), "mmdd-HHMM"))"
+        tb_init(logdir=tb_dir, run_name=run_name)
 
-            wandb_init(project=args["wandb_project"], name=run_name, config=config)
-            @info "WandB initialized: project=$(args["wandb_project"]), run=$run_name"
-        catch e
-            @warn "Failed to initialize wandb, continuing without logging" exception=e
-            wandb_enabled = false
+        # Log configuration
+        config = Dict{String, Any}(
+            "game" => args["game"],
+            "network_type" => args["network_type"],
+            "network_width" => args["network_width"],
+            "network_blocks" => args["network_blocks"],
+            "network_params" => num_params,
+            "num_workers" => args["num_workers"],
+            "total_iterations" => args["total_iterations"],
+            "games_per_iteration" => args["games_per_iteration"],
+            "batch_size" => args["batch_size"],
+            "learning_rate" => args["learning_rate"],
+            "l2_reg" => args["l2_reg"],
+            "mcts_iters" => args["mcts_iters"],
+            "cpuct" => args["cpuct"],
+            "buffer_capacity" => args["buffer_capacity"],
+            "eval_interval" => eval_interval,
+            "eval_games" => args["eval_games"],
+            "eval_vs_gnubg" => eval_vs_gnubg,
+            "gnubg_ply" => gnubg_ply,
+            "host_id" => host_id,
+            "use_gpu" => use_gpu,
+            "git_commit" => git_hash,
+            "seed" => seed,
+        )
+        tb_log_config(config)
+    end
+
+    # Save reproducibility info to session directory
+    open(joinpath(session_dir, "run_info.txt"), "w") do f
+        println(f, "# AlphaZero.jl Training Run")
+        println(f, "timestamp: $timestamp")
+        println(f, "git_commit: $git_hash")
+        println(f, "git_dirty: $git_dirty")
+        println(f, "seed: $seed")
+        println(f, "")
+        println(f, "# Arguments")
+        for (k, v) in sort(collect(args), by=first)
+            println(f, "$k: $v")
         end
+    end
+
+    # Track start time
+    start_time = time()
+
+    # TensorBoard logging callback
+    tb_log_fn = if tb_enabled
+        (metrics) -> begin
+            try
+                # Add system metrics periodically
+                if haskey(metrics, "train/iteration") && metrics["train/iteration"] % 5 == 0
+                    cuda_mod = use_gpu ? CUDA : nothing
+                    sys_metrics = all_system_metrics(host_id=host_id, cuda_module=cuda_mod)
+                    merge!(metrics, sys_metrics)
+                end
+                tb_log(metrics, step=get(metrics, "train/iteration", nothing))
+            catch e
+                @warn "TensorBoard log failed" exception=e
+            end
+        end
+    else
+        nothing
     end
 
     # Create MCTS params
@@ -558,59 +696,32 @@ function main()
         num_checkpoints=1
     )
 
-    # Create session directory
-    timestamp = Dates.format(now(), "yyyymmdd_HHMMSS")
-    session_dir = joinpath("sessions", "cluster_$(timestamp)")
-    checkpoint_dir = joinpath(session_dir, args["checkpoint_dir"])
-    mkpath(checkpoint_dir)
-    @info "Session directory: $session_dir"
-
-    # Save reproducibility info to session directory
-    open(joinpath(session_dir, "run_info.txt"), "w") do f
-        println(f, "# AlphaZero.jl Training Run")
-        println(f, "timestamp: $timestamp")
-        println(f, "git_commit: $git_hash")
-        println(f, "git_dirty: $git_dirty")
-        println(f, "seed: $seed")
-        println(f, "")
-        println(f, "# Arguments")
-        for (k, v) in sort(collect(args), by=first)
-            println(f, "$k: $v")
-        end
-    end
-
-    # Track start time
-    start_time = time()
-
-    # WandB logging callback
-    wandb_log_fn = if wandb_enabled
-        (metrics) -> begin
-            try
-                # Add system metrics periodically
-                if haskey(metrics, "train/iteration") && metrics["train/iteration"] % 5 == 0
-                    cuda_mod = use_gpu ? CUDA : nothing
-                    sys_metrics = all_system_metrics(host_id=host_id, cuda_module=cuda_mod)
-                    merge!(metrics, sys_metrics)
-                end
-                wandb_log(metrics, step=get(metrics, "train/iteration", nothing))
-            catch e
-                @warn "WandB log failed" exception=e
-            end
-        end
-    else
-        nothing
-    end
-
     # Evaluation callback
     eval_fn = if eval_interval > 0
         (network) -> begin
-            @info "Running evaluation ($(args["eval_games"]) games vs random)..."
+            results = Dict{String, Any}()
             eval_start = time()
-            results = evaluate_vs_random(network, gspec, args["eval_games"], eval_mcts, use_gpu)
-            results["eval/time_s"] = time() - eval_start
-            @info "Eval results: white=$(round(results["eval/vs_random_white"], digits=3)), " *
+
+            # Always evaluate vs random (fast baseline)
+            @info "Running evaluation ($(args["eval_games"]) games vs random)..."
+            random_results = evaluate_vs_random(network, gspec, args["eval_games"], eval_mcts, use_gpu)
+            merge!(results, random_results)
+            @info "vs Random: white=$(round(results["eval/vs_random_white"], digits=3)), " *
                   "black=$(round(results["eval/vs_random_black"], digits=3)), " *
                   "combined=$(round(results["eval/vs_random_combined"], digits=3))"
+
+            # Optionally evaluate vs GnuBG (meaningful generalization test)
+            if eval_vs_gnubg
+                @info "Running GnuBG evaluation ($gnubg_eval_games games vs $(gnubg_ply)-ply)..."
+                gnubg_results = evaluate_vs_gnubg(network, gspec, gnubg_eval_games, eval_mcts, use_gpu; gnubg_ply=gnubg_ply)
+                merge!(results, gnubg_results)
+                @info "vs GnuBG $(gnubg_ply)-ply: white=$(round(gnubg_results["eval/vs_gnubg$(gnubg_ply)ply_white"], digits=3)), " *
+                      "black=$(round(gnubg_results["eval/vs_gnubg$(gnubg_ply)ply_black"], digits=3)), " *
+                      "combined=$(round(gnubg_results["eval/vs_gnubg$(gnubg_ply)ply_combined"], digits=3)) " *
+                      "(wr=$(round(100*gnubg_results["eval/vs_gnubg$(gnubg_ply)ply_wr_combined"], digits=1))%)"
+            end
+
+            results["eval/time_s"] = time() - eval_start
             results
         end
     else
@@ -633,10 +744,11 @@ function main()
             games_per_iteration=args["games_per_iteration"],
             use_gpu=use_gpu,
             checkpoint_dir=checkpoint_dir,
-            wandb_log=wandb_log_fn,
+            wandb_log=tb_log_fn,  # Still called wandb_log in the API, but now it's TensorBoard
             eval_fn=eval_fn,
             eval_interval=eval_interval,
-            seed=seed
+            seed=seed,
+            load_network_path=load_network_path
         )
     catch e
         if e isa InterruptException
@@ -658,6 +770,9 @@ function main()
     end
     @info "  Total time: $(round(total_time / 60, digits=2)) minutes"
     @info "  Session saved to: $session_dir"
+    if tb_enabled
+        @info "  TensorBoard: tensorboard --logdir=$tb_dir"
+    end
     @info "=" ^ 60
 
     # Final evaluation (parallel for speed)
@@ -683,7 +798,7 @@ function main()
         eval_time = time() - eval_start
 
         @info "=" ^ 60
-        @info "Final Evaluation Results:"
+        @info "Final Evaluation Results (vs Random):"
         @info "  White: $(round(final_results["eval/vs_random_white"], digits=3))"
         @info "  Black: $(round(final_results["eval/vs_random_black"], digits=3))"
         @info "  Combined: $(round(final_results["eval/vs_random_combined"], digits=3))"
@@ -691,7 +806,7 @@ function main()
         @info "  Speed: $(round(final_eval_games / eval_time * 60, digits=1)) games/min"
         @info "=" ^ 60
 
-        if wandb_enabled
+        if tb_enabled
             final_metrics = Dict{String, Any}(
                 "eval/final_vs_random_white" => final_results["eval/vs_random_white"],
                 "eval/final_vs_random_black" => final_results["eval/vs_random_black"],
@@ -699,27 +814,59 @@ function main()
                 "eval/final_games" => final_eval_games,
                 "eval/final_workers" => final_eval_workers,
                 "eval/final_time_s" => eval_time,
-                "summary/total_iterations" => coord.iteration,
-                "summary/total_games" => coord.total_games,
-                "summary/total_samples" => coord.total_samples,
+                "summary/total_iterations" => !isnothing(coord) ? coord.iteration : 0,
+                "summary/total_games" => !isnothing(coord) ? coord.total_games : 0,
+                "summary/total_samples" => !isnothing(coord) ? coord.total_samples : 0,
                 "summary/total_time_min" => total_time / 60,
             )
-            try
-                wandb_log(final_metrics)
-            catch e
-                @warn "Failed to log final metrics to wandb" exception=e
+            tb_log(final_metrics)
+        end
+
+        # Final GnuBG evaluation (if enabled)
+        if eval_vs_gnubg
+            @info "=" ^ 60
+            @info "Running final GnuBG evaluation..."
+            @info "  Games: $gnubg_eval_games"
+            @info "  GnuBG ply: $gnubg_ply"
+            @info "  MCTS iters: $eval_mcts"
+            @info "=" ^ 60
+
+            gnubg_eval_start = time()
+            gnubg_final_results = evaluate_vs_gnubg(
+                coord.network, gspec, gnubg_eval_games, eval_mcts, use_gpu;
+                gnubg_ply=gnubg_ply
+            )
+            gnubg_eval_time = time() - gnubg_eval_start
+
+            @info "=" ^ 60
+            @info "Final Evaluation Results (vs GnuBG $(gnubg_ply)-ply):"
+            @info "  White: $(round(gnubg_final_results["eval/vs_gnubg$(gnubg_ply)ply_white"], digits=3)) (wr=$(round(100*gnubg_final_results["eval/vs_gnubg$(gnubg_ply)ply_wr_white"], digits=1))%)"
+            @info "  Black: $(round(gnubg_final_results["eval/vs_gnubg$(gnubg_ply)ply_black"], digits=3)) (wr=$(round(100*gnubg_final_results["eval/vs_gnubg$(gnubg_ply)ply_wr_black"], digits=1))%)"
+            @info "  Combined: $(round(gnubg_final_results["eval/vs_gnubg$(gnubg_ply)ply_combined"], digits=3)) (wr=$(round(100*gnubg_final_results["eval/vs_gnubg$(gnubg_ply)ply_wr_combined"], digits=1))%)"
+            @info "  Time: $(round(gnubg_eval_time / 60, digits=2)) minutes"
+            @info "=" ^ 60
+
+            if tb_enabled
+                gnubg_metrics = Dict{String, Any}(
+                    "eval/final_vs_gnubg$(gnubg_ply)ply_white" => gnubg_final_results["eval/vs_gnubg$(gnubg_ply)ply_white"],
+                    "eval/final_vs_gnubg$(gnubg_ply)ply_black" => gnubg_final_results["eval/vs_gnubg$(gnubg_ply)ply_black"],
+                    "eval/final_vs_gnubg$(gnubg_ply)ply_combined" => gnubg_final_results["eval/vs_gnubg$(gnubg_ply)ply_combined"],
+                    "eval/final_vs_gnubg$(gnubg_ply)ply_wr_white" => gnubg_final_results["eval/vs_gnubg$(gnubg_ply)ply_wr_white"],
+                    "eval/final_vs_gnubg$(gnubg_ply)ply_wr_black" => gnubg_final_results["eval/vs_gnubg$(gnubg_ply)ply_wr_black"],
+                    "eval/final_vs_gnubg$(gnubg_ply)ply_wr_combined" => gnubg_final_results["eval/vs_gnubg$(gnubg_ply)ply_wr_combined"],
+                    "eval/final_gnubg_games" => gnubg_eval_games,
+                    "eval/final_gnubg_ply" => gnubg_ply,
+                    "eval/final_gnubg_time_s" => gnubg_eval_time,
+                )
+                tb_log(gnubg_metrics)
             end
         end
     end
 
-    # Finish wandb
-    if wandb_enabled
-        try
-            wandb_finish()
-            @info "WandB run finished"
-        catch e
-            @warn "Failed to finish wandb" exception=e
-        end
+    # Finish TensorBoard
+    if tb_enabled
+        tb_finish()
+        @info "TensorBoard logging finished"
     end
 end
 

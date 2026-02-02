@@ -10,6 +10,7 @@ module UserInterface
   export explore
   export Session, resume!, save
   export Wandb
+  export TensorBoard
 
   using ..AlphaZero
 
@@ -30,6 +31,8 @@ module UserInterface
   include("json.jl")
   include("wandb.jl")
   using .Wandb
+  include("tensorboard.jl")
+  using .TensorBoard
   include("session.jl")
 
 end

@@ -5,13 +5,13 @@
 This is a Julia implementation of AlphaZero with extensions for backgammon, including:
 - Multi-head equity network (TD-Gammon style)
 - Stochastic game support (dice rolling)
-- Wandb integration for experiment tracking
+- TensorBoard integration for experiment tracking (pure Julia, no Python conflicts)
 
-## Current Best Approach (2026-01-26)
+## Current Best Approach (2026-02-01)
 
-### ALWAYS Use Cluster Training with WandB
+### Training Options
 
-**Standard training command** (single host, multi-threaded):
+**Option 1: Thread-based (single machine, fastest)**
 ```bash
 julia --project --threads=8 scripts/train_cluster.jl \
     --game=backgammon-deterministic \
@@ -25,12 +25,41 @@ julia --project --threads=8 scripts/train_cluster.jl \
     --final-eval-games=1000
 ```
 
-WandB is enabled by default (project: `alphazero-jl`). To disable: `--no-wandb`
+**Option 2: Julia Distributed (multi-machine capable)**
+```bash
+julia --project scripts/train_distributed.jl \
+    --num-workers=6 \
+    --total-iterations=70 \
+    --games-per-iteration=50 \
+    --mcts-iters=100 \
+    --final-eval-games=1000
+```
+
+TensorBoard is enabled by default. To disable: `--no-tensorboard`
+View logs with: `tensorboard --logdir=sessions/<session>/tensorboard`
+
+**Current Status**: See `notes/distributed_training_infrastructure.md` for TODOs and next steps.
 
 **Features**:
 - Git commit hash logged at start and saved to `run_info.txt`
 - Parallel final evaluation (1000 games default, uses all threads)
 - Progress logging every 10% during evaluation
+- **GnuBG evaluation during training** (use `--eval-vs-gnubg`)
+
+**Option 3: Training with GnuBG evaluation** (more meaningful than random)
+```bash
+julia --project --threads=8 scripts/train_cluster.jl \
+    --game=backgammon-deterministic \
+    --network-type=fcresnet-multihead \
+    --num-workers=6 \
+    --total-iterations=70 \
+    --eval-vs-gnubg \
+    --gnubg-ply=0 \
+    --gnubg-eval-games=50
+```
+
+**Note**: GnuBG uses PyCall which has threading issues with Julia's GC. For GnuBG eval, use single-threaded or run standalone eval after training.
+
 
 ### Multi-Head Equity Network
 
@@ -51,7 +80,13 @@ julia --project scripts/quick_eval.jl
 
 # Detailed evaluation with histograms
 julia --project scripts/eval_current_iteration.jl sessions/<session_dir>
+
+# GnuBG evaluation (RECOMMENDED - more meaningful than random)
+julia --project scripts/eval_vs_gnubg.jl <checkpoint_path> [obs_type] [num_games]
+# Example: julia --project scripts/eval_vs_gnubg.jl sessions/cluster_20260126_231628/checkpoints/latest.data minimal 500
 ```
+
+**Important**: Always evaluate against GnuBG, not just random! See "Key Insight" below.
 
 ## Key Files
 
@@ -63,7 +98,9 @@ julia --project scripts/eval_current_iteration.jl sessions/<session_dir>
 - `src/params.jl` - Parameters including `always_replace`
 
 ### Scripts (Active)
-- `scripts/train_cluster.jl` - **Primary training script** (thread-based, wandb, parallel final eval)
+- `scripts/train_cluster.jl` - **Primary training script** (thread-based, TensorBoard, parallel final eval)
+- `scripts/train_distributed.jl` - **Distributed training** (Julia Distributed, multi-machine, parallel worker eval)
+- `scripts/eval_vs_gnubg.jl` - **GnuBG evaluation** (recommended for meaningful benchmarks)
 - `scripts/quick_eval.jl` - Quick evaluation vs random
 - `scripts/eval_current_iteration.jl` - Evaluation with histograms
 - `scripts/backgammon_full_evaluation.jl` - Comprehensive evaluation
@@ -79,17 +116,31 @@ julia --project scripts/eval_current_iteration.jl sessions/<session_dir>
 
 ### Documentation
 - `notes/backgammon_improvement_roadmap.md` - Detailed experiment results and roadmap
+- `notes/distributed_training_infrastructure.md` - Distributed training plan, browser workers, testing requirements
 
-## WandB Integration
+## TensorBoard Integration
 
-WandB is enabled by default in `train_single_server.jl`. All training runs log to project `alphazero-jl`.
+TensorBoard logging is enabled by default. Logs are saved to `sessions/<session>/tensorboard/`.
 
-### Setup (one-time)
+### Viewing Logs
 ```bash
-# wandb is auto-installed via CondaPkg when you first run the script
-# Just need to login once:
-wandb login
+# Start TensorBoard server
+tensorboard --logdir=sessions/<session>/tensorboard
+
+# Or view all sessions
+tensorboard --logdir=sessions
 ```
+
+### Module: `src/ui/tensorboard.jl`
+
+Pure Julia implementation using TensorBoardLogger.jl - no Python dependencies, works alongside PyCall (GnuBG).
+
+Key functions:
+- `tb_init(; logdir, run_name)` - Initialize TensorBoard logging
+- `tb_log(metrics; step)` - Log metrics
+- `tb_log_config(config)` - Log configuration as text
+- `tb_finish()` - Finish logging
+- `all_system_metrics(; host_id, cuda_module)` - Collect system/GPU metrics
 
 ### Metrics Tracked
 
@@ -119,12 +170,21 @@ wandb login
 - `eval/games` - Games per evaluation
 - `eval/time_s` - Evaluation duration
 
+**GnuBG evaluation metrics** (when `--eval-vs-gnubg` is used):
+- `eval/vs_gnubg{N}ply_white` - Avg reward as white vs GnuBG N-ply
+- `eval/vs_gnubg{N}ply_black` - Avg reward as black vs GnuBG N-ply
+- `eval/vs_gnubg{N}ply_combined` - Combined average
+- `eval/vs_gnubg{N}ply_wr_white` - Win rate as white
+- `eval/vs_gnubg{N}ply_wr_black` - Win rate as black
+- `eval/vs_gnubg{N}ply_wr_combined` - Combined win rate
+- `eval/gnubg_games` - Games per GnuBG evaluation
+- `eval/gnubg_ply` - GnuBG lookahead depth used
+
 **Summary metrics** (end of training):
 - `summary/total_iterations`
 - `summary/total_games`
 - `summary/total_samples`
 - `summary/total_time_min`
-- `summary/avg_loss`
 - `eval/final_vs_random_*` - Final evaluation results
 
 ### Multi-Machine Support (Future)
@@ -134,16 +194,6 @@ When running distributed training across multiple hosts:
 - Each host reports its own system metrics with unique prefix
 - Training metrics come from coordinator only
 - Use `--host-id=<name>` to set custom host identifier
-
-### Module: `src/ui/wandb.jl`
-
-Key functions:
-- `wandb_init(; project, name, config)` - Initialize run
-- `wandb_log(metrics; step)` - Log metrics
-- `wandb_finish()` - Finish run
-- `all_system_metrics(; host_id, cuda_module)` - Collect system/GPU metrics
-
-**Important**: Scripts using wandb must `using PythonCall` before calling wandb functions.
 
 ## Testing
 
@@ -158,21 +208,29 @@ julia --project test/test_multihead.jl
 ## Session Directories
 
 Training sessions are saved to `sessions/` with format:
-- `bg-multihead-v2-YYYYMMDD_HHMMSS/`
+- `cluster_YYYYMMDD_HHMMSS/`
 
 Each contains:
-- `bestnn.data` - Best network weights
-- `iter.txt` - Current iteration count
-- `log.txt` - Training log
-- `params.json` - Training parameters
+- `checkpoints/latest.data` - Latest network weights
+- `checkpoints/network_iterN.data` - Checkpoint at iteration N
+- `tensorboard/` - TensorBoard logs
+- `run_info.txt` - Git commit and run parameters
+
+### Notable Sessions
+- `cluster_20260201_211302` - 100-iter MINIMAL features (+2.01 vs random, +0.35 vs GnuBG 0-ply)
+- `cluster_20260202_103525` - Sweep A: Baseline (128w×3b, 100 MCTS) → 1.73
+- `cluster_20260202_112558` - Sweep B: Wider (256w×3b, 100 MCTS) → 1.68
+- `cluster_20260202_130346` - Sweep C: Deeper (128w×6b, 100 MCTS) → 1.865
+- `cluster_20260202_141047` - Sweep D: More MCTS (128w×3b, 200 MCTS) → 1.95
 
 ## Performance Baselines
 
-| Model | Iterations | Combined Reward vs Random | Notes |
-|-------|------------|---------------------------|-------|
-| SimpleNet (128, 6) | 128 | +1.11 | Single-process baseline |
-| FCResNetMultiHead (128, 3) | 69 | +1.23 | Multi-head baseline |
-| **FCResNetMultiHead (cluster)** | **70** | **+1.21** | **train_cluster.jl (1000 games, 98.5% of baseline)** |
+| Model | Iterations | vs Random | vs GnuBG 0-ply | vs GnuBG 1-ply | Notes |
+|-------|------------|-----------|----------------|----------------|-------|
+| SimpleNet (128, 6) | 128 | +1.11 | - | - | Single-process baseline |
+| FCResNetMultiHead (128, 3) | 69 | +1.23 | - | - | Multi-head baseline |
+| FCResNetMultiHead (cluster) | 70 | +1.21 | - | - | train_cluster.jl |
+| **FCResNetMultiHead (100 iter)** | **100** | **+2.01** | **+0.35 (62%)** | **+0.20 (55%)** | **MINIMAL features, 2.6h training** |
 
 ## Training (2026-01-26)
 
@@ -181,7 +239,7 @@ Thread-based parallel training using `train_cluster.jl`:
 - N self-play worker threads (single machine)
 - Shared GPU for training
 - Replay buffer with 100K sample capacity
-- **WandB integration** for real-time metrics tracking
+- **TensorBoard integration** for real-time metrics tracking
 - **Parallel final evaluation** using all threads
 
 ### Running Training
@@ -200,11 +258,10 @@ julia --project --threads=8 scripts/train_cluster.jl \
     --batch-size=256 \
     --eval-interval=10 \
     --eval-games=50 \
-    --final-eval-games=1000 \
-    --wandb-project=alphazero-jl
+    --final-eval-games=1000
 
-# Disable wandb if needed
-julia --project --threads=8 scripts/train_cluster.jl --no-wandb ...
+# View logs with TensorBoard
+tensorboard --logdir=sessions/<session>/tensorboard
 ```
 
 ### Key Lessons Learned
@@ -213,45 +270,158 @@ julia --project --threads=8 scripts/train_cluster.jl --no-wandb ...
 3. **Loss metrics differ**: Distributed script reports raw loss; baseline reports decomposed (Lv+Lp+Lreg)
 4. **Playing strength matches**: Despite different loss values, actual performance vs random is equivalent
 5. **GPU sharing works**: Multiple components can share GPU with lazy memory allocation
-6. **WandB requires PythonCall**: Scripts must `using PythonCall` before calling wandb functions
+6. **TensorBoard is pure Julia**: Uses TensorBoardLogger.jl, no Python conflicts with GnuBG
 7. **Julia Distributed serialization is tricky**: Closures referencing complex types fail to serialize; thread-based approach more reliable
 8. **Thread safety for parallel training**: ReentrantLock essential for sample buffer; version counters for weight sync
 9. **Evaluation variance is high**: 50-game evals show ±0.2 variance; use 1000+ games for reliable comparisons
 10. **Buffer capacity matters**: 100K samples prevents overfitting to recent games
 11. **Reproducibility via --seed flag**: Use `--seed=12345` for reproducible runs; each worker gets a unique derived seed
 12. **Git commit hash logged**: `train_cluster.jl` logs git commit at start and saves to `run_info.txt` for traceability
+13. **Random baseline is misleading**: Models that beat random badly may not generalize to strong opponents (GnuBG)
+14. **Simpler features may generalize better**: MINIMAL (780 features) beats BIASED (3172) against GnuBG despite worse vs random
+15. **More MCTS iterations > larger networks**: 200 MCTS with baseline network (1.95) outperformed 256-wide network (1.68) at same iteration count
+16. **Deeper networks help**: 6 blocks (1.865) outperformed 3 blocks (1.73) with only 35% more parameters
+17. **Wider networks underperform**: 256-width (3x params) was slower AND scored worse than baseline - not worth the cost
+18. **MCTS quality matters more than network size**: Higher quality self-play games lead to better learning
+
+### Hyperparameter Sweep Results (2026-02-02)
+
+30-iteration experiments with 200-game final evaluation vs random:
+
+| Config | Network | MCTS | Final Score | Time | Throughput |
+|--------|---------|------|-------------|------|------------|
+| Baseline | 128w × 3b (281K) | 100 | 1.73 | 50 min | ~62 g/min |
+| Wider | 256w × 3b (857K) | 100 | 1.68 | 95 min | ~20 g/min |
+| Deeper | 128w × 6b (382K) | 100 | 1.865 | 66 min | ~47 g/min |
+| **More MCTS** | 128w × 3b (281K) | 200 | **1.95** | 71 min | ~32 g/min |
+
+**Winner: 200 MCTS iterations** - best score despite 2x slower per-game throughput.
+
+**Recommended config for long training:**
+- Network: 128w × 3b or 128w × 6b
+- MCTS: 200 iterations
+- Expected throughput: 25-32 games/min
 
 ### Training Infrastructure
-- `scripts/train_cluster.jl` - **Primary training script** (thread-based, wandb, parallel eval)
+- `scripts/train_cluster.jl` - **Primary training script** (thread-based, TensorBoard, parallel eval)
+- `scripts/train_distributed.jl` - **Distributed training** (Julia Distributed, multi-machine capable)
 - `src/cluster/` - Thread-based cluster module (4 files)
-- `src/ui/wandb.jl` - WandB integration with system metrics
-- `src/distributed/` - Multi-server module (WIP, archived)
+- `src/ui/tensorboard.jl` - TensorBoard integration with system metrics
+
+### Distributed Training (2026-02-01)
+
+For multi-machine training, use `train_distributed.jl`:
+
+```bash
+# Local distributed (spawns worker processes on same machine)
+julia --project scripts/train_distributed.jl \
+    --num-workers=6 \
+    --total-iterations=50 \
+    --games-per-iteration=50 \
+    --mcts-iters=100
+
+# Remote workers (future: add machines via --worker-hosts)
+julia --project scripts/train_distributed.jl \
+    --num-workers=0 \
+    --worker-hosts="worker1,worker2,worker3"
+```
+
+**Performance vs Thread-based (single machine, 6 workers):**
+| Metric | Thread-based | Distributed |
+|--------|-------------|-------------|
+| Throughput | ~59 games/min | ~47 games/min |
+| Overhead | - | ~20% (IPC serialization) |
+
+**Advantages of distributed:**
+- Scales across multiple machines
+- Isolated memory per worker (no GIL issues)
+- Foundation for web-based workers (WASM/WebGPU)
+
+### Browser Workers (Planned)
+
+**Sibling project**: `/home/sile/github/tavlatalk/` - WebGPU-powered backgammon AI
+
+**Architecture:**
+- ONNX Runtime Web for neural network inference (WebGPU backend)
+- Rust/WebAssembly for MCTS
+- AssemblyScript for game logic
+
+**Integration plan:**
+1. WebSocket server in Julia for model distribution + sample collection
+2. Browser workers run self-play and send samples back
+3. Leaderboard and stats for community participation
+4. User-adjustable resource controls
+
+See `notes/distributed_training_infrastructure.md` for full plan.
+
+## Observation Types (BackgammonNet v0.3.2+)
+
+| obs_type | Size | Format | Description |
+|----------|------|--------|-------------|
+| `:minimal_flat` | **330** | Vector | Flat MLP input (RECOMMENDED) |
+| `:full_flat` | **362** | Vector | Flat + extra features |
+| `:minimal` | 30×1×26 | Tensor | For Conv1D networks |
+| `:full` | 62×1×26 | Tensor | Conv + extra features |
+
+Set via environment variable: `BACKGAMMON_OBS_TYPE=minimal` (or `full`, `minimal_flat`, `full_flat`)
+
+**Note**: v0.3.2 simplified observation sizes significantly (330/362 vs previous 780/1612).
+
+## Key Insight: Observation Features (2026-01-27)
+
+**Critical finding from GnuBG evaluation (pre-v0.3.2 observation sizes):**
+
+| Model | Features | vs Random | vs GnuBG 0-ply | vs GnuBG 1-ply |
+|-------|----------|-----------|----------------|----------------|
+| MINIMAL | 780 | +1.23 (3rd) | **+0.553 (1st)** | **+0.391 (1st)** |
+| FULL | 1612 | +1.318 (2nd) | +0.466 (2nd) | +0.305 (2nd) |
+| BIASED | 3172 | **+1.339 (1st)** | +0.424 (3rd) | +0.235 (3rd) |
+
+**Rankings flip completely!** BIASED wins vs random but MINIMAL wins vs GnuBG.
+
+**Implications:**
+1. **Random baseline is misleading** - doesn't test generalization
+2. **More features can hurt** - heuristic features may cause overfitting
+3. **MINIMAL features recommended** for robust, generalizable play
+4. **Always evaluate vs GnuBG** to catch overfitting to weak opponents
+
+See `notes/stochastic_mcts_experiments.md` Experiment 6 for full analysis.
 
 ## Next Steps (from roadmap)
 
 ### Completed
 1. ✅ Multi-head equity network - **DONE**
 2. ✅ Thread-based parallel training - **DONE** (train_cluster.jl, 4-6x throughput)
-3. ✅ WandB integration - **DONE** (system + training metrics)
+3. ✅ TensorBoard integration - **DONE** (system + training metrics, pure Julia)
 4. ✅ Parallel final evaluation - **DONE** (40-60x speedup)
 5. ✅ `--seed` flag for reproducibility - **DONE** (thread-local derived seeds)
-6. ✅ Observation feature engineering comparison - **DONE** (2026-01-27)
-   - BIASED (3172 features) best: +8.9% vs minimal
-   - Recommend BIASED for production training
+6. ✅ Observation feature comparison - **DONE** (2026-01-27)
+7. ✅ GnuBG evaluation scripts - **DONE** (scripts/eval_vs_gnubg.jl)
+8. ✅ Julia Distributed training - **DONE** (train_distributed.jl, ~80% of thread throughput, multi-machine capable)
+9. ✅ GnuBG eval in training loop - **DONE** (use `--eval-vs-gnubg` in train_cluster.jl)
+10. ✅ Replace WandB with TensorBoard - **DONE** (pure Julia, no Python conflicts)
 
 ### Next Priority
-7. **GnuBG evaluation integration** - Benchmark against real backgammon AI
-8. **Match equity table (MET) integration** - Proper match play scoring
-9. **Longer training runs with BIASED features** - Find performance ceiling
+11. **Investigate color asymmetry** - Why do models struggle as white (38-48% win) but dominate as black (72-93%)?
+12. **Match equity table (MET) integration** - Proper match play scoring
+13. **Scale up training** - More iterations, larger networks, see if performance vs GnuBG continues to improve
+
+### Recently Completed (2026-02-01)
+10. ✅ **Longer training with MINIMAL features** - **DONE** - 100 iterations achieved:
+    - vs Random (500 games): **+2.01** combined
+    - vs GnuBG 0-ply (200 games): **+0.35** (62% win rate)
+    - vs GnuBG 1-ply (200 games): **+0.20** (55% win rate)
+    - **Conclusion**: MINIMAL features generalize well! Model beats both 0-ply and 1-ply GnuBG
+    - Session: `sessions/cluster_20260201_211302`
 
 ### Future
-10. Multi-machine training using Julia Distributed
-11. Reanalyze (MuZero style)
-12. Curriculum learning - Progressive training difficulty
-13. Pre-race-net and race-net - Specialized networks for racing positions
-14. Exam eval - Known tricky positions for evaluation only
-15. Gym - Training on known board positions with known targets
-16. Precomputed endgame tables - Avoid running games to completion
+14. Web-based workers using WASM and WebGPU - Leverage browser compute for distributed training
+15. Reanalyze (MuZero style)
+16. Curriculum learning - Progressive training difficulty
+17. Pre-race-net and race-net - Specialized networks for racing positions
+18. Exam eval - Known tricky positions for evaluation only
+19. Gym - Training on known board positions with known targets
+20. Precomputed endgame tables - Avoid running games to completion
 
 **Ideas/Notes:**
 - For stochastic implementation: train a stochastic head that outputs priors for all 21 dice outcomes for V, so we know the prior for all 21 options. Optionally predict which stochastic options will have the highest absolute change in V, use that to sample top-k extreme outcomes for better value estimates.
