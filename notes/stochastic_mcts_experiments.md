@@ -667,6 +667,355 @@ Compare different observation representations to determine which features help l
 
 ### Next Steps
 
-1. Train longer with BIASED features to see final performance ceiling
-2. Test if benefits persist at higher iteration counts (200+)
-3. Consider hybrid: BIASED for training, MINIMAL for fast eval
+1. ~~Train longer with BIASED features to see final performance ceiling~~
+2. ~~Test if benefits persist at higher iteration counts (200+)~~
+3. ~~Consider hybrid: BIASED for training, MINIMAL for fast eval~~
+
+**UPDATE**: See Experiment 6 below - GnuBG evaluation revealed surprising results!
+
+---
+
+## Experiment 6: GnuBG Evaluation of Observation Types (2026-01-27)
+
+### Goal
+Evaluate the three models from Experiment 5 against GnuBG (GNU Backgammon) at 0-ply and 1-ply to test performance against a strong, well-calibrated opponent instead of just a random baseline.
+
+### Experimental Metadata
+
+| Field | Value |
+|-------|-------|
+| Evaluation script | scripts/eval_vs_gnubg.jl |
+| Games per matchup | 500 |
+| Matchups per model | 4 (white/black × 0-ply/1-ply) |
+| Total games per model | 2000 |
+| GnuBG interface | PyCall via BackgammonNet/GnubgInterface.jl |
+
+### Models Evaluated
+
+| Model | Checkpoint | Features | Network Params |
+|-------|------------|----------|----------------|
+| MINIMAL | sessions/cluster_20260126_231628/checkpoints/latest.data | 780 | 339,241 |
+| FULL | sessions/cluster_20260127_001636/checkpoints/latest.data | 1612 | 445,737 |
+| BIASED | sessions/cluster_20260127_012254/checkpoints/latest.data | 3172 | 645,417 |
+
+### Results vs GnuBG 0-ply (Neural Network Only)
+
+| Model | As White | As Black | **Combined** | **Win Rate** |
+|-------|----------|----------|--------------|--------------|
+| **MINIMAL** | -0.034 ± 0.106 | +1.140 ± 0.073 | **+0.553** | **70.2%** |
+| FULL | -0.128 ± 0.101 | +1.060 ± 0.077 | +0.466 | 66.8% |
+| BIASED | -0.250 ± 0.106 | +1.098 ± 0.081 | +0.424 | 64.4% |
+
+### Results vs GnuBG 1-ply (1-ply Lookahead)
+
+| Model | As White | As Black | **Combined** | **Win Rate** |
+|-------|----------|----------|--------------|--------------|
+| **MINIMAL** | -0.212 ± 0.111 | +0.994 ± 0.104 | **+0.391** | **62.1%** |
+| FULL | -0.240 ± 0.106 | +0.850 ± 0.120 | +0.305 | 58.8% |
+| BIASED | -0.298 ± 0.108 | +0.768 ± 0.126 | +0.235 | 55.6% |
+
+### Summary Table
+
+| Model | vs Random | vs GnuBG 0-ply | vs GnuBG 1-ply |
+|-------|-----------|----------------|----------------|
+| MINIMAL | +1.23 (3rd) | **+0.553 (1st)** | **+0.391 (1st)** |
+| FULL | +1.318 (2nd) | +0.466 (2nd) | +0.305 (2nd) |
+| BIASED | **+1.339 (1st)** | +0.424 (3rd) | +0.235 (3rd) |
+
+### Key Finding: Rankings Reversed!
+
+**The order completely flips when evaluating against GnuBG vs random:**
+- vs Random: BIASED > FULL > MINIMAL
+- vs GnuBG: MINIMAL > FULL > BIASED
+
+### Analysis
+
+#### 1. Why BIASED Fails Against GnuBG
+
+The BIASED observation includes heuristic features like:
+- Blot exposure risk
+- Prime structure detection
+- Anchor positions
+- Blocking point values
+
+These heuristics encode **one particular style of play**. The network may learn to rely on these pre-computed features rather than understanding the underlying position. When facing GnuBG (which uses different heuristics), this creates a **feature mismatch**.
+
+#### 2. Why MINIMAL Succeeds
+
+With only basic board state (780 features), the MINIMAL network must learn:
+- Position evaluation from first principles
+- Generalizable patterns that work against any opponent
+- Robust features that transfer to different playing styles
+
+This leads to **more generalizable learning** even though it's harder initially.
+
+#### 3. The Random Baseline is Misleading
+
+A random opponent doesn't punish strategic weaknesses:
+- BIASED features help exploit random's mistakes
+- But these same features may not generalize to rational opponents
+- Random play is not representative of competitive backgammon
+
+### Implications
+
+#### For Feature Engineering
+1. **Domain heuristics can hurt generalization**: Hand-crafted features may encode brittle strategies
+2. **Simpler observations may force better learning**: Network must discover robust representations
+3. **Evaluation opponent matters critically**: Always test against calibrated opponents, not just random
+
+#### For Training Pipeline
+1. **Use GnuBG for evaluation** during training, not just random baseline
+2. **Consider minimal features** for training despite slower initial progress
+3. **Heuristic features may be a form of overfitting** to the training distribution
+
+### Color Asymmetry Observation
+
+All models show strong asymmetry:
+- As Black (second player): 72-93% win rate
+- As White (first player): 38-48% win rate
+
+This suggests:
+1. Models may have learned a defensive/reactive style
+2. Or the MCTS + NN combination works better in reactive positions
+3. Worth investigating in future work
+
+### Updated Recommendations
+
+**Previous recommendation** (from Experiment 5): Use BIASED features for production training.
+
+**New recommendation**:
+1. **Use MINIMAL features** for training to develop generalizable play
+2. **Evaluate against GnuBG** (not just random) to catch overfitting to weak opponents
+3. **Consider FULL features** as a middle ground if minimal is too slow
+4. **Avoid heavy heuristic features** unless validated against strong opponents
+
+### Lessons Learned
+
+1. **Benchmark choice is critical**: Results that look good against random may not generalize
+2. **More features ≠ better generalization**: Feature engineering can introduce biases
+3. **Simple can be stronger**: Forcing the network to learn from scratch may produce more robust play
+4. **Test against calibrated opponents early**: Don't wait until the end to test against GnuBG
+
+### Scripts Created
+
+- `scripts/eval_vs_gnubg.jl` - Sequential evaluation against GnuBG
+- `scripts/eval_vs_gnubg_parallel.jl` - Parallel version (PyCall threading issues)
+- `scripts/eval_vs_gnubg_batch.jl` - Batch evaluation helper
+- `scripts/run_gnubg_eval_all.sh` - Runner for all 3 models
+
+### Next Steps
+
+1. **Retrain with MINIMAL features** for longer (200+ iterations) and track vs GnuBG
+2. **Add GnuBG evaluation to training loop** as a periodic benchmark
+3. **Investigate color asymmetry** - why do all models struggle as white?
+4. **Test intermediate feature sets** - find the sweet spot between minimal and biased
+5. **Try curriculum learning** - start with minimal, gradually add features
+
+---
+
+## Experiment 7: BackgammonNet v0.3.2 Observation Formats (2026-01-28)
+
+### Goal
+Compare different observation formats in BackgammonNet v0.3.2, which introduced simplified and restructured observation types. Test whether the hybrid format (separating board from globals) improves learning over flat vectors.
+
+### BackgammonNet v0.3.2 Changes
+
+The new version significantly simplified observation sizes:
+
+| Obs Type | v0.3.1 Size | v0.3.2 Size | Format |
+|----------|-------------|-------------|--------|
+| minimal_flat | 780 | **330** | Flat vector |
+| full_flat | 1612 | **362** | Flat vector |
+| full_hybrid | N/A | **362** | (board=12×26, globals=50) |
+
+The hybrid format separates board representation (12 channels × 26 points = 312) from global features (dice, bar, off counts = 50).
+
+### Training Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Game | backgammon-deterministic (short_game=true) |
+| Network | FCResNetMultiHead (width=128, blocks=3) |
+| Workers | 6 |
+| Iterations | 70 |
+| Games/iteration | 50 |
+| MCTS iterations | 100 |
+| Final eval games | 1000 |
+
+### Models Trained
+
+| Model | Obs Type | Features | Network Params | Session |
+|-------|----------|----------|----------------|---------|
+| full_hybrid | :full_hybrid | 362 | 285,737 | cluster_20260127_173723 |
+| full_flat | :full_flat | 362 | 285,737 | cluster_20260127_181701 |
+| minimal_flat | :minimal_flat | 330 | 285,737 | cluster_20260128_105330 |
+
+### All Training Runs Summary (70 iterations each)
+
+| Model | Version | Features | Wall Clock | Notes |
+|-------|---------|----------|------------|-------|
+| MINIMAL | v0.3.1 | 780 | **57.6 min** | Fastest, best generalization |
+| FULL | v0.3.1 | 1612 | **67.4 min** | |
+| BIASED | v0.3.1 | 3172 | **72.5 min** | Slowest |
+| full_hybrid | v0.3.2 | 362 | **~75 min** | Includes ~15 min final eval |
+| full_flat | v0.3.2 | 362 | **~81 min** | Includes ~15 min final eval |
+| minimal_flat | v0.3.2 | 330 | **61 min** | 59 min train + 2 min eval |
+
+**Notes:**
+- All runs used identical config: 70 iterations, 50 games/iter, 100 MCTS iters, 6 workers
+- v0.3.1 times are training only; v0.3.2 times include 1000-game final evaluation (~15 min)
+- Larger feature counts = slower training (more compute per forward pass)
+- Network params vary by input size: 339K (780 features) to 645K (3172 features)
+
+### Training Observations
+
+**Loss increased during training** for both models:
+- Iterations 1-10: Loss dropped 5.4 → 3.9 (normal)
+- Iterations 11-70: Loss rose 4.2 → 6.9 (unusual)
+
+This occurred after the replay buffer filled at 100K samples. Possible causes:
+1. Target instability from self-play
+2. Buffer turnover replacing "easier" positions
+3. Policy entropy collapse
+
+Despite rising loss, playing strength remained stable.
+
+### Results vs Random (1000 games)
+
+| Model | Combined | As White | As Black |
+|-------|----------|----------|----------|
+| **full_hybrid** | **+1.201** | **+0.604** | +1.798 |
+| minimal_flat | +1.172 | +0.636 | +1.708 |
+| full_flat | +1.109 | +0.382 | +1.836 |
+
+**full_hybrid wins vs random**, especially as white. minimal_flat is second.
+
+### Results vs GnuBG 0-ply (500 games each direction)
+
+| Model | As White | As Black | **Combined** | **Win Rate** |
+|-------|----------|----------|--------------|--------------|
+| full_flat | -0.204 ± 0.100 | +1.114 ± 0.076 | **+0.455** | **66.3%** |
+| full_hybrid | -0.258 ± 0.104 | +1.096 ± 0.081 | +0.419 | 65.3% |
+| minimal_flat | -0.262 ± 0.105 | +1.100 ± 0.083 | +0.419 | 64.7% |
+
+### Results vs GnuBG 1-ply (500 games each direction)
+
+| Model | As White | As Black | **Combined** | **Win Rate** |
+|-------|----------|----------|--------------|--------------|
+| full_flat | -0.332 ± 0.102 | +0.912 ± 0.076 | **+0.290** | **57.6%** |
+| full_hybrid | -0.448 ± 0.106 | +0.720 ± 0.081 | +0.136 | 53.1% |
+| minimal_flat | -0.292 ± 0.107 | +0.782 ± 0.113 | +0.245 | 57.7% |
+
+### Complete Comparison Across All Experiments
+
+| Model | Obs Size | vs Random | vs GnuBG 0-ply | vs GnuBG 1-ply |
+|-------|----------|-----------|----------------|----------------|
+| **Previous (v0.3.1):** |
+| MINIMAL | 780 | +1.23 | **+0.553** | **+0.391** |
+| FULL | 1612 | +1.318 | +0.466 | +0.305 |
+| BIASED | 3172 | +1.339 | +0.424 | +0.235 |
+| **New (v0.3.2):** |
+| full_flat | 362 | +1.109 | +0.455 | **+0.290** |
+| minimal_flat | 330 | +1.172 | +0.419 | +0.245 |
+| full_hybrid | 362 | +1.201 | +0.419 | +0.136 |
+
+### Key Findings
+
+#### 1. Rankings Reverse Again
+- **vs Random**: full_hybrid (+1.201) > minimal_flat (+1.172) > full_flat (+1.109)
+- **vs GnuBG**: full_flat (+0.290) > minimal_flat (+0.245) > full_hybrid (+0.136)
+
+Same pattern as Experiment 6: better vs random ≠ better generalization.
+
+#### 2. Flat Format Generalizes Better
+Despite identical feature count (362), flat vectors outperform hybrid format:
+- 0-ply: +0.455 vs +0.419 (+8.6%)
+- 1-ply: +0.290 vs +0.136 (+113%!)
+
+The hybrid separation may be a form of inductive bias that hurts generalization.
+
+#### 3. Smaller Observations Competitive
+v0.3.2 flat formats nearly match old versions with far fewer features:
+- FULL (1612): +0.305 vs GnuBG 1-ply
+- full_flat (362): +0.290 → only 5% worse with **4.5× fewer features**
+- minimal_flat (330): +0.245 → still competitive with **4.9× fewer features**
+- BIASED (3172): +0.235 → minimal_flat beats it with **10× fewer features**!
+
+#### 4. More Features in Same Format = Better
+Comparing flat variants in v0.3.2:
+| Model | Features | vs GnuBG 1-ply |
+|-------|----------|----------------|
+| full_flat | 362 | +0.290 |
+| minimal_flat | 330 | +0.245 |
+| full_hybrid | 362 | +0.136 |
+
+Within flat format, more features (362 vs 330) improves performance by ~18%.
+
+### Analysis
+
+#### Why Flat Beats Hybrid?
+
+1. **MLP architecture favors flat inputs**: FCResNet processes all features equally through dense layers. The hybrid structure doesn't provide spatial locality benefits without conv layers.
+
+2. **Forced feature mixing**: Flat format mixes board and globals immediately, potentially enabling richer feature interactions in early layers.
+
+3. **Hybrid may introduce harmful bias**: Separating board from globals might prevent useful cross-feature learning.
+
+#### Implications for Feature Engineering
+
+1. **Format matters as much as content**: Same information in different structures yields different results.
+
+2. **Match format to architecture**: Use hybrid/structured observations only with architectures that exploit structure (e.g., conv networks for board, separate heads for globals).
+
+3. **Potential for pruning**: Since larger flat observations help, we could:
+   - Analyze feature importance via gradients
+   - Identify unused features
+   - Prune network for efficiency
+
+### Feature Importance Analysis (Future Work)
+
+To identify which features the network actually uses:
+
+1. **Gradient-based importance**:
+   ```julia
+   # Compute gradient w.r.t. inputs
+   grads = gradient(x -> sum(network(x)), observation)
+   importance = mean(abs.(grads), dims=batch)
+   ```
+
+2. **First layer weight analysis**:
+   ```julia
+   W = network.layers[1].weight
+   importance = sum(abs.(W), dims=1)
+   ```
+
+3. **Ablation study**: Zero out feature groups and measure performance drop
+
+4. **Permutation importance**: Shuffle features and measure accuracy degradation
+
+### Updated Rankings (All Models)
+
+**vs GnuBG 1-ply (most meaningful benchmark):**
+1. MINIMAL (780 features) = **+0.391**
+2. FULL (1612 features) = +0.305
+3. **full_flat (362 features) = +0.290** ← 4.5× smaller than FULL!
+4. **minimal_flat (330 features) = +0.245** ← Smallest, still competitive!
+5. BIASED (3172 features) = +0.235
+6. full_hybrid (362 features) = +0.136
+
+### Conclusions
+
+1. **MINIMAL (v0.3.1) remains best** for generalization despite being oldest/simplest
+2. **full_flat is highly competitive** with 4.5× fewer features than FULL
+3. **minimal_flat nearly matches BIASED** with 10× fewer features (330 vs 3172)
+4. **Hybrid format hurts this architecture** - don't use without conv layers
+5. **Feature count helps within same format** - full_flat > minimal_flat
+6. **Rising loss during training** didn't prevent learning useful features
+
+### Next Steps
+
+1. ~~**Train minimal_flat (330 features)** with v0.3.2 for fair comparison~~ ✅ Done!
+2. **Implement feature importance analysis** to identify unused features
+3. **Try conv architecture with hybrid format** to test spatial benefits
+4. **Investigate training loss dynamics** - why does loss rise after buffer fills?
+5. **Longer training** to see if full_flat catches up to MINIMAL

@@ -20,6 +20,14 @@ end
   include("stochastic_mcts.jl")
 end
 
+@testset "Cluster Module" begin
+  include("test_cluster.jl")
+end
+
+@testset "Reanalyze Module" begin
+  include("test_reanalyze.jl")
+end
+
 @testset "Dummy Runs" begin
   dir = "sessions/test-tictactoe"
   @test dummy_run(experiments["tictactoe"], nostdout=false) == nothing

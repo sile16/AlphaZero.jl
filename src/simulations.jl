@@ -38,7 +38,7 @@ function fill_and_evaluate(net, batch; batch_size, fill_batches)
 end
 
 # """
-#     launch_inference_server(net; num_workers, fill_batches)
+#     launch_inference_server(net; num_workers, fill_batches, use_async, ...)
 
 # Start a server that processes inference requests for a single neural network.
 
@@ -48,21 +48,33 @@ function launch_inference_server(
     net::AbstractNetwork;
     num_workers,
     batch_size,
-    fill_batches)
+    fill_batches,
+    use_async=false,
+    async_min_batch=1,
+    async_timeout_ns=1_000_000)
 
-  return Batchifier.launch_server(;num_workers, batch_size) do batch
-    fill_and_evaluate(net, batch; batch_size, fill_batches)
+  if use_async
+    return AsyncBatchifier.launch_async_server(;
+        num_workers, batch_size,
+        min_batch=async_min_batch,
+        timeout_ns=async_timeout_ns) do batch
+      fill_and_evaluate(net, batch; batch_size, fill_batches)
+    end
+  else
+    return Batchifier.launch_server(;num_workers, batch_size) do batch
+      fill_and_evaluate(net, batch; batch_size, fill_batches)
+    end
   end
 end
 
 # """
-#     launch_inference_server(net1, net2, num_workers; fill_batches)
-# 
+#     launch_inference_server(net1, net2, num_workers; fill_batches, use_async, ...)
+#
 # Start a server that processes inference requests for TWO networks.
 # This is needed when pitting two players together that rely on distinct networks for
 # example. The reason we do not spawn two separate servers in this case is that each
 # server would not know how many queries to wait for.
-# 
+#
 # Such a server expects modified queries that are named tuples with field `query` and
 # `netid`. The latter must be an integer in {1, 2} indicating whether `net1` or `net2`
 # is queried.
@@ -72,9 +84,12 @@ function launch_inference_server(
     net2::AbstractNetwork;
     num_workers,
     batch_size,
-    fill_batches)
+    fill_batches,
+    use_async=false,
+    async_min_batch=1,
+    async_timeout_ns=1_000_000)
 
-  return Batchifier.launch_server(;num_workers, batch_size) do batch
+  inference_fn = function(batch)
     n = length(batch)
     mask1 = findall(b -> b.netid == 1, batch)
     mask2 = findall(b -> b.netid == 2, batch)
@@ -95,6 +110,15 @@ function launch_inference_server(
       res[mask2] = res2
       return res
     end
+  end
+
+  if use_async
+    return AsyncBatchifier.launch_async_server(inference_fn;
+        num_workers, batch_size,
+        min_batch=async_min_batch,
+        timeout_ns=async_timeout_ns)
+  else
+    return Batchifier.launch_server(inference_fn; num_workers, batch_size)
   end
 end
 
@@ -117,37 +141,51 @@ function batchify_oracles() end
 
 ret_oracle(x) = () -> x
 do_nothing!() = nothing
-send_done!(reqc) = () -> Batchifier.client_done!(reqc)
+send_done!(reqc, use_async) = use_async ?
+  () -> AsyncBatchifier.client_done!(reqc) :
+  () -> Batchifier.client_done!(reqc)
 zipthunk(f1, f2) = () -> (f1(), f2())
 
+# Helper to create the appropriate oracle type
+function make_batched_oracle(reqc, use_async, preprocess=(x->x))
+  if use_async
+    return AsyncBatchifier.AsyncBatchedOracle(reqc, preprocess)
+  else
+    return Batchifier.BatchedOracle(reqc, preprocess)
+  end
+end
+
 # Two neural network oracles
-function batchify_oracles(os::Tuple{AbstractNetwork, AbstractNetwork}; kwargs...)
-  reqc = launch_inference_server(os[1], os[2]; kwargs...)
-  make1() = Batchifier.BatchedOracle(reqc, st -> (state=st, netid=1))
-  make2() = Batchifier.BatchedOracle(reqc, st -> (state=st, netid=2))
-  return zipthunk(make1, make2), send_done!(reqc)
+function batchify_oracles(os::Tuple{AbstractNetwork, AbstractNetwork};
+    use_async=false, kwargs...)
+  reqc = launch_inference_server(os[1], os[2]; use_async, kwargs...)
+  make1() = make_batched_oracle(reqc, use_async, st -> (state=st, netid=1))
+  make2() = make_batched_oracle(reqc, use_async, st -> (state=st, netid=2))
+  return zipthunk(make1, make2), send_done!(reqc, use_async)
 end
 
-function batchify_oracles(os::Tuple{<:Any, AbstractNetwork}; kwargs...)
-  reqc = launch_inference_server(os[2]; kwargs...)
-  make2() = Batchifier.BatchedOracle(reqc)
-  return zipthunk(ret_oracle(os[1]), make2), send_done!(reqc)
+function batchify_oracles(os::Tuple{<:Any, AbstractNetwork};
+    use_async=false, kwargs...)
+  reqc = launch_inference_server(os[2]; use_async, kwargs...)
+  make2() = make_batched_oracle(reqc, use_async)
+  return zipthunk(ret_oracle(os[1]), make2), send_done!(reqc, use_async)
 end
 
-function batchify_oracles(os::Tuple{AbstractNetwork, <:Any}; kwargs...)
-  reqc = launch_inference_server(os[1]; kwargs...)
-  make1() = Batchifier.BatchedOracle(reqc)
-  return zipthunk(make1, ret_oracle(os[2])), send_done!(reqc)
+function batchify_oracles(os::Tuple{AbstractNetwork, <:Any};
+    use_async=false, kwargs...)
+  reqc = launch_inference_server(os[1]; use_async, kwargs...)
+  make1() = make_batched_oracle(reqc, use_async)
+  return zipthunk(make1, ret_oracle(os[2])), send_done!(reqc, use_async)
 end
 
 function batchify_oracles(os::Tuple{<:Any, <:Any}; kwargs...)
   return zipthunk(ret_oracle(os[1]), ret_oracle(os[2])), do_nothing!
 end
 
-function batchify_oracles(o::AbstractNetwork; kwargs...)
-  reqc = launch_inference_server(o; kwargs...)
-  make() = Batchifier.BatchedOracle(reqc)
-  return make, send_done!(reqc)
+function batchify_oracles(o::AbstractNetwork; use_async=false, kwargs...)
+  reqc = launch_inference_server(o; use_async, kwargs...)
+  make() = make_batched_oracle(reqc, use_async)
+  return make, send_done!(reqc, use_async)
 end
 
 function batchify_oracles(o::Any; kwargs...)
@@ -212,7 +250,11 @@ function simulate(
 
   oracles = simulator.make_oracles()
   spawn_oracles, done =
-    batchify_oracles(oracles; p.num_workers, p.batch_size, p.fill_batches)
+    batchify_oracles(oracles;
+      p.num_workers, p.batch_size, p.fill_batches,
+      use_async=p.use_async_batchifier,
+      async_min_batch=p.async_min_batch,
+      async_timeout_ns=p.async_timeout_ns)
   return Util.mapreduce(1:p.num_games, p.num_workers, vcat, []) do
     oracles = spawn_oracles()
     player = simulator.make_player(oracles)

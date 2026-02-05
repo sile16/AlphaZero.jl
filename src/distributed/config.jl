@@ -324,18 +324,16 @@ end
 Validate a configuration, throwing errors for invalid settings.
 """
 function validate_config(config::CoordinatorConfig)
-    # Check port conflicts
+    # Check port conflicts between distinct services
+    # Note: training's coordinator_endpoint may share the command port for in-process training
     ports = [
         config.inference_config.endpoint.port,
         config.replay_config.endpoint.port,
         config.command_endpoint.port,
     ]
-    if !isnothing(config.training_config)
-        push!(ports, config.training_config.coordinator_endpoint.port)
-    end
 
     if length(unique(ports)) != length(ports)
-        error("Port conflict in configuration")
+        error("Port conflict in configuration: inference, replay, and command ports must be distinct")
     end
 
     # Check positive values

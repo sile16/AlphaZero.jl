@@ -104,6 +104,84 @@ julia --project --threads=8 scripts/train_cluster.jl \
 - ~25 games/min throughput (estimate)
 - May produce best overall results
 
+## GnuBG Evaluation (2026-02-02)
+
+**Critical finding**: Rankings reverse completely when evaluating against GnuBG instead of random!
+
+### Results vs GnuBG
+
+| Config | vs Random | vs GnuBG 0-ply | vs GnuBG 1-ply |
+|--------|-----------|----------------|----------------|
+| **A: Baseline** | 1.73 (3rd) | **+0.290 (61%)** | **+0.190 (55%)** |
+| C: Deeper | 1.865 (2nd) | +0.170 (57%) | -0.090 (47%) |
+| D: More MCTS | **1.95 (1st)** | +0.180 (57%) | -0.040 (50%) |
+
+### Key Findings
+
+1. **Baseline wins vs GnuBG** - The simplest config generalizes best
+2. **More MCTS hurts generalization** - 200 MCTS scored highest vs random but near-zero vs GnuBG 1-ply
+3. **Deeper network doesn't help** - 6 blocks worse than 3 blocks vs GnuBG
+4. **Random baseline is misleading** - Don't use it to compare models
+
+### Color Asymmetry (all models)
+
+| Color | Win Rate Range |
+|-------|----------------|
+| As White | 26-38% |
+| As Black | 65-91% |
+
+All models struggle as white but dominate as black - suggests defensive/reactive play style.
+
+### Implications for Training
+
+1. **Use GnuBG eval during training** - Random doesn't predict real strength
+2. **Don't over-optimize MCTS iterations** - May overfit to self-play
+3. **Simpler configs may generalize better** - Avoid overfitting
+
+## 100-Iteration Training Runs (2026-02-03)
+
+Extended training to validate sweep findings with longer runs.
+
+### Baseline (128w×3b, 100 MCTS) - 100 iterations
+- **Session**: `sessions/cluster_20260202_233010`
+- **vs Random**: +1.29
+- **vs GnuBG 0-ply**: +0.425 (63.5% wins)
+- **vs GnuBG 1-ply**: **+0.215 (56.2% wins)**
+  - As white: -0.330 (37.5% wins)
+  - As black: +0.760 (75.0% wins)
+
+### Deeper (128w×6b, 100 MCTS) - 100 iterations
+- **Session**: `sessions/cluster_20260202_233013`
+- **vs Random**: +1.04
+- **vs GnuBG 0-ply**: +0.415 (65.5% wins)
+- **vs GnuBG 1-ply**: +0.095 (50.0% wins)
+  - As white: -0.440 (30.5% wins)
+  - As black: +0.630 (69.5% wins)
+
+### Summary
+
+| Model | Params | Iters | vs Random | vs GnuBG 1-ply |
+|-------|--------|-------|-----------|----------------|
+| **Baseline** | 281K | 100 | **+1.29** | **+0.215** |
+| Deeper | 382K | 100 | +1.04 | +0.095 |
+
+**Conclusion**: Baseline config is the clear winner for the big run.
+- Better vs random (+1.29 vs +1.04)
+- Better vs GnuBG 1-ply (+0.215 vs +0.095)
+- 36% fewer parameters, faster training
+- Color asymmetry persists but baseline is better in both roles
+
+## Recommendation for Big Run
+
+```bash
+julia --project --threads=8 scripts/train_cluster.jl \
+    --network-width=128 --network-blocks=3 \
+    --mcts-iters=100 \
+    --total-iterations=200 \
+    --games-per-iteration=100 \
+    --final-eval-games=1000
+```
+
 ## Scripts
 
 Sweep script: `scripts/run_hyperparameter_sweep.sh`

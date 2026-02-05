@@ -89,9 +89,10 @@ function run(env::Env, eval::Evaluation, progress=nothing)
       return TwoPlayers(player, baseline)
     end
   end
+  progress_callback = isnothing(progress) ? (() -> nothing) : (() -> next!(progress))
   samples, elapsed = @timed simulate(
     simulator, env.gspec, eval.sim,
-    game_simulated=(() -> next!(progress)))
+    game_simulated=progress_callback)
   gamma = env.params.self_play.mcts.gamma
   rewards, redundancy = rewards_and_redundancy(samples, gamma=gamma)
   return Report.Evaluation(

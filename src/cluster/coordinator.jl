@@ -94,21 +94,144 @@ function add_samples!(coord::ClusterCoordinator, batch::GameBatch)
 end
 
 """
-Sample a random batch from the replay buffer.
+Sample a random batch from the replay buffer (uniform sampling).
+Returns (samples, indices, weights) where weights are all 1.0.
 """
 function sample_batch(coord::ClusterCoordinator, batch_size::Int)
     n = length(coord.buffer)
     if n < batch_size
-        return nothing
+        return nothing, nothing, nothing
     end
     indices = rand(1:n, batch_size)
-    return [coord.buffer[i] for i in indices]
+    samples = [coord.buffer[i] for i in indices]
+    weights = ones(Float32, batch_size)
+    return samples, indices, weights
+end
+
+"""
+Sample a batch using Prioritized Experience Replay (PER).
+
+Uses proportional prioritization: P(i) = p_i^α / Σ p_k^α
+where p_i = |δ_i| + ε (TD-error + small constant).
+
+Returns (samples, indices, importance_weights) for bias correction.
+Importance weights: w_i = (N · P(i))^(-β) / max_j(w_j)
+
+Based on Schaul et al. 2016 "Prioritized Experience Replay".
+"""
+function sample_batch_prioritized(
+    coord::ClusterCoordinator,
+    batch_size::Int,
+    config::PrioritizedSamplingConfig,
+    current_step::Int
+)
+    n = length(coord.buffer)
+    if n < batch_size
+        return nothing, nothing, nothing
+    end
+
+    # Compute priorities: p_i = priority + epsilon
+    # Then raise to power alpha
+    priorities = Float64[]
+    for sample in coord.buffer
+        p = Float64(max(sample.priority, 0.0f0) + config.epsilon)
+        push!(priorities, p ^ config.alpha)
+    end
+
+    # Compute sampling probabilities
+    total_priority = sum(priorities)
+    probs = priorities ./ total_priority
+
+    # Sample according to probabilities (with replacement)
+    indices = Int[]
+    for iter in 1:batch_size
+        r = rand()
+        cumsum_p = 0.0
+        selected = false
+        for (j, p) in enumerate(probs)
+            cumsum_p += p
+            if r <= cumsum_p
+                push!(indices, j)
+                selected = true
+                break
+            end
+        end
+        # Fallback if numerical issues (r > sum of all probs due to floating point)
+        if !selected
+            push!(indices, rand(1:n))
+        end
+    end
+
+    # Ensure we got the right number of samples (shouldn't happen but just in case)
+    while length(indices) < batch_size
+        push!(indices, rand(1:n))
+    end
+
+    # Compute importance sampling weights
+    # w_i = (N * P(i))^(-beta)
+    beta = get_beta(config, current_step)
+    weights = Float32[]
+    for idx in indices
+        w = (n * probs[idx]) ^ (-beta)
+        push!(weights, Float32(w))
+    end
+
+    # Normalize weights so max = 1
+    max_weight = maximum(weights)
+    if max_weight > 0
+        weights ./= max_weight
+    end
+
+    samples = [coord.buffer[i] for i in indices]
+    return samples, indices, weights
+end
+
+"""
+Update priorities for sampled indices based on TD-errors.
+Called after training step with computed TD-errors.
+"""
+function update_priorities!(
+    coord::ClusterCoordinator,
+    indices::Vector{Int},
+    td_errors::Vector{Float32}
+)
+    for (idx, td_error) in zip(indices, td_errors)
+        if idx <= length(coord.buffer)
+            old_sample = coord.buffer[idx]
+            # Create new sample with updated priority
+            coord.buffer[idx] = ClusterSample(
+                old_sample.state,
+                old_sample.policy,
+                old_sample.value,
+                old_sample.turn,
+                old_sample.is_chance,
+                old_sample.equity_p_win,
+                old_sample.equity_p_gw,
+                old_sample.equity_p_bgw,
+                old_sample.equity_p_gl,
+                old_sample.equity_p_bgl,
+                old_sample.has_equity,
+                abs(td_error),  # New priority = |TD-error|
+                old_sample.added_step,
+                old_sample.last_reanalyze_step,
+                old_sample.reanalyze_count,
+                old_sample.model_iter_reanalyzed
+            )
+        end
+    end
 end
 
 """
 Prepare training batch from ClusterSamples.
+
+If importance_weights is provided (from PER), they are incorporated into the
+sample weights W for proper bias correction.
 """
-function prepare_training_batch(coord::ClusterCoordinator, samples::Vector{ClusterSample})
+function prepare_training_batch(
+    coord::ClusterCoordinator,
+    samples::Vector{ClusterSample};
+    importance_weights::Union{Nothing, Vector{Float32}} = nothing
+)
     n = length(samples)
     state_shape = GI.state_dim(coord.gspec)
     policy_dim = GI.num_actions(coord.gspec)
@@ -129,7 +252,12 @@ function prepare_training_batch(coord::ClusterCoordinator, samples::Vector{Clust
 
     for (i, s) in enumerate(samples)
         xs[i] = reshape(s.state, state_shape)
-        ws[i] = Float32[1]
+        # Apply importance sampling weight if provided (for PER bias correction)
+        if !isnothing(importance_weights)
+            ws[i] = Float32[importance_weights[i]]
+        else
+            ws[i] = Float32[1]
+        end
         ps[i] = s.policy
         vs[i] = Float32[s.value]
 
@@ -174,10 +302,11 @@ function prepare_training_batch(coord::ClusterCoordinator, samples::Vector{Clust
 end
 
 """
-Run one training step.
+Run one training step with uniform sampling.
+Returns (total_loss, policy_loss, value_loss, reg_loss) or nothing.
 """
 function training_step!(coord::ClusterCoordinator, batch_size::Int)
-    samples = sample_batch(coord, batch_size)
+    samples, indices, weights = sample_batch(coord, batch_size)
     if isnothing(samples)
         return nothing
     end
@@ -192,7 +321,79 @@ function training_step!(coord::ClusterCoordinator, batch_size::Int)
     l, grads = Flux.withgradient(loss_fn, coord.network)
     Flux.update!(coord.opt_state, coord.network, grads[1])
 
-    return Float64(l)
+    # Get individual loss components for logging (no gradient needed)
+    L, Lp, Lv, Lreg, Linv = losses(coord.network, coord.learning_params, Wmean, Hp, batch_data)
+
+    return (Float64(L), Float64(Lp), Float64(Lv), Float64(Lreg))
+end
+
+"""
+Run one training step with Prioritized Experience Replay (PER).
+
+Returns (total_loss, policy_loss, value_loss, reg_loss) or nothing.
+Also updates sample priorities based on TD-errors.
+
+Based on Schaul et al. 2016 "Prioritized Experience Replay".
+"""
+function training_step_prioritized!(
+    coord::ClusterCoordinator,
+    batch_size::Int,
+    per_config::PrioritizedSamplingConfig,
+    current_step::Int
+)
+    samples, indices, importance_weights = sample_batch_prioritized(
+        coord, batch_size, per_config, current_step
+    )
+    if isnothing(samples)
+        return nothing
+    end
+
+    # Prepare batch with importance sampling weights for bias correction
+    batch_data = prepare_training_batch(coord, samples; importance_weights=importance_weights)
+
+    Wmean = mean(batch_data.W)
+    Hp = 0.0f0
+
+    loss_fn(nn) = losses(nn, coord.learning_params, Wmean, Hp, batch_data)[1]
+
+    l, grads = Flux.withgradient(loss_fn, coord.network)
+    Flux.update!(coord.opt_state, coord.network, grads[1])
+
+    # Get individual loss components for logging (no gradient needed)
+    L, Lp, Lv, Lreg, Linv = losses(coord.network, coord.learning_params, Wmean, Hp, batch_data)
+
+    # Compute TD-errors and update priorities
+    # TD-error = |predicted_value - target_value|
+    td_errors = compute_td_errors(coord, samples, batch_data)
+    update_priorities!(coord, indices, td_errors)
+
+    return (Float64(L), Float64(Lp), Float64(Lv), Float64(Lreg))
+end
+
+"""
+Compute TD-errors for priority updates.
+TD-error = |network_value - target_value|
+"""
+function compute_td_errors(
+    coord::ClusterCoordinator,
+    samples::Vector{ClusterSample},
+    batch_data
+)
+    # Get network predictions
+    # Network.forward returns (P, V) tuple
+    P, V = Network.forward(coord.network, batch_data.X)
+
+    # Move values to CPU if on GPU
+    cpu_fn = coord.use_gpu ? Flux.cpu : identity
+    predicted_values = cpu_fn(V)[1, :]  # V has shape (1, batch_size)
+
+    # Target values from samples
+    target_values = [s.value for s in samples]
+
+    # TD-error = |predicted - target|
+    td_errors = Float32[abs(predicted_values[i] - target_values[i]) for i in 1:length(samples)]
+
+    return td_errors
 end
 
 """

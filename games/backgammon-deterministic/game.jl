@@ -9,7 +9,9 @@
 # Configuration:
 # - short_game=true: Faster games with pieces closer to bearing off
 # - doubles_only=true: Only doubles dice rolls (simpler game)
-# - OBSERVATION_TYPE: "minimal" (780), "full" (1612), or "biased" (3172)
+# - OBSERVATION_TYPE: :minimal_flat (330), :full_flat (362), :minimal (780), :full (1612)
+#
+# BackgammonNet v0.3.2+ required
 
 import AlphaZero.GI
 using StaticArrays
@@ -22,28 +24,50 @@ using BackgammonNet
 const SHORT_GAME = true  # Shorter games for faster learning (intentionally different starting position)
 const DOUBLES_ONLY = false  # Full 21 dice outcomes for proper stochastic testing
 
-# Observation type: "minimal", "full", or "biased"
+# Observation type: Symbol-based configuration (v0.3.2+)
 # Can be overridden via environment variable BACKGAMMON_OBS_TYPE
-const OBSERVATION_TYPE = get(ENV, "BACKGAMMON_OBS_TYPE", "full")
+# Available types:
+#   :minimal_flat (330)   - Flat vector for MLP (RECOMMENDED)
+#   :full_flat (362)      - Flat vector with extra features
+#   :biased_flat (?)      - Flat vector with heuristic features
+#   :minimal (30×1×26)    - Tensor for conv networks
+#   :full (62×1×26)       - Tensor with extra features
+#   :minimal_hybrid       - Named tuple (board=12×26, globals) for hybrid nets
+#   :full_hybrid          - Named tuple (board=12×26, globals=50) for hybrid nets
+#   :biased_hybrid        - Named tuple with heuristic features
+const OBS_TYPE_MAP = Dict(
+    "minimal" => :minimal_flat,      # Default to flat for MLP networks
+    "minimal_flat" => :minimal_flat,
+    "full" => :full_flat,
+    "full_flat" => :full_flat,
+    "biased" => :biased_flat,
+    "biased_flat" => :biased_flat,
+    "minimal_conv" => :minimal,      # For conv networks
+    "full_conv" => :full,
+    "minimal_hybrid" => :minimal_hybrid,  # For hybrid networks
+    "full_hybrid" => :full_hybrid,
+    "biased_hybrid" => :biased_hybrid,
+)
+const OBS_TYPE_STR = get(ENV, "BACKGAMMON_OBS_TYPE", "minimal")
+const OBSERVATION_TYPE = get(OBS_TYPE_MAP, OBS_TYPE_STR, :minimal_flat)
 
 # Action space: 676 actions (26*26 locations)
 const NUM_ACTIONS = 676
 
-# Observation sizes from BackgammonNet (channels × OBS_WIDTH)
-const OBS_SIZES = Dict(
-    "minimal" => BackgammonNet.OBS_CHANNELS_MINIMAL * BackgammonNet.OBS_WIDTH,  # 30 × 26 = 780
-    "full" => BackgammonNet.OBS_CHANNELS_FULL * BackgammonNet.OBS_WIDTH,        # 62 × 26 = 1612
-    "biased" => BackgammonNet.OBS_CHANNELS_BIASED * BackgammonNet.OBS_WIDTH     # 122 × 26 = 3172
-)
-const OBS_SIZE = OBS_SIZES[OBSERVATION_TYPE]
-
-# Observation function mapping
-const OBS_FUNCTIONS = Dict(
-    "minimal" => BackgammonNet.observe_minimal,
-    "full" => BackgammonNet.observe_full,
-    "biased" => BackgammonNet.observe_biased
-)
-const OBSERVE_FN = OBS_FUNCTIONS[OBSERVATION_TYPE]
+# Get observation size from BackgammonNet
+# Handle hybrid observations (named tuples) by computing flattened size
+function _compute_obs_size(obs_type)
+  dims = BackgammonNet.obs_dims(obs_type)
+  if dims isa NamedTuple
+    # Hybrid: (board = (12, 26), globals = 50) -> 12*26 + 50 = 362
+    return prod(dims.board) + (dims.globals isa Tuple ? prod(dims.globals) : dims.globals)
+  elseif dims isa Tuple
+    return prod(dims)
+  else
+    return dims
+  end
+end
+const OBS_SIZE = _compute_obs_size(OBSERVATION_TYPE)
 
 const Player = Bool
 const WHITE = true   # Player 0
@@ -66,9 +90,14 @@ end
 GI.num_chance_outcomes(::GameSpec) = 0
 
 function GI.vectorize_state(::GameSpec, game::BackgammonNet.BackgammonGame)
-  # Use configured observation function, flatten 3D to 1D
-  obs = OBSERVE_FN(game)
-  return vec(obs)
+  # Use observe() which dispatches based on game.obs_type
+  obs = BackgammonNet.observe(game)
+  # Handle hybrid observations (named tuples with board and globals)
+  if obs isa NamedTuple
+    return vcat(vec(obs.board), vec(obs.globals))
+  else
+    return vec(obs)
+  end
 end
 
 #####
@@ -83,29 +112,15 @@ end
 GI.spec(::GameEnv) = GameSpec()
 
 function GI.current_state(g::GameEnv)
-  # Return a COPY of the game state, not a reference
-  # This is important because MCTS captures state before playing actions
-  game = g.game
-  return BackgammonNet.BackgammonGame(
-    game.p0, game.p1, game.dice, game.remaining_actions,
-    game.current_player, game.terminated, game.reward,
-    copy(game.history), game.doubles_only,
-    Int[], Int[], Int[]  # Fresh buffers for the copy
-  )
+  # Use clone() for safe deep copy with all fields including obs_type
+  return BackgammonNet.clone(g.game)
 end
 
 function GI.set_state!(g::GameEnv, state::BackgammonNet.BackgammonGame)
-  # Copy state from another game
-  g.game.p0 = state.p0
-  g.game.p1 = state.p1
-  g.game.dice = state.dice
-  g.game.remaining_actions = state.remaining_actions
-  g.game.current_player = state.current_player
-  g.game.terminated = state.terminated
-  g.game.reward = state.reward
-  g.game.doubles_only = state.doubles_only
-  empty!(g.game.history)
-  append!(g.game.history, state.history)
+  # Clone the state into our game
+  cloned = BackgammonNet.clone(state)
+  g.game = cloned
+
   # If at chance node, auto-roll to get to player turn
   if BackgammonNet.is_chance_node(g.game) && !BackgammonNet.game_terminated(g.game)
     BackgammonNet.sample_chance!(g.game, g.rng)
@@ -119,7 +134,11 @@ GI.white_playing(g::GameEnv) = g.game.current_player == 0
 GI.white_playing(::GameSpec, state::BackgammonNet.BackgammonGame) = state.current_player == 0
 
 function GI.init(::GameSpec)
-  game = BackgammonNet.initial_state(; short_game=SHORT_GAME, doubles_only=DOUBLES_ONLY)
+  game = BackgammonNet.initial_state(;
+    short_game=SHORT_GAME,
+    doubles_only=DOUBLES_ONLY,
+    obs_type=OBSERVATION_TYPE
+  )
   rng = MersenneTwister()
   genv = GameEnv(game, rng)
   # Auto-roll initial dice to get to first decision point
@@ -196,6 +215,7 @@ function GI.render(g::GameEnv)
   game = g.game
   println("=" ^ 50)
   println("Backgammon DETERMINISTIC (short_game=$SHORT_GAME, doubles=$DOUBLES_ONLY)")
+  println("Observation type: $(game.obs_type) ($(OBS_SIZE) features)")
   println("-" ^ 50)
 
   # Display board state using canonical indexing (27=my off, 28=opp off)
@@ -260,12 +280,33 @@ end
 #####
 
 function GI.heuristic_value(g::GameEnv)
-  obs = BackgammonNet.observe_full(g.game)
-  pip_diff = obs[38]
-  if g.game.current_player == 1
+  # Get pip difference as a simple heuristic
+  # Note: This uses internal game state, not observation
+  game = g.game
+
+  # Calculate pip counts manually from board state
+  p0_pip = 0
+  p1_pip = 0
+  for i in 1:24
+    v = game[i]
+    if v > 0
+      p0_pip += v * (25 - i)  # White moving toward point 0
+    elseif v < 0
+      p1_pip += abs(v) * i    # Black moving toward point 25
+    end
+  end
+  # Add bar pieces (25 pips to enter)
+  p0_pip += game[0] * 25   # White on bar
+  p1_pip += abs(game[25]) * 25  # Black on bar
+
+  pip_diff = p1_pip - p0_pip  # Positive = white ahead
+
+  if game.current_player == 1
     pip_diff = -pip_diff
   end
-  return Float64(pip_diff)
+
+  # Normalize to roughly [-1, 1] range
+  return Float64(pip_diff) / 100.0
 end
 
 #####

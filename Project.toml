@@ -43,11 +43,9 @@ cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 [weakdeps]
 Knet = "1902f260-5fb4-5aff-8c31-6271790ab950"
 
-[sources]
-BackgammonNet = {url = "https://github.com/sile16/BackgammonNet.jl.git"}
-
 [compat]
 ArgParse = "1.1.4"
+BackgammonNet = "0.3.2"
 CUDA = "3, 5"
 Colors = "0.12.7, 0.13"
 CommonRLInterface = "0.3.1"

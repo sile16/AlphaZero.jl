@@ -7,11 +7,11 @@ This is a Julia implementation of AlphaZero with extensions for backgammon, incl
 - Stochastic game support (dice rolling)
 - TensorBoard integration for experiment tracking (pure Julia, no Python conflicts)
 
-## Current Best Approach (2026-02-01)
+## Current Best Approach (2026-02-04)
 
 ### Training Options
 
-**Option 1: Thread-based (single machine, fastest)**
+**Option 1: Concurrent architecture with PER + Smart Reanalyze (RECOMMENDED)**
 ```bash
 julia --project --threads=8 scripts/train_cluster.jl \
     --game=backgammon-deterministic \
@@ -19,15 +19,20 @@ julia --project --threads=8 scripts/train_cluster.jl \
     --network-width=128 \
     --network-blocks=3 \
     --num-workers=6 \
-    --total-iterations=70 \
+    --total-iterations=250 \
     --games-per-iteration=50 \
     --mcts-iters=100 \
+    --per --reanalyze --distributed \
     --final-eval-games=1000
 ```
 
-**Option 2: Julia Distributed (multi-machine capable)**
+**Option 2: Simple thread-based (no PER/reanalyze)**
 ```bash
-julia --project scripts/train_distributed.jl \
+julia --project --threads=8 scripts/train_cluster.jl \
+    --game=backgammon-deterministic \
+    --network-type=fcresnet-multihead \
+    --network-width=128 \
+    --network-blocks=3 \
     --num-workers=6 \
     --total-iterations=70 \
     --games-per-iteration=50 \
@@ -44,6 +49,9 @@ View logs with: `tensorboard --logdir=sessions/<session>/tensorboard`
 - Git commit hash logged at start and saved to `run_info.txt`
 - Parallel final evaluation (1000 games default, uses all threads)
 - Progress logging every 10% during evaluation
+- **PER** (Prioritized Experience Replay) for better sample efficiency
+- **Smart Reanalyze** - MuZero-style, tracks model iteration per sample, stops when buffer is up-to-date
+- **Concurrent architecture** (`--distributed`) - self-play, reanalyze, and eval run simultaneously
 - **GnuBG evaluation during training** (use `--eval-vs-gnubg`)
 
 **Option 3: Training with GnuBG evaluation** (more meaningful than random)
@@ -222,6 +230,10 @@ Each contains:
 - `cluster_20260202_112558` - Sweep B: Wider (256w×3b, 100 MCTS) → 1.68
 - `cluster_20260202_130346` - Sweep C: Deeper (128w×6b, 100 MCTS) → 1.865
 - `cluster_20260202_141047` - Sweep D: More MCTS (128w×3b, 200 MCTS) → 1.95
+- `cluster_20260204_092136` - 100-iter PER + smart reanalyze test (+0.902 vs random, 48 min)
+
+**Note**: Sessions before 2026-02-04 used the old asymmetric `short_game` initial position.
+Results may not be directly comparable to newer runs with the fixed position.
 
 ## Performance Baselines
 
@@ -231,6 +243,12 @@ Each contains:
 | FCResNetMultiHead (128, 3) | 69 | +1.23 | - | - | Multi-head baseline |
 | FCResNetMultiHead (cluster) | 70 | +1.21 | - | - | train_cluster.jl |
 | **FCResNetMultiHead (100 iter)** | **100** | **+2.01** | **+0.35 (62%)** | **+0.20 (55%)** | **MINIMAL features, 2.6h training** |
+| PER + Smart Reanalyze (100 iter) | 100 | +0.902 | - | - | 48 min, concurrent arch |
+
+**Note on color asymmetry**: Earlier results showed severe white/black asymmetry (white 38-48% win vs
+black 72-93%). This was caused by a bug in BackgammonNet's `short_game` initial position which was
+asymmetric between players. The fix in BackgammonNet corrects the starting position. Previous results
+measured with the old initial position may not be directly comparable to new results.
 
 ## Training (2026-01-26)
 
@@ -283,6 +301,8 @@ tensorboard --logdir=sessions/<session>/tensorboard
 16. **Deeper networks help**: 6 blocks (1.865) outperformed 3 blocks (1.73) with only 35% more parameters
 17. **Wider networks underperform**: 256-width (3x params) was slower AND scored worse than baseline - not worth the cost
 18. **MCTS quality matters more than network size**: Higher quality self-play games lead to better learning
+19. **Use clone() for game state copying**: Manual struct construction breaks when fields are added (e.g., `obs_type`). Always use `BackgammonNet.clone()` in `GI.current_state()`
+20. **Hyperparameter sweep rankings reverse vs GnuBG**: More MCTS (1.95 vs random) performed WORST vs GnuBG 1-ply (-0.04), while baseline (1.73 vs random) performed BEST (+0.19). Overfitting to self-play distribution.
 
 ### Hyperparameter Sweep Results (2026-02-02)
 
@@ -400,28 +420,77 @@ See `notes/stochastic_mcts_experiments.md` Experiment 6 for full analysis.
 8. ✅ Julia Distributed training - **DONE** (train_distributed.jl, ~80% of thread throughput, multi-machine capable)
 9. ✅ GnuBG eval in training loop - **DONE** (use `--eval-vs-gnubg` in train_cluster.jl)
 10. ✅ Replace WandB with TensorBoard - **DONE** (pure Julia, no Python conflicts)
+11. ✅ Longer training with MINIMAL features - **DONE** (100 iter, +2.01 vs random, +0.35 vs GnuBG 0-ply)
+12. ✅ PER (Prioritized Experience Replay) - **DONE** (Schaul et al. 2016, proportional prioritization)
+13. ✅ Reanalyze Phase 1 (MuZero style) - **DONE** (basic value reanalysis with TD-error tracking)
+14. ✅ Smart Reanalyze (Phase 2) - **DONE** (model iteration tracking, staleness-based prioritization)
+15. ✅ Concurrent architecture - **DONE** (self-play, reanalyze, eval run simultaneously)
+16. ✅ Color asymmetry resolved - **DONE** (was caused by asymmetric `short_game` initial position in BackgammonNet)
 
 ### Next Priority
-11. **Investigate color asymmetry** - Why do models struggle as white (38-48% win) but dominate as black (72-93%)?
-12. **Match equity table (MET) integration** - Proper match play scoring
-13. **Scale up training** - More iterations, larger networks, see if performance vs GnuBG continues to improve
-
-### Recently Completed (2026-02-01)
-10. ✅ **Longer training with MINIMAL features** - **DONE** - 100 iterations achieved:
-    - vs Random (500 games): **+2.01** combined
-    - vs GnuBG 0-ply (200 games): **+0.35** (62% win rate)
-    - vs GnuBG 1-ply (200 games): **+0.20** (55% win rate)
-    - **Conclusion**: MINIMAL features generalize well! Model beats both 0-ply and 1-ply GnuBG
-    - Session: `sessions/cluster_20260201_211302`
+17. **Scale up training** - 2+ hour runs with PER + smart reanalyze to validate at scale
+18. **Match equity table (MET) integration** - Proper match play scoring
+19. **GnuBG eval for new runs** - Benchmark new PER+reanalyze runs against GnuBG
 
 ### Future
-14. Web-based workers using WASM and WebGPU - Leverage browser compute for distributed training
-15. Reanalyze (MuZero style)
-16. Curriculum learning - Progressive training difficulty
-17. Pre-race-net and race-net - Specialized networks for racing positions
-18. Exam eval - Known tricky positions for evaluation only
-19. Gym - Training on known board positions with known targets
-20. Precomputed endgame tables - Avoid running games to completion
+20. Web-based workers using WASM and WebGPU - Leverage browser compute for distributed training
+21. Curriculum learning - Progressive training difficulty
+22. Pre-race-net and race-net - Specialized networks for racing positions
+23. Exam eval - Known tricky positions for evaluation only
+24. Gym - Training on known board positions with known targets
+25. Precomputed endgame tables - Avoid running games to completion
+26. **Reanalyze Phase 3** - Bear-off database and curated position library integration
+
+## PER + Smart Reanalyze (2026-02-04)
+
+### Prioritized Experience Replay (PER)
+Based on Schaul et al. 2016 "Prioritized Experience Replay" (ICLR 2016).
+- **Proportional prioritization**: P(i) = p_i^alpha / sum(p_k^alpha)
+- **Importance sampling weights**: w_i = (N * P(i))^(-beta) for bias correction
+- **Beta annealing**: beta linearly anneals from 0.4 to 1.0 over training
+- Enable with `--per` flag
+
+### Smart Reanalyze (MuZero-style)
+Re-evaluates stored positions with the latest network. Smart strategy:
+- **Model iteration tracking**: Each sample tracks which model iteration it was last reanalyzed with
+- **Staleness-based priority**: Samples with oldest model iteration are reanalyzed first
+- **Automatic stop/resume**: Stops when all samples are up-to-date, resumes when model updates
+- **Concurrent**: Runs on a separate thread, doesn't block training
+- Enable with `--reanalyze` flag
+
+### Key Files
+- `src/reanalyze.jl` - ReanalyzeConfig, ReanalyzeStats, smart sampling functions
+- `src/cluster/types.jl` - ClusterSample with PER + reanalyze fields
+- `src/cluster/async_workers.jl` - AsyncReanalyzeWorker, AsyncEvalWorker
+- `src/cluster/Cluster.jl` - Concurrent training loop integration
+- `src/cluster/coordinator.jl` - PER sampling, TD-error priority updates
+
+### Usage
+```bash
+julia --project --threads=8 scripts/train_cluster.jl \
+    --per --reanalyze --distributed \
+    --game=backgammon-deterministic \
+    --total-iterations=250 \
+    ...
+```
+
+### ClusterSample Fields
+| Field | Type | Description |
+|-------|------|-------------|
+| `priority` | Float32 | TD-error based priority for PER sampling |
+| `added_step` | Int | Training iteration when sample was added |
+| `last_reanalyze_step` | Int | Last reanalysis step (worker counter) |
+| `reanalyze_count` | Int | Times this sample has been reanalyzed |
+| `model_iter_reanalyzed` | Int | Model iteration sample was last reanalyzed with |
+
+### Training Results (100 iter test)
+- 605K smart reanalyze operations in 48 min
+- Buffer correctly tracks stale samples per model iteration
+- FIFO eviction (research-backed: priority eviction doesn't help)
+
+### Future: Phase 3 - External Data
+- **Bear-off database**: Exact equity for endgame positions
+- **Curated position library**: High-quality positions from rollouts/experts
 
 **Ideas/Notes:**
 - For stochastic implementation: train a stochastic head that outputs priors for all 21 dice outcomes for V, so we know the prior for all 21 options. Optionally predict which stochastic options will have the highest absolute change in V, use that to sample top-k extreme outcomes for better value estimates.

@@ -41,7 +41,7 @@ end
 
 using AlphaZero
 using AlphaZero.Cluster
-using AlphaZero: GI, Network, FluxLib
+using AlphaZero: GI, Network, FluxLib, ReanalyzeConfig
 using AlphaZero.TensorBoard
 import Flux
 using Statistics: mean
@@ -201,6 +201,45 @@ function parse_args()
             help = "Random seed for reproducibility (0 = use random seed)"
             arg_type = Int
             default = 0
+
+        # Prioritized Experience Replay (PER)
+        "--per"
+            help = "Enable Prioritized Experience Replay (Schaul et al. 2016)"
+            action = :store_true
+        "--per-alpha"
+            help = "PER priority exponent (0=uniform, 1=full prioritization)"
+            arg_type = Float64
+            default = 0.6
+        "--per-beta"
+            help = "PER importance sampling initial beta (anneals to 1.0)"
+            arg_type = Float64
+            default = 0.4
+        "--per-epsilon"
+            help = "PER small constant for numerical stability"
+            arg_type = Float64
+            default = 0.01
+
+        # Reanalyze (MuZero-style)
+        "--reanalyze"
+            help = "Enable MuZero-style reanalysis of replay buffer samples"
+            action = :store_true
+        "--reanalyze-batch-size"
+            help = "Batch size for reanalysis"
+            arg_type = Int
+            default = 256
+        "--reanalyze-alpha"
+            help = "Blend factor for reanalysis (0=keep old, 1=use new)"
+            arg_type = Float64
+            default = 0.5
+        "--reanalyze-interval"
+            help = "Run reanalysis every N training iterations"
+            arg_type = Int
+            default = 1
+
+        # Architecture
+        "--distributed"
+            help = "Use fully concurrent architecture (async reanalyze + eval)"
+            action = :store_true
 
         # Misc
         "--no-gpu"
@@ -728,28 +767,78 @@ function main()
         nothing
     end
 
+    # Create PER config
+    per_config = Cluster.PrioritizedSamplingConfig(
+        enabled=args["per"],
+        alpha=Float32(args["per_alpha"]),
+        beta=Float32(args["per_beta"]),
+        beta_annealing_steps=args["total_iterations"],  # Anneal over full training
+        epsilon=Float32(args["per_epsilon"]),
+        initial_priority=1.0f0
+    )
+
+    # Create Reanalyze config
+    reanalyze_config = ReanalyzeConfig(
+        enabled=args["reanalyze"],
+        batch_size=args["reanalyze_batch_size"],
+        update_interval=args["reanalyze_interval"],
+        reanalyze_alpha=Float32(args["reanalyze_alpha"]),
+        max_reanalyze_count=5,
+        prioritize_high_td=true,
+        log_interval=10
+    )
+
     # Run training
     coord = nothing
     try
-        coord = start_cluster_training(
-            gspec,
-            network_constructor,
-            learning_params,
-            mcts_params;
-            num_workers=args["num_workers"],
-            buffer_capacity=args["buffer_capacity"],
-            batch_size=args["batch_size"],
-            checkpoint_interval=args["checkpoint_interval"],
-            total_iterations=args["total_iterations"],
-            games_per_iteration=args["games_per_iteration"],
-            use_gpu=use_gpu,
-            checkpoint_dir=checkpoint_dir,
-            wandb_log=tb_log_fn,  # Still called wandb_log in the API, but now it's TensorBoard
-            eval_fn=eval_fn,
-            eval_interval=eval_interval,
-            seed=seed,
-            load_network_path=load_network_path
-        )
+        if args["distributed"]
+            # Use new concurrent architecture
+            @info "Using distributed (concurrent) architecture"
+            coord = start_distributed_training(
+                gspec,
+                network_constructor,
+                learning_params,
+                mcts_params;
+                num_workers=args["num_workers"],
+                buffer_capacity=args["buffer_capacity"],
+                batch_size=args["batch_size"],
+                checkpoint_interval=args["checkpoint_interval"],
+                total_iterations=args["total_iterations"],
+                games_per_iteration=args["games_per_iteration"],
+                use_gpu=use_gpu,
+                checkpoint_dir=checkpoint_dir,
+                wandb_log=tb_log_fn,
+                eval_games=args["eval_games"],
+                eval_interval=eval_interval,
+                seed=seed,
+                load_network_path=load_network_path,
+                per_config=per_config,
+                reanalyze_config=reanalyze_config
+            )
+        else
+            # Use original sequential architecture
+            coord = start_cluster_training(
+                gspec,
+                network_constructor,
+                learning_params,
+                mcts_params;
+                num_workers=args["num_workers"],
+                buffer_capacity=args["buffer_capacity"],
+                batch_size=args["batch_size"],
+                checkpoint_interval=args["checkpoint_interval"],
+                total_iterations=args["total_iterations"],
+                games_per_iteration=args["games_per_iteration"],
+                use_gpu=use_gpu,
+                checkpoint_dir=checkpoint_dir,
+                wandb_log=tb_log_fn,
+                eval_fn=eval_fn,
+                eval_interval=eval_interval,
+                seed=seed,
+                load_network_path=load_network_path,
+                per_config=per_config,
+                reanalyze_config=reanalyze_config
+            )
+        end
     catch e
         if e isa InterruptException
             @info "Training interrupted"

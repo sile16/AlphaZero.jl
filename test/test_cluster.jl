@@ -203,8 +203,9 @@ include(joinpath(GAMES_DIR, "backgammon-deterministic", "main.jl"))
             use_gpu=false
         )
 
-        # Empty buffer should return nothing
-        @test isnothing(sample_batch(coord, 10))
+        # Empty buffer should return (nothing, nothing, nothing)
+        sampled, indices, weights = sample_batch(coord, 10)
+        @test isnothing(sampled)
 
         # Add samples
         state_dim = prod(GI.state_dim(gspec))
@@ -222,13 +223,46 @@ include(joinpath(GAMES_DIR, "backgammon-deterministic", "main.jl"))
         batch = GameBatch(1, samples, 50, 1.0f0)
         add_samples!(coord, batch)
 
-        # Now sampling should work
-        sampled = sample_batch(coord, 20)
+        # Now sampling should work (returns tuple of samples, indices, weights)
+        sampled, indices, weights = sample_batch(coord, 20)
         @test !isnothing(sampled)
         @test length(sampled) == 20
+        @test length(indices) == 20
+        @test length(weights) == 20
+        @test all(w == 1.0f0 for w in weights)  # Uniform sampling has all weights = 1
 
         # Request more than buffer size should return nothing
-        @test isnothing(sample_batch(coord, 100))
+        sampled, indices, weights = sample_batch(coord, 100)
+        @test isnothing(sampled)
+
+        # Test prioritized sampling
+        per_config = PrioritizedSamplingConfig(
+            enabled=true,
+            alpha=0.6f0,
+            beta=0.4f0,
+            epsilon=0.01f0
+        )
+
+        # Set varying priorities on samples
+        for (i, _) in enumerate(coord.buffer)
+            old = coord.buffer[i]
+            coord.buffer[i] = ClusterSample(
+                old.state, old.policy, old.value, old.turn, old.is_chance,
+                old.equity_p_win, old.equity_p_gw, old.equity_p_bgw,
+                old.equity_p_gl, old.equity_p_bgl, old.has_equity,
+                Float32(i) / 10.0f0,  # Priority increases with index
+                old.added_step, old.last_reanalyze_step, old.reanalyze_count,
+                old.model_iter_reanalyzed
+            )
+        end
+
+        # Prioritized sampling should work
+        sampled, indices, weights = sample_batch_prioritized(coord, 20, per_config, 10)
+        @test !isnothing(sampled)
+        @test length(sampled) == 20
+        @test length(indices) == 20
+        @test length(weights) == 20
+        @test all(0.0 < w <= 1.0 for w in weights)  # Importance weights normalized to max 1
     end
 
     @testset "Weight serialization" begin
@@ -363,9 +397,10 @@ include(joinpath(GAMES_DIR, "backgammon-deterministic", "main.jl"))
         add_samples!(coord, batch)
 
         # Now training should work
-        loss = training_step!(coord, 16)
-        @test !isnothing(loss)
-        @test loss > 0  # Loss should be positive
+        loss_result = training_step!(coord, 16)
+        @test !isnothing(loss_result)
+        L, Lp, Lv, Lreg = loss_result
+        @test L > 0  # Total loss should be positive
     end
 
     @testset "TrainingMetrics and EvalResults" begin

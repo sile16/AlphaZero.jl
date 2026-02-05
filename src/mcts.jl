@@ -178,7 +178,7 @@ mutable struct Env{State, Oracle}
   noise_ϵ :: Float64
   noise_α :: Float64
   prior_temperature :: Float64
-  chance_mode :: Symbol  # :full, :sampling, or :progressive
+  chance_mode :: Symbol  # :full, :sampling, :stratified, or :progressive
   # Progressive widening parameters (for :progressive mode)
   progressive_widening_alpha :: Float64  # Expand new outcome when N^α > num_expanded
   prior_virtual_visits :: Float64        # Virtual visits to weight NN prior (like PUCT prior)
@@ -303,7 +303,7 @@ end
 """
 Handle simulation at a chance node.
 
-Three modes controlled by env.chance_mode:
+Four modes controlled by env.chance_mode:
 
 :full (default) - Full expectimax:
   - First visit: Query NN, return V
@@ -313,6 +313,12 @@ Three modes controlled by env.chance_mode:
 :sampling - Monte Carlo sampling (faster):
   - First visit: Query NN, return V, initialize stats with prior
   - Subsequent visits: Sample ONE outcome by probability, update running average
+
+:stratified - Stratified sampling (guaranteed coverage):
+  - First visit: Query NN, return V, initialize stats with prior
+  - Next K visits: Visit each outcome exactly once (random order)
+  - After all visited: Sample by probability (same as :sampling)
+  - Better variance than pure sampling in early visits
 
 :progressive - Progressive widening with prior integration:
   - First visit: Query NN, return V, initialize with prior virtual visits
@@ -327,6 +333,8 @@ function run_simulation_chance!(env::Env, game; η, root, depth)
 
   if env.chance_mode == :sampling
     return run_simulation_chance_sampling!(env, game, state, η, depth)
+  elseif env.chance_mode == :stratified
+    return run_simulation_chance_stratified!(env, game, state, η, depth)
   elseif env.chance_mode == :progressive
     return run_simulation_chance_progressive!(env, game, state, η, depth)
   else
@@ -372,11 +380,13 @@ function run_simulation_chance_sampling!(env::Env, game, state, η, depth)
     # Initialize each outcome with prior: mean = V, weight = virtual_N
     # This way: Σ prob × (W/N) = Σ prob × V = V (correct expectation)
     virtual_N = env.prior_virtual_visits
-    outcome_stats = [ChanceOutcomeStats(prob, V * virtual_N, virtual_N)
+    # Protect against NaN from neural network
+    V_safe = isnan(V) ? 0.0f0 : V
+    outcome_stats = [ChanceOutcomeStats(prob, V_safe * virtual_N, virtual_N)
                      for (_, prob) in outcomes]
-    info = ChanceNodeInfo(outcome_stats, collect(1:length(outcomes)), V, true, length(outcomes))
+    info = ChanceNodeInfo(outcome_stats, collect(1:length(outcomes)), V_safe, true, length(outcomes))
     env.chance_tree[state] = info
-    return V
+    return V_safe
   end
 
   info = env.chance_tree[state]
@@ -395,12 +405,110 @@ function run_simulation_chance_sampling!(env::Env, game, state, η, depth)
     v = run_simulation!(env, game_copy, η=η, root=false, depth=depth+1)
   end
 
-  # Update statistics for the sampled outcome
-  update_chance_outcome!(info, outcome_idx, v)
+  # Protect against NaN values from simulation
+  v_safe = isnan(v) ? 0.0 : v
 
-  # Return expectimax value: weighted average of mean values across all outcomes
-  # Each outcome's value is W/N (mean of samples), weighted by probability
-  return sum(o.prob * (o.W / max(o.N, 1)) for o in info.outcomes)
+  # Update statistics for the sampled outcome
+  update_chance_outcome!(info, outcome_idx, v_safe)
+
+  # Return expectimax value with NaN protection
+  total = 0.0
+  for o in info.outcomes
+    val = o.W / max(o.N, 1)
+    if !isnan(val)
+      total += o.prob * val
+    end
+  end
+  return total
+end
+
+"""
+Stratified sampling mode: visit all outcomes once before random sampling.
+
+This ensures guaranteed coverage of all outcomes before switching to
+probability-proportional sampling. Better than pure random sampling because
+it reduces variance in the early visits.
+
+Algorithm:
+1. First visit: Initialize with NN prior (same as sampling mode)
+2. While unvisited outcomes exist: pick a random unvisited outcome
+3. After all visited: sample by probability (same as sampling mode)
+
+Uses num_expanded to track how many unique outcomes have been visited.
+An outcome is "unvisited" if N == virtual_N (only has prior, no real samples).
+"""
+function run_simulation_chance_stratified!(env::Env, game, state, η, depth)
+  outcomes = GI.chance_outcomes(game)
+  virtual_N = env.prior_virtual_visits
+
+  if !haskey(env.chance_tree, state)
+    # FIRST VISIT: Query NN, use prior value, initialize with virtual visits
+    (_, V) = env.oracle(state)
+    # Protect against NaN from neural network
+    V_safe = isnan(V) ? 0.0f0 : V
+    outcome_stats = [ChanceOutcomeStats(prob, V_safe * virtual_N, virtual_N)
+                     for (_, prob) in outcomes]
+    # outcome_order maps to original indices (identity for stratified)
+    info = ChanceNodeInfo(outcome_stats, collect(1:length(outcomes)), V_safe, false, 0)
+    env.chance_tree[state] = info
+    return V_safe
+  end
+
+  info = env.chance_tree[state]
+  num_outcomes = length(info.outcomes)
+
+  # Choose which outcome to visit
+  if info.num_expanded < num_outcomes
+    # STRATIFIED PHASE: Find unvisited outcomes and pick one randomly
+    # An outcome is unvisited if N <= virtual_N (only has prior)
+    unvisited_indices = Int[]
+    for i in 1:num_outcomes
+      if info.outcomes[i].N <= virtual_N
+        push!(unvisited_indices, i)
+      end
+    end
+
+    if !isempty(unvisited_indices)
+      # Pick random unvisited outcome
+      outcome_idx = unvisited_indices[rand(1:length(unvisited_indices))]
+      info.num_expanded += 1  # Track that we're visiting a new outcome
+    else
+      # All visited, switch to sampling
+      info.num_expanded = num_outcomes  # Sync num_expanded
+      probs = [o.prob for o in info.outcomes]
+      outcome_idx = Util.rand_categorical(probs)
+    end
+  else
+    # SAMPLING PHASE: Sample by probability (all outcomes visited at least once)
+    probs = [o.prob for o in info.outcomes]
+    outcome_idx = Util.rand_categorical(probs)
+  end
+
+  outcome, _ = outcomes[outcome_idx]
+  game_copy = GI.clone(game)
+  GI.apply_chance!(game_copy, outcome)
+
+  if GI.game_terminated(game_copy)
+    v = 0.0
+  else
+    v = run_simulation!(env, game_copy, η=η, root=false, depth=depth+1)
+  end
+
+  # Protect against NaN values from simulation
+  v_safe = isnan(v) ? 0.0 : v
+
+  # Update statistics for the visited outcome
+  update_chance_outcome!(info, outcome_idx, v_safe)
+
+  # Return expectimax value with NaN protection
+  total = 0.0
+  for o in info.outcomes
+    val = o.W / max(o.N, 1)
+    if !isnan(val)
+      total += o.prob * val
+    end
+  end
+  return total
 end
 
 """

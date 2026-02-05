@@ -128,6 +128,12 @@ module AlphaZero
   include("memory.jl")
   export MemoryBuffer, get_experience
 
+  # MuZero-style reanalysis for improved sample efficiency
+  include("reanalyze.jl")
+  export ReanalyzeConfig, ReanalyzeStats
+  export reanalyze_step!, get_reanalyze_metrics
+  export sample_for_reanalysis, sample_for_smart_reanalysis, count_stale_samples
+
   # Utilities to train the neural network based on collected samples
   include("learning.jl")
 
@@ -201,10 +207,15 @@ module AlphaZero
   include("scripts/scripts.jl")
   export Scripts
 
-  # Distributed training module
+  # Distributed training module (ZMQ-based, legacy)
   include("distributed/Distributed.jl")
   using .Distributed
   export Distributed
+
+  # Cluster training module (Julia Distributed stdlib)
+  include("cluster/Cluster.jl")
+  using .Cluster
+  export Cluster
 
   function __init__()
     # OpenSpiel.jl Wrapper
