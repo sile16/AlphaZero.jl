@@ -16,6 +16,7 @@ Usage:
 using ArgParse
 using Dates
 using Random
+using StaticArrays: SVector
 using Statistics
 using TensorBoardLogger
 using Logging: with_logger
@@ -137,12 +138,8 @@ function parse_args()
             arg_type = Float64
             default = 0.25
         "--use-bearoff"
-            help = "Enable bear-off rollout value targets for endgame positions"
+            help = "Enable exact bear-off table value targets (k=6 two-sided database)"
             action = :store_true
-        "--bearoff-rollouts"
-            help = "Number of rollouts for bear-off value estimation"
-            arg_type = Int
-            default = 100
     end
 
     return ArgParse.parse_args(s)
@@ -187,6 +184,49 @@ mkpath(joinpath(SESSION_DIR, "checkpoints"))
 const TB_DIR = joinpath(SESSION_DIR, "tb")
 mkpath(TB_DIR)
 const TB_LOGGER = TBLogger(TB_DIR, tb_append)
+
+# Log reproducibility info to TensorBoard
+with_logger(TB_LOGGER) do
+    # Git commit
+    git_commit = try strip(read(`git rev-parse HEAD`, String)) catch; "unknown" end
+    git_dirty = try strip(read(`git diff --stat`, String)) catch; "" end
+    git_status = isempty(git_dirty) ? "clean" : "dirty"
+
+    # Command line
+    cmd = "julia " * join(Base.ARGS, " ")
+
+    # All hyperparameters
+    params_lines = ["## Hyperparameters\n"]
+    for (k, v) in sort(collect(ARGS), by=first)
+        push!(params_lines, "- **$k**: `$v`")
+    end
+
+    # Build features description
+    features = String[]
+    ARGS["use_per"] && push!(features, "PER (α=$(ARGS["per_alpha"]), β=$(ARGS["per_beta"]))")
+    ARGS["use_reanalyze"] && push!(features, "Reanalyze ($(ARGS["reanalyze_fraction"]*100)%)")
+    ARGS["use_bearoff"] && push!(features, "Bear-off table (k=6 exact, MCTS+TD-bootstrap)")
+    features_str = isempty(features) ? "Baseline (no enhancements)" : join(features, ", ")
+
+    repro_text = """
+    ## Goal
+    Train world-class SOTA backgammon model using AlphaZero self-play with multi-head equity network.
+
+    ## Experiment
+    - **Features**: $(features_str)
+    - **Session**: `$(SESSION_DIR)`
+
+    ## Reproducibility
+    - **Git commit**: `$(git_commit)` ($(git_status))
+    - **Command**: `$(cmd)`
+    - **Julia version**: `$(VERSION)`
+    - **Threads**: $(Threads.nthreads())
+    - **Date**: $(Dates.format(now(), "yyyy-mm-dd HH:MM:SS"))
+
+    $(join(params_lines, "\n"))
+    """
+    @info "config" text=repro_text log_step_increment=0
+end
 
 println("=" ^ 60)
 println(RESUMING ? "Threaded AlphaZero Training (RESUMING)" : "Threaded AlphaZero Training")
@@ -681,77 +721,163 @@ function refresh_fast_weights!()
 end
 
 #####
-##### Bear-off detection and rollout
+##### Bear-off exact table lookup (k=6 two-sided database)
 #####
 
 const USE_BEAROFF = ARGS["use_bearoff"]
-const BEAROFF_ROLLOUTS = ARGS["bearoff_rollouts"]
 
-"""Check if a BackgammonGame position is a no-contact bear-off race.
-Both players have all checkers in their home board (or off), no bar checkers."""
-function is_bearoff_race(game::BackgammonNet.BackgammonGame)
-    p0, p1 = game.p0, game.p1
-    # Bitmask checks: any bits set in masked region means checkers outside home
-    _MASK_1_18 = BackgammonNet.MASK_1_18
-    _MASK_7_24 = BackgammonNet.MASK_7_24
-    # P0: no checkers outside home (points 1-18) and not on bar
-    p0_outside = (p0 & _MASK_1_18) != 0
-    p0_bar = BackgammonNet.get_count(p0, BackgammonNet.IDX_P0_BAR) > 0
-    if p0_outside || p0_bar; return false; end
-    # P1: no checkers outside home (points 7-24) and not on bar
-    p1_outside = (p1 & _MASK_7_24) != 0
-    p1_bar = BackgammonNet.get_count(p1, BackgammonNet.IDX_P1_BAR) > 0
-    if p1_outside || p1_bar; return false; end
-    return true
+# Load BearoffK6 module from local BackgammonNet.jl dev repo
+# (bearoff_k6.jl and 5.5GB data files are not in the published package)
+const BEAROFF_SRC_DIR = let
+    # Try local dev repo first, fall back to installed package
+    local_path = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k6.jl")
+    pkg_path = joinpath(dirname(pathof(BackgammonNet)), "bearoff_k6.jl")
+    if isfile(local_path)
+        dirname(local_path)
+    elseif isfile(pkg_path)
+        dirname(pkg_path)
+    else
+        error("Cannot find bearoff_k6.jl. Expected at:\n  $local_path\n  $pkg_path")
+    end
+end
+include(joinpath(BEAROFF_SRC_DIR, "bearoff_k6.jl"))
+using .BearoffK6
+
+const BEAROFF_TABLE = if USE_BEAROFF
+    table_dir = joinpath(BEAROFF_SRC_DIR, "..", "tools", "bearoff_twosided", "bearoff_k6_twosided")
+    if !isdir(table_dir)
+        error("Bear-off table not found at: $table_dir\nDownload or generate the k=6 two-sided database first.")
+    end
+    println("Loading k=6 bear-off table from $table_dir ...")
+    t = BearoffTable(table_dir)
+    println("  Tier-1 entries: $(t.n_tier1) ($(round(length(t.tier1_data)/1e9, digits=1)) GB)")
+    println("  Tier-2 entries: $(t.n_tier2) ($(round(length(t.tier2_data)/1e9, digits=1)) GB)")
+    flush(stdout)
+    t
+else
+    nothing
 end
 
-"""Run fast rollouts from a bear-off position to estimate equity.
+"""Look up exact bear-off equity from precomputed table.
 Returns (value, equity_5tuple) from current player's perspective."""
-function bearoff_rollout_equity(game::BackgammonNet.BackgammonGame, n_rollouts::Int, rng)
-    wins = 0; gammon_wins = 0; bg_wins = 0; gammon_losses = 0; bg_losses = 0
-    wp = game.current_player == 0  # white playing (P0)?
+function bearoff_table_equity(game::BackgammonNet.BackgammonGame)
+    r = BearoffK6.lookup(BEAROFF_TABLE, game)
+    eq = Float32[r.p_win, r.p_gammon_win, r.p_bg_win, r.p_gammon_loss, r.p_bg_loss]
+    value = BearoffK6.compute_equity(r)
+    return (value=value, equity=eq)
+end
 
-    for _ in 1:n_rollouts
-        g = BackgammonNet.clone(game)
-        # Play out to completion with random dice and greedy moves
-        # Ensure we start from a non-chance state
-        if BackgammonNet.is_chance_node(g)
-            BackgammonNet.sample_chance!(g, rng)
-        end
-        max_moves = 200
-        for _ in 1:max_moves
-            BackgammonNet.game_terminated(g) && break
-            acts = BackgammonNet.legal_actions(g)
-            isempty(acts) && break
-            a = acts[1]  # First legal action (greedy bear-off)
-            BackgammonNet.step!(g, a, rng)  # apply_action! + sample_chance!
-        end
+#####
+##### Bear-off accuracy benchmark (fixed 10K positions, evaluated each iteration)
+#####
 
-        if BackgammonNet.game_terminated(g)
-            r = g.reward
-            won = (wp && r > 0) || (!wp && r < 0)
-            if won
-                wins += 1
-                abs(r) >= 2 && (gammon_wins += 1)
-                abs(r) >= 3 && (bg_wins += 1)
-            else
-                abs(r) >= 2 && (gammon_losses += 1)
-                abs(r) >= 3 && (bg_losses += 1)
-            end
+"""Generate a random bear-off position (both players in home board, no contact)."""
+function _random_bearoff_board(rng)
+    # P0: distribute up to 15 checkers across points 19-24, rest are off (index 25)
+    p0 = UInt128(0)
+    remaining = rand(rng, 1:15)  # at least 1 checker on board
+    off_p0 = 15 - remaining
+    p0 = p0 | (UInt128(off_p0) << (25 << 2))  # P0 off
+    for pt in 19:23
+        c = rand(rng, 0:remaining)
+        if c > 0
+            p0 = p0 | (UInt128(c) << (pt << 2))
         end
+        remaining -= c
+    end
+    if remaining > 0
+        p0 = p0 | (UInt128(remaining) << (24 << 2))
     end
 
-    p_win = Float32(wins / n_rollouts)
-    p_gw = wins > 0 ? Float32(gammon_wins / wins) : 0f0
-    p_bgw = wins > 0 ? Float32(bg_wins / wins) : 0f0
-    losses = n_rollouts - wins
-    p_gl = losses > 0 ? Float32(gammon_losses / losses) : 0f0
-    p_bgl = losses > 0 ? Float32(bg_losses / losses) : 0f0
+    # P1: distribute up to 15 checkers across points 1-6, rest are off (index 0)
+    p1 = UInt128(0)
+    remaining = rand(rng, 1:15)
+    off_p1 = 15 - remaining
+    p1 = p1 | (UInt128(off_p1) << (0 << 2))  # P1 off
+    for pt in 1:5
+        c = rand(rng, 0:remaining)
+        if c > 0
+            p1 = p1 | (UInt128(c) << (pt << 2))
+        end
+        remaining -= c
+    end
+    if remaining > 0
+        p1 = p1 | (UInt128(remaining) << (6 << 2))
+    end
 
-    # Value: equity scaled to [-3, 3]
-    value = Float32((p_win * (1 + p_gw + p_bgw) - (1 - p_win) * (1 + p_gl + p_bgl)))
+    cp = Int8(rand(rng, 0:1))
+    dice = SVector{2, Int8}(Int8(rand(rng, 1:6)), Int8(rand(rng, 1:6)))
+    game = BackgammonNet.BackgammonGame(p0, p1, dice, Int8(1), cp, false, 0.0f0;
+                                         obs_type=:minimal_flat)
+    return game
+end
 
-    return (value=value, equity=Float32[p_win, p_gw, p_bgw, p_gl, p_bgl])
+# Pre-generate fixed 10K bear-off positions for benchmark
+const BEAROFF_EVAL_N = 10_000
+const BEAROFF_EVAL_DATA = if USE_BEAROFF
+    println("Generating $BEAROFF_EVAL_N fixed bear-off benchmark positions ...")
+    bo_rng = MersenneTwister(12345)  # Fixed seed for reproducibility
+    bo_games = [_random_bearoff_board(bo_rng) for _ in 1:BEAROFF_EVAL_N]
+
+    # Pre-vectorize into batch matrix and compute exact table values
+    bo_X = zeros(Float32, _state_dim, BEAROFF_EVAL_N)
+    bo_A = zeros(Float32, NUM_ACTIONS, BEAROFF_EVAL_N)
+    bo_exact_equity = zeros(Float32, 5, BEAROFF_EVAL_N)  # 5-way equity
+    bo_exact_value = zeros(Float32, BEAROFF_EVAL_N)       # scalar equity
+
+    for (i, g) in enumerate(bo_games)
+        vectorize_state_into!(@view(bo_X[:, i]), gspec, g)
+        if !BackgammonNet.game_terminated(g)
+            legal = BackgammonNet.legal_actions(g)
+            for a in legal
+                if 1 <= a <= NUM_ACTIONS
+                    bo_A[a, i] = 1.0f0
+                end
+            end
+        end
+        r = BearoffK6.lookup(BEAROFF_TABLE, g)
+        bo_exact_value[i] = BearoffK6.compute_equity(r)
+        bo_exact_equity[1, i] = r.p_win
+        bo_exact_equity[2, i] = r.p_gammon_win
+        bo_exact_equity[3, i] = r.p_bg_win
+        bo_exact_equity[4, i] = r.p_gammon_loss
+        bo_exact_equity[5, i] = r.p_bg_loss
+    end
+    println("  Bear-off benchmark ready ($(BEAROFF_EVAL_N) positions)")
+    flush(stdout)
+    (X=bo_X, A=bo_A, exact_equity=bo_exact_equity, exact_value=bo_exact_value)
+else
+    nothing
+end
+
+"""Evaluate NN value head accuracy on fixed bear-off positions.
+Returns (mae_equity, mae_per_head) — all mean absolute errors."""
+function eval_bearoff_accuracy(net)
+    data = BEAROFF_EVAL_DATA
+    data === nothing && return nothing
+
+    head_names = ["P(win)", "P(gw|w)", "P(bgw|w)", "P(gl|l)", "P(bgl|l)"]
+
+    if net isa FluxLib.FCResNetMultiHead
+        # Multihead: get all 5 equity heads
+        _, V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl, _ =
+            FluxLib.forward_normalized_multihead(net, data.X, data.A)
+
+        # Overall equity MAE (scalar, range [-3, +3])
+        equity_pred = FluxLib.compute_equity(V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl)
+        mae_value = Float32(mean(abs.(vec(equity_pred) .- data.exact_value)))
+
+        # Per-head MAE
+        preds = [V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl]
+        mae_heads = Float32[Float32(mean(abs.(vec(preds[h]) .- data.exact_equity[h, :]))) for h in 1:5]
+    else
+        # Single value head fallback
+        _, V̂, _ = Network.forward_normalized(net, data.X, data.A)
+        mae_value = Float32(mean(abs.(vec(V̂) .- data.exact_value)))
+        mae_heads = Float32[]
+    end
+
+    return (mae_value=mae_value, mae_heads=mae_heads, head_names=head_names)
 end
 
 #####
@@ -775,6 +901,43 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
     samples = []
     num_actions = GI.num_actions(gspec)
 
+    # Bear-off TD-bootstrap: find the first bear-off position and compute its exact
+    # equity. Use this as the value target for ALL preceding positions (lower variance
+    # than binary game outcome). Bear-off positions themselves get exact table equity.
+    first_bearoff_idx = n + 1  # sentinel: no bear-off found
+    bearoff_value_white = Float32(0)  # equity from white's perspective
+    bearoff_eq_white = zeros(Float32, 5)  # equity tuple from white's perspective
+    has_bearoff_bootstrap = false
+
+    if USE_BEAROFF
+        for i in 1:n
+            state = states[i]
+            if !is_chance[i] && state isa BackgammonNet.BackgammonGame
+                if BearoffK6.is_bearoff_position(state.p0, state.p1)
+                    first_bearoff_idx = i
+                    bo = bearoff_table_equity(state)
+                    wp = GI.white_playing(gspec, state)
+                    # Store from white's perspective for consistent sign convention
+                    bearoff_value_white = wp ? bo.value : -bo.value
+                    if wp
+                        bearoff_eq_white = bo.equity
+                    else
+                        # Flip perspective: swap win/loss conditional probs
+                        bearoff_eq_white = Float32[
+                            1.0f0 - bo.equity[1],  # P(win) for white = 1 - P(win) for black
+                            bo.equity[4],           # P(gammon|win) for white = P(gammon|loss) for black
+                            bo.equity[5],           # P(bg|win) for white = P(bg|loss) for black
+                            bo.equity[2],           # P(gammon|loss) for white = P(gammon|win) for black
+                            bo.equity[3],           # P(bg|loss) for white = P(bg|win) for black
+                        ]
+                    end
+                    has_bearoff_bootstrap = true
+                    break
+                end
+            end
+        end
+    end
+
     for i in 1:n
         state = states[i]
         policy = policies[i]
@@ -782,43 +945,59 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
         is_ch = is_chance[i]
 
         wp = GI.white_playing(gspec, state)
-        z = wp ? final_reward : -final_reward
+
+        # Value target selection:
+        # 1. Bear-off positions: exact table equity (from current player's perspective)
+        # 2. Pre-bear-off positions: bootstrap from first bear-off equity (lower variance)
+        # 3. No bear-off reached: use actual game outcome (as before)
+        if USE_BEAROFF && i >= first_bearoff_idx && !is_ch && state isa BackgammonNet.BackgammonGame &&
+                BearoffK6.is_bearoff_position(state.p0, state.p1)
+            # Bear-off position: exact table equity
+            bo = bearoff_table_equity(state)
+            z = bo.value
+            eq = bo.equity
+            has_eq = true
+        elseif has_bearoff_bootstrap && i < first_bearoff_idx
+            # Pre-bear-off: bootstrap from first bear-off equity
+            z = wp ? bearoff_value_white : -bearoff_value_white
+            if wp
+                eq = copy(bearoff_eq_white)
+            else
+                eq = Float32[
+                    1.0f0 - bearoff_eq_white[1],
+                    bearoff_eq_white[4], bearoff_eq_white[5],
+                    bearoff_eq_white[2], bearoff_eq_white[3],
+                ]
+            end
+            has_eq = true
+        else
+            # Default: actual game outcome
+            z = wp ? final_reward : -final_reward
+            eq = zeros(Float32, 5)
+            has_eq = false
+            if !isnothing(outcome)
+                has_eq = true
+                won = outcome.white_won == wp
+                if won
+                    eq[1] = 1.0f0
+                    eq[2] = outcome.is_gammon ? 1.0f0 : 0.0f0
+                    eq[3] = outcome.is_backgammon ? 1.0f0 : 0.0f0
+                else
+                    eq[4] = outcome.is_gammon ? 1.0f0 : 0.0f0
+                    eq[5] = outcome.is_backgammon ? 1.0f0 : 0.0f0
+                end
+            end
+        end
 
         state_arr = GI.vectorize_state(gspec, state)
         state_vec = Vector{Float32}(vec(state_arr))
 
         full_policy = zeros(Float32, num_actions)
         if !is_ch && !isempty(policy) && !isempty(actions)
-            # Use stored actions list directly (avoids GI.init + actions_mask)
             for (j, a) in enumerate(actions)
                 if j <= length(policy)
                     full_policy[a] = policy[j]
                 end
-            end
-        end
-
-        eq = zeros(Float32, 5)
-        has_eq = false
-        if !isnothing(outcome)
-            has_eq = true
-            won = outcome.white_won == wp
-            if won
-                eq[1] = 1.0f0
-                eq[2] = outcome.is_gammon ? 1.0f0 : 0.0f0
-                eq[3] = outcome.is_backgammon ? 1.0f0 : 0.0f0
-            else
-                eq[4] = outcome.is_gammon ? 1.0f0 : 0.0f0
-                eq[5] = outcome.is_backgammon ? 1.0f0 : 0.0f0
-            end
-        end
-
-        # Bear-off override: use rollout equity for no-contact race positions
-        if USE_BEAROFF && !is_ch && !isnothing(rng) && state isa BackgammonNet.BackgammonGame
-            if is_bearoff_race(state)
-                bo = bearoff_rollout_equity(state, BEAROFF_ROLLOUTS, rng)
-                z = bo.value
-                eq = bo.equity
-                has_eq = true
             end
         end
 
@@ -1112,9 +1291,30 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         n = length(states)
         n == 0 && return Tuple{Vector{Float32}, Float32}[]
         t0 = time_ns()
+
+        # Bear-off table: identify positions we can resolve exactly (skip NN)
+        bearoff_mask = USE_BEAROFF ? BitVector(undef, n) : nothing
+        if USE_BEAROFF
+            for i in 1:n
+                s = states[i]
+                bearoff_mask[i] = !BackgammonNet.game_terminated(s) &&
+                    !BackgammonNet.is_chance_node(s) &&
+                    BearoffK6.is_bearoff_position(s.p0, s.p1)
+            end
+        end
+
+        # Vectorize non-bearoff states for NN inference
+        nn_count = 0
+        nn_indices = Int[]  # maps NN slot → original index
         for (i, s) in enumerate(states)
-            vectorize_state_into!(@view(X_buf[:, i]), gspec, s)
-            a_col = @view(A_buf[:, i])
+            if USE_BEAROFF && bearoff_mask[i]
+                continue  # Skip NN for bear-off positions
+            end
+            nn_count += 1
+            push!(nn_indices, i)
+            slot = nn_count
+            vectorize_state_into!(@view(X_buf[:, slot]), gspec, s)
+            a_col = @view(A_buf[:, slot])
             fill!(a_col, 0.0f0)
             if !BackgammonNet.game_terminated(s)
                 legal = BackgammonNet.legal_actions(s)
@@ -1126,30 +1326,16 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
             end
         end
         t1 = time_ns()
-        local results
-        if mb_slot !== nothing
-            # GPU mailbox inference (lock-free, no channels)
-            mb_slot.n[] = n
-            mb_slot.status[] = 1  # Submit request
-            while mb_slot.status[] != 2  # Spin-wait for result
-                yield()
-            end
-            results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
-            for i in 1:n
-                legal = @view(A_buf[:, i]) .> 0
-                results[i] = (mb_slot.P_out[legal, i], mb_slot.V_out[i])
-            end
-            mb_slot.status[] = 0  # Mark idle
-        elseif USE_GPU_INFERENCE
-            # GPU inference via channel server (legacy, used for eval)
-            put!(req_chan, (wid=vworker_id, X=@view(X_buf[:, 1:n]), A=@view(A_buf[:, 1:n])))
-            results = take!(resp_chan)
+
+        # NN inference for non-bearoff states
+        local nn_results
+        if nn_count == 0
+            nn_results = Tuple{Vector{Float32}, Float32}[]
         elseif fast_bufs !== nothing
             # Allocation-free CPU inference + result pooling
-            # Forward pass: zero allocations
-            P_buf, V_buf, _ = fast_forward_normalized!(FAST_WEIGHTS, fast_bufs, X_buf, A_buf, n)
-            # Zero-alloc results: reuse pre-allocated vectors + results tuple vector
-            @inbounds for i in 1:n
+            P_buf, V_buf, _ = fast_forward_normalized!(FAST_WEIGHTS, fast_bufs, X_buf, A_buf, nn_count)
+            nn_results = Vector{Tuple{Vector{Float32}, Float32}}(undef, nn_count)
+            @inbounds for i in 1:nn_count
                 pv = fast_bufs.result_vecs[i]
                 k = 0
                 for a in 1:NUM_ACTIONS
@@ -1159,22 +1345,55 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
                     end
                 end
                 resize!(pv, k)
-                fast_bufs.results[i] = (pv, V_buf[i])
+                nn_results[i] = (pv, V_buf[i])
             end
-            results = @view(fast_bufs.results[1:n])
+        elseif mb_slot !== nothing
+            # GPU mailbox inference
+            mb_slot.n[] = nn_count
+            mb_slot.status[] = 1
+            while mb_slot.status[] != 2; yield(); end
+            nn_results = Vector{Tuple{Vector{Float32}, Float32}}(undef, nn_count)
+            for i in 1:nn_count
+                legal = @view(A_buf[:, i]) .> 0
+                nn_results[i] = (mb_slot.P_out[legal, i], mb_slot.V_out[i])
+            end
+            mb_slot.status[] = 0
+        elseif USE_GPU_INFERENCE
+            put!(req_chan, (wid=vworker_id, X=@view(X_buf[:, 1:nn_count]), A=@view(A_buf[:, 1:nn_count])))
+            nn_results = take!(resp_chan)
         else
-            # Local CPU inference (Flux — allocates intermediates)
-            X = @view(X_buf[:, 1:n])
-            A = @view(A_buf[:, 1:n])
+            # Local CPU inference (Flux)
+            X = @view(X_buf[:, 1:nn_count])
+            A = @view(A_buf[:, 1:nn_count])
             P_raw, V, _ = Network.convert_output_tuple(
                 cpu_network, Network.forward_normalized(cpu_network, X, A))
-            results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
-            for i in 1:n
+            nn_results = Vector{Tuple{Vector{Float32}, Float32}}(undef, nn_count)
+            for i in 1:nn_count
                 legal = @view(A[:, i]) .> 0
-                results[i] = (P_raw[legal, i], V[1, i])
+                nn_results[i] = (P_raw[legal, i], V[1, i])
             end
         end
         t2 = time_ns()
+
+        # Merge: combine bear-off table results with NN results
+        results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
+        nn_idx = 0
+        for i in 1:n
+            if USE_BEAROFF && bearoff_mask[i]
+                # Exact table lookup: uniform policy + exact value
+                s = states[i]
+                br = BearoffK6.lookup(BEAROFF_TABLE, s)
+                v = BearoffK6.compute_equity(br)
+                legal = BackgammonNet.legal_actions(s)
+                nl = length(legal)
+                p = fill(1.0f0 / nl, nl)  # Uniform policy
+                results[i] = (p, v)
+            else
+                nn_idx += 1
+                results[i] = nn_results[nn_idx]
+            end
+        end
+
         t_vectorize += (t1 - t0)
         t_gpu_wait += (t2 - t1)
         n_oracle_calls += 1
@@ -1929,6 +2148,26 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         @info "perf/games_per_min" value=games_per_min log_step_increment=0
         @info "perf/iter_time_s" value=iter_time log_step_increment=0
         @info "train/total_games" value=total_games log_step_increment=0
+
+        # Bear-off accuracy benchmark (fast, runs every iteration)
+        if USE_BEAROFF
+            bo_t0 = time()
+            bo_result = eval_bearoff_accuracy(network)
+            bo_time = time() - bo_t0
+            if bo_result !== nothing
+                @info "bearoff/mae_equity" value=bo_result.mae_value log_step_increment=0
+                for (h, name) in enumerate(bo_result.head_names)
+                    @info "bearoff/mae_$(name)" value=bo_result.mae_heads[h] log_step_increment=0
+                end
+                @info "bearoff/eval_time_s" value=Float32(bo_time) log_step_increment=0
+                if iter == 1 || iter % 10 == 0
+                    @info "Bear-off MAE: equity=$(round(bo_result.mae_value, digits=4)), " *
+                          "P(win)=$(round(bo_result.mae_heads[1], digits=4)) " *
+                          "($(round(bo_time*1000, digits=1))ms)"
+                    flush(stderr)
+                end
+            end
+        end
     end
 
     # Evaluation

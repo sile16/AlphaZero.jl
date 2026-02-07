@@ -1,11 +1,24 @@
 # AlphaZero.jl - Claude Code Context
 
+## Project Goal
+
+**Build a world-class SOTA backgammon AI** using AlphaZero self-play. Always use the best known approach — never settle for "good enough" when a better method exists. Document all experiments for eventual paper publication.
+
 ## Project Overview
 
 Julia implementation of AlphaZero for backgammon with:
 - Multi-head equity network (5 value heads: P(win), P(gammon|win), P(bg|win), P(gammon|loss), P(bg|loss))
 - Threaded training with CPU inference (14 workers on i7-10700K)
 - GnuBG evaluation for meaningful benchmarks
+- Exact k=6 bear-off table (5.5GB, from BackgammonNet.jl) for MCTS and training
+
+## Best Practices
+
+- **Always git commit before training runs** — store the commit hash in TensorBoard for reproducibility
+- **TensorBoard logs**: reproducibility info (git commit, command, all hyperparams) auto-logged at session start
+- **Bear-off benchmark**: 10K fixed positions evaluated every iteration — tracks value head accuracy vs exact table
+- **One change at a time** for experiments — isolate variables to know what works
+- **2000+ GnuBG eval games** (500 per matchup × 4) for reliable comparisons
 
 ## Training
 
