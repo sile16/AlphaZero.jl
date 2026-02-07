@@ -12,7 +12,11 @@ Tested 4 configurations, all using FCResNetMultiHead 128w×3b (283K params), Ada
 | **Baseline** | 50 | 3.97 | +0.94 (79%) | +0.55 (66%) | 75.0 |
 | **PER** | 50 | 4.07 | +1.08 (83%) | +0.79 (72%) | 74.4 |
 | **Reanalyze** | 50 | 3.98 | +0.97 (79%) | +0.69 (71%) | 80.0 |
-| **Bear-off** | 50 | 3.98 | +1.00 (81%) | +0.83 (72%) | 67.1 |
+| **Bear-off rollouts** | 50 | 3.98 | +1.00 (81%) | +0.83 (72%) | 67.1 |
+| Bear-off table+TD | 50 | 4.34 | +1.12 (83%) | +0.60 (65%) | ~67 |
+
+**Note**: "Bear-off rollouts" = 50 random rollouts per position (training targets only).
+"Bear-off table+TD" = exact k=6 table in MCTS self-play + TD-bootstrap for all preceding positions.
 
 ## Key Findings
 
@@ -40,12 +44,21 @@ Tested 4 configurations, all using FCResNetMultiHead 128w×3b (283K params), Ada
 - Same loss as baseline (3.98)
 - Actually faster (67.1 min vs 75 min) — unclear why, possibly faster game completion
 
+### 5. Bear-off Exact Table + TD-Bootstrap (50 iter) — Slower to Converge
+- **+0.60 vs GnuBG 1-ply** — worse than rollouts (+0.83) at 50 iter
+- Three changes combined: (1) exact k=6 table in MCTS leaf eval, (2) TD-bootstrap from first bear-off position, (3) exact table training targets
+- Loss 4.34 (higher than all others) — the softer TD-bootstrap equity targets are harder to fit than binary outcomes
+- Hypothesis: TD-bootstrap provides richer but harder-to-learn signals. May need 200+ iter to show benefit.
+- The MCTS integration changes self-play game distribution (better endgame play → different training data)
+- **Lesson: multiple simultaneous changes make it hard to isolate effects. Should have tested table-in-MCTS and TD-bootstrap separately.**
+
 ## Ranking (50-iter GnuBG 1-ply performance)
 
 1. **Bear-off rollouts**: +0.83 (72.0% win) — best
 2. **PER**: +0.79 (71.8% win) — close second
 3. **Reanalyze**: +0.69 (70.9% win) — solid improvement
-4. **Baseline**: +0.55 (65.6% win) — reference
+4. **Bear-off table+TD**: +0.60 (64.6% win) — needs more iterations
+5. **Baseline**: +0.55 (65.6% win) — reference
 
 ## Implications
 
