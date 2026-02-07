@@ -207,12 +207,7 @@ module AlphaZero
   include("scripts/scripts.jl")
   export Scripts
 
-  # Distributed training module (ZMQ-based, legacy)
-  include("distributed/Distributed.jl")
-  using .Distributed
-  export Distributed
-
-  # Cluster training module (Julia Distributed stdlib)
+  # Cluster training module (thread-based, with PER + reanalyze)
   include("cluster/Cluster.jl")
   using .Cluster
   export Cluster

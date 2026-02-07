@@ -50,6 +50,7 @@ end
 mutable struct PendingSimulation
     request_id::Int
     leaf_state::Any
+    leaf_actions::Vector{Int}       # Available actions at leaf node
     path::Vector{Tuple{Any, Int}}  # (state, action_id) pairs
     rewards::Vector{Float64}
     player_switches::Vector{Bool}
@@ -282,7 +283,7 @@ function traverse_to_leaf!(worker::AsyncWorker, game, η)
 
     while depth < max_depth
         if GI.game_terminated(game)
-            return (nothing, path, rewards, player_switches, true, 0.0)
+            return (nothing, Int[], path, rewards, player_switches, true, 0.0)
         end
 
         if GI.is_chance_node(game)
@@ -295,15 +296,16 @@ function traverse_to_leaf!(worker::AsyncWorker, game, η)
         end
 
         state = GI.current_state(game)
-        actions = GI.available_actions(game)
 
         if !haskey(env.tree, state)
-            # New leaf node - needs evaluation
-            return (state, path, rewards, player_switches, false, 0.0)
+            # New leaf node - compute actions for node creation
+            actions = GI.available_actions(game)
+            return (state, actions, path, rewards, player_switches, false, 0.0)
         end
 
-        # Existing node - select action
+        # Existing node - use cached actions (no allocation)
         info = env.tree[state]
+        actions = info.actions
         ϵ = isempty(path) ? worker.noise_ϵ : 0.0
         scores = MCTS.uct_scores(info, worker.cpuct, ϵ, η)
         action_id = argmax(scores)
@@ -327,19 +329,19 @@ function traverse_to_leaf!(worker::AsyncWorker, game, η)
     end
 
     # Depth limit
-    return (nothing, path, rewards, player_switches, true, 0.0)
+    return (nothing, Int[], path, rewards, player_switches, true, 0.0)
 end
 
 """
 Submit a leaf state for async evaluation.
 """
-function submit_for_evaluation!(worker::AsyncWorker, leaf_state, path, rewards, player_switches)
+function submit_for_evaluation!(worker::AsyncWorker, leaf_state, leaf_actions, path, rewards, player_switches)
     request_id = worker.next_request_id
     worker.next_request_id += 1
 
     # Store pending simulation
     worker.pending_sims[request_id] = PendingSimulation(
-        request_id, leaf_state, path, rewards, player_switches
+        request_id, leaf_state, leaf_actions, path, rewards, player_switches
     )
 
     # Submit to GPU server
@@ -368,7 +370,7 @@ function process_completed!(worker::AsyncWorker)
         delete!(worker.pending_sims, response.id)
 
         # Initialize leaf node in tree
-        info = MCTS.init_state_info(response.policy, response.value, 1.0)
+        info = MCTS.init_state_info(response.policy, response.value, 1.0, sim.leaf_actions)
         env.tree[sim.leaf_state] = info
 
         # Backpropagate
@@ -452,7 +454,7 @@ function async_explore!(worker::AsyncWorker, game, num_sims=nothing)
         while true
             if isready(response_queue)
                 response = take!(response_queue)
-                info = MCTS.init_state_info(response.policy, response.value, 1.0)
+                info = MCTS.init_state_info(response.policy, response.value, 1.0, actions)
                 env.tree[root_state] = info
                 break
             end
@@ -473,7 +475,7 @@ function async_explore!(worker::AsyncWorker, game, num_sims=nothing)
         # Launch new simulations if we have capacity
         while sims_launched < num_sims && length(worker.pending_sims) < max_in_flight
             game_clone = GI.clone(game)
-            leaf_state, path, rewards, player_switches, is_terminal, term_value =
+            leaf_state, leaf_actions, path, rewards, player_switches, is_terminal, term_value =
                 traverse_to_leaf!(worker, game_clone, η)
 
             if is_terminal
@@ -485,7 +487,7 @@ function async_explore!(worker::AsyncWorker, game, num_sims=nothing)
                 sims_completed += 1
             elseif leaf_state !== nothing
                 # Submit for async evaluation
-                submit_for_evaluation!(worker, leaf_state, path, rewards, player_switches)
+                submit_for_evaluation!(worker, leaf_state, leaf_actions, path, rewards, player_switches)
                 sims_launched += 1
             else
                 # Empty path terminal

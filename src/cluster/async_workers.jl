@@ -15,7 +15,7 @@ using ..AlphaZero: ReanalyzeConfig, ReanalyzeStats
 using ..AlphaZero: sample_for_reanalysis, sample_for_smart_reanalysis, count_stale_samples
 
 # Import MCTS player and related functions
-import ..AlphaZero: MctsPlayer, think, reset_player!
+import ..AlphaZero: MctsPlayer, think, select_move, reset_player!
 
 #####
 ##### Async Reanalyze Worker
@@ -392,11 +392,13 @@ Returns reward from perspective of the MCTS player.
 """
 function play_vs_random(game, player::MctsPlayer, player_is_white::Bool)
     reset_player!(player)
+    turn = 0
 
     while !GI.game_terminated(game)
+        turn += 1
         if GI.white_playing(game) == player_is_white
-            # MCTS player's turn
-            action = think(player, game)
+            # MCTS player's turn - select_move samples from think() distribution
+            action = select_move(player, game, turn)
             GI.play!(game, action)
         else
             # Random player's turn

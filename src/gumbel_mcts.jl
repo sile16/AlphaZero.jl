@@ -157,18 +157,18 @@ end
 ##### State Info Access
 #####
 
-function init_state_info(P, V, prior_temperature)
+function init_state_info(P, V, prior_temperature, actions::Vector{Int})
   P = Util.apply_temperature(P, prior_temperature)
   stats = [ActionStats(p, 0, 0) for p in P]
-  return StateInfo(stats, V)
+  return StateInfo(stats, actions, V)
 end
 
-function state_info(env::Env, state)
+function state_info(env::Env, state, actions::Vector{Int})
   if haskey(env.tree, state)
     return (env.tree[state], false)
   else
     (P, V) = env.oracle(state)
-    info = init_state_info(P, V, env.prior_temperature)
+    info = init_state_info(P, V, env.prior_temperature, actions)
     env.tree[state] = info
     return (info, true)
   end
@@ -203,7 +203,7 @@ Returns the Q-value for the root player.
 """
 function run_simulation!(env::Env, game, root_action_idx::Int; cpuct::Float64=1.0)
   state = GI.current_state(game)
-  actions = GI.available_actions(game)
+  actions = env.tree[state].actions  # Cached from root initialization
 
   # Play the root action
   root_action = actions[root_action_idx]
@@ -238,10 +238,14 @@ function run_subtree_simulation!(env::Env, game, cpuct::Float64)
   end
 
   state = GI.current_state(game)
-  actions = GI.available_actions(game)
-  info, new_node = state_info(env, state)
-
-  if new_node
+  if haskey(env.tree, state)
+    info = env.tree[state]
+    actions = info.actions
+  else
+    actions = GI.available_actions(game)
+    (P, V) = env.oracle(state)
+    info = init_state_info(P, V, env.prior_temperature, actions)
+    env.tree[state] = info
     return info.Vest
   end
 
@@ -297,7 +301,7 @@ function explore!(env::Env, game)
   n_actions = length(actions)
 
   # Get prior and value from oracle
-  info, _ = state_info(env, state)
+  info, _ = state_info(env, state, actions)
   priors = [a.P for a in info.stats]
   value_est = info.Vest
 
@@ -370,7 +374,6 @@ This gives a softer target than pure visit counts (which are very peaked
 due to sequential halving eliminating most actions).
 """
 function policy(env::Env, game)
-  actions = GI.available_actions(game)
   state = GI.current_state(game)
 
   if isempty(env.root_visits)
@@ -379,6 +382,7 @@ function policy(env::Env, game)
 
   # Get priors and value estimate
   info = env.tree[state]
+  actions = info.actions
   priors = [a.P for a in info.stats]
   value_est = Float64(info.Vest)
 

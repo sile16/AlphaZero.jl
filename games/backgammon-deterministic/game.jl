@@ -100,6 +100,28 @@ function GI.vectorize_state(::GameSpec, game::BackgammonNet.BackgammonGame)
   end
 end
 
+# In-place version: writes observation directly into buffer (zero intermediate allocation).
+# Only works for flat observation types (minimal_flat, full_flat, biased_flat).
+# For minimal_flat, bypasses observe_minimal_flat! to skip redundant fill!
+# (all 330 values are explicitly written by the encoding functions).
+function vectorize_state_into!(buf::AbstractVector{Float32}, ::GameSpec, game::BackgammonNet.BackgammonGame)
+  ot = game.obs_type
+  if ot === :minimal_flat
+    # Skip fill! — all 330 values explicitly set by encoders (verified in BackgammonNet v0.3.2+)
+    idx = BackgammonNet._encode_board_flat!(buf, game, 0)
+    idx = BackgammonNet._encode_dice_flat!(buf, game, idx, nothing)
+    idx = BackgammonNet._encode_off_flat!(buf, game, idx)
+  elseif ot === :full_flat
+    BackgammonNet.observe_full_flat!(buf, game)
+  elseif ot === :biased_flat
+    BackgammonNet.observe_biased_flat!(buf, game)
+  else
+    # Fallback: allocate and copy
+    buf .= vec(GI.vectorize_state(GameSpec(), game))
+  end
+  return buf
+end
+
 #####
 ##### Game Environment
 #####
@@ -111,9 +133,59 @@ end
 
 GI.spec(::GameEnv) = GameSpec()
 
+# Fast clone: 1 full clone instead of default's 2 (init + set_state! each clone)
+# Shares RNG to avoid MersenneTwister allocation (2496 bytes each).
+# Safe: MCTS clones are sequential within a batch, and RNG is only used for
+# chance node sampling during tree traversal (stochastic nature is acceptable).
+function GI.clone(g::GameEnv)
+  return GameEnv(BackgammonNet.clone(g.game), g.rng)
+end
+
+# Zero-allocation clone: copies game state fields into pre-allocated dst,
+# reusing dst's history/actions/sources buffers. Used by batched MCTS game pool.
+# Safe: observe() and hash/== don't use history or scratch buffers.
+function GI.clone_into!(dst::GameEnv, src::GameEnv)
+  sg = src.game
+  dg = dst.game
+  dg.p0 = sg.p0
+  dg.p1 = sg.p1
+  dg.dice = sg.dice
+  dg.remaining_actions = sg.remaining_actions
+  dg.current_player = sg.current_player
+  dg.terminated = sg.terminated
+  dg.reward = sg.reward
+  empty!(dg.history)
+  append!(dg.history, sg.history)
+  dg.doubles_only = sg.doubles_only
+  dg.obs_type = sg.obs_type
+  dg.cube_value = sg.cube_value
+  dg.cube_owner = sg.cube_owner
+  dg.phase = sg.phase
+  dg.cube_enabled = sg.cube_enabled
+  dg.my_away = sg.my_away
+  dg.opp_away = sg.opp_away
+  dg.is_crawford = sg.is_crawford
+  dg.is_post_crawford = sg.is_post_crawford
+  dg.jacoby_enabled = sg.jacoby_enabled
+  dg._actions_cached = false
+  dst.rng = src.rng
+  return dst
+end
+
 function GI.current_state(g::GameEnv)
-  # Use clone() for safe deep copy with all fields including obs_type
-  return BackgammonNet.clone(g.game)
+  # Lightweight clone: shares internal buffers (history, actions_buf, sources).
+  # Safe because MCTS tree states are read-only (only used as Dict keys and
+  # for oracle evaluation). Eliminates ~3KB allocation per clone (~10K/game).
+  game = g.game
+  return BackgammonNet.BackgammonGame(
+    game.p0, game.p1, game.dice, game.remaining_actions,
+    game.current_player, game.terminated, game.reward,
+    game.history,  # shared
+    game.doubles_only, game.obs_type,
+    game.cube_value, game.cube_owner, game.phase, game.cube_enabled,
+    game.my_away, game.opp_away, game.is_crawford, game.is_post_crawford, game.jacoby_enabled,
+    game._actions_buffer, false, game._sources_buffer1, game._sources_buffer2
+  )
 end
 
 function GI.set_state!(g::GameEnv, state::BackgammonNet.BackgammonGame)
@@ -200,6 +272,21 @@ function GI.actions_mask(g::GameEnv)
   end
 
   return mask
+end
+
+# Override default available_actions to avoid expensive collect(1:676) + indexing.
+# Returns sorted legal action indices directly from BackgammonNet.
+function GI.available_actions(g::GameEnv)
+  if BackgammonNet.game_terminated(g.game)
+    return Int[]
+  end
+  # Handle internal chance nodes
+  if BackgammonNet.is_chance_node(g.game) && !BackgammonNet.game_terminated(g.game)
+    BackgammonNet.sample_chance!(g.game, g.rng)
+  end
+  legal = BackgammonNet.legal_actions(g.game)
+  # Must be sorted to match oracle P indexing (findall order)
+  return sort!(collect(Int, action for action in legal if 1 <= action <= NUM_ACTIONS))
 end
 
 function GI.play!(g::GameEnv, action)

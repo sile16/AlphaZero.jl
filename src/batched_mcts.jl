@@ -39,6 +39,7 @@ Stores the state of a simulation that's waiting for neural network evaluation.
 """
 mutable struct PendingSimulation{S}
     leaf_state::S           # State to be evaluated
+    leaf_actions::Vector{Int}    # Available actions at leaf (for new node creation)
     path::Vector{Tuple{S, Int}}  # (state, action_id) pairs for backpropagation
     rewards::Vector{Float64}     # Rewards accumulated along path
     player_switches::Vector{Bool}  # Whether player switched at each step
@@ -59,10 +60,32 @@ mutable struct BatchedEnv{S, O}
     env::MCTS.Env{S, O}     # Underlying MCTS environment
     batch_size::Int          # Number of simulations to batch
     pending::Vector{PendingSimulation{S}}  # Simulations waiting for evaluation
+    batch_oracle::Any        # Optional: (Vector{S}) -> Vector{(P,V)} for batched GPU eval
+    game_pool::Vector{Any}   # Pre-allocated game clones for zero-alloc traversal
+    sim_pool::Vector{PendingSimulation{S}}  # Pre-allocated sim objects (reuse vectors)
+    # Pre-allocated buffers for batch_evaluate_pending! (avoid per-call allocation)
+    _eval_states::Vector{S}
+    _eval_indices::Vector{Int}
 end
 
-function BatchedEnv(env::MCTS.Env{S, O}, batch_size::Int) where {S, O}
-    BatchedEnv{S, O}(env, batch_size, PendingSimulation{S}[])
+function BatchedEnv(env::MCTS.Env{S, O}, batch_size::Int; batch_oracle=nothing) where {S, O}
+    eval_states = S[]; sizehint!(eval_states, batch_size)
+    eval_indices = Int[]; sizehint!(eval_indices, batch_size)
+    BatchedEnv{S, O}(env, batch_size, PendingSimulation{S}[], batch_oracle, [],
+                     PendingSimulation{S}[], eval_states, eval_indices)
+end
+
+"""Pre-allocate sim pool with sizehinted vectors (called once, reused forever)."""
+function _init_sim_pool!(benv::BatchedEnv{S}, game) where S
+    dummy_state = GI.current_state(game)
+    for _ in 1:benv.batch_size
+        path = Tuple{S, Int}[]; sizehint!(path, 12)
+        rewards = Float64[]; sizehint!(rewards, 12)
+        pswitches = Bool[]; sizehint!(pswitches, 12)
+        push!(benv.sim_pool, PendingSimulation{S}(
+            dummy_state, Int[], path, rewards, pswitches, false, 0.0
+        ))
+    end
 end
 
 #####
@@ -94,31 +117,29 @@ end
 #####
 
 """
-Traverse the tree until reaching a leaf node (new or terminal).
-Returns a PendingSimulation with the path taken.
-Does NOT call the oracle.
+In-place traversal: fills a pre-allocated PendingSimulation, reusing its vectors.
+Eliminates 3 vector allocations per simulation (path, rewards, player_switches).
+Uses get() + inlined virtual loss to reduce Dict lookups from 4 to 1 per node visit.
 """
-function traverse_to_leaf(benv::BatchedEnv{S}, game, η) where S
+function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game, η) where S
     env = benv.env
-    path = Tuple{S, Int}[]
-    rewards = Float64[]
-    player_switches = Bool[]
+    empty!(sim.path)
+    empty!(sim.rewards)
+    empty!(sim.player_switches)
 
     depth = 0
-    max_depth = 500  # Prevent infinite loops
+    max_depth = 500
 
     while depth < max_depth
         if GI.game_terminated(game)
-            # Terminal node - no oracle needed
-            return PendingSimulation{S}(
-                GI.current_state(game), path, rewards, player_switches,
-                false, 0.0
-            )
+            sim.leaf_state = GI.current_state(game)
+            sim.leaf_actions = Int[]
+            sim.is_new_node = false
+            sim.terminal_value = 0.0
+            return sim
         end
 
         if GI.is_chance_node(game)
-            # Handle chance node - sample and continue
-            # Note: For simplicity, we use sampling mode for batched MCTS
             outcomes = GI.chance_outcomes(game)
             probs = [p for (_, p) in outcomes]
             idx = Util.rand_categorical(probs)
@@ -128,48 +149,48 @@ function traverse_to_leaf(benv::BatchedEnv{S}, game, η) where S
         end
 
         state = GI.current_state(game)
-        actions = GI.available_actions(game)
 
-        if !haskey(env.tree, state)
-            # New node - need oracle evaluation
-            return PendingSimulation{S}(
-                state, path, rewards, player_switches,
-                true, 0.0
-            )
+        # Single Dict lookup (was: haskey + env.tree[state] = 2 lookups)
+        info = get(env.tree, state, nothing)
+        if info === nothing
+            sim.leaf_state = state
+            sim.leaf_actions = GI.available_actions(game)
+            sim.is_new_node = true
+            sim.terminal_value = 0.0
+            return sim
         end
 
-        # Existing node - select action using UCT
-        info = env.tree[state]
-        ϵ = isempty(path) ? env.noise_ϵ : 0.0  # Only add noise at root
-        scores = MCTS.uct_scores(info, env.cpuct, ϵ, η)
-        action_id = argmax(scores)
+        actions = info.actions
+        ϵ = isempty(sim.path) ? env.noise_ϵ : 0.0
+        action_id = MCTS.best_uct_action(info, env.cpuct, ϵ, η)
         action = actions[action_id]
 
-        # Apply virtual loss to discourage other traversals from same path
-        apply_virtual_loss!(env, state, action_id)
+        # Inline virtual loss (was: apply_virtual_loss! with haskey + env.tree[state] = 2 lookups)
+        @inbounds begin
+            astats = info.stats[action_id]
+            info.stats[action_id] = MCTS.ActionStats(astats.P, astats.W - VIRTUAL_LOSS, astats.N + 1)
+        end
 
-        # Record path for backpropagation
         wp = GI.white_playing(game)
-        push!(path, (state, action_id))
+        push!(sim.path, (state, action_id))
 
-        # Take action
         GI.play!(game, action)
         wr = GI.white_reward(game)
         r = wp ? wr : -wr
-        push!(rewards, r)
+        push!(sim.rewards, r)
 
         pswitch = wp != GI.white_playing(game)
-        push!(player_switches, pswitch)
+        push!(sim.player_switches, pswitch)
 
         depth += 1
         env.total_nodes_traversed += 1
     end
 
-    # Depth limit reached - treat as terminal with value 0
-    return PendingSimulation{S}(
-        GI.current_state(game), path, rewards, player_switches,
-        false, 0.0
-    )
+    sim.leaf_state = GI.current_state(game)
+    sim.leaf_actions = Int[]
+    sim.is_new_node = false
+    sim.terminal_value = 0.0
+    return sim
 end
 
 #####
@@ -180,35 +201,32 @@ end
 Evaluate all pending simulations in a single batch.
 Returns vector of (P, V) pairs.
 
-For now, we call the oracle sequentially on each state.
-The benefit comes from batching multiple simulations between oracle calls,
-reducing the synchronization overhead.
-
-TODO: Add support for true batched oracle that can evaluate multiple states
-in a single GPU call.
+When a `batch_oracle` is set, all states are evaluated in a single call
+(e.g. one GPU forward pass via RPC). Otherwise falls back to sequential oracle calls.
 """
 function batch_evaluate(benv::BatchedEnv, states::Vector)
     if isempty(states)
         return Tuple{Vector{Float32}, Float32}[]
     end
 
-    oracle = benv.env.oracle
-
-    # Call oracle on each state sequentially
-    # The benefit of batched MCTS is reducing synchronization, not batching GPU calls
-    # (that's handled separately by the batchifier when using BatchedOracle)
-    return [oracle(state) for state in states]
+    if benv.batch_oracle !== nothing
+        # Use batched oracle for GPU evaluation (all states in one call)
+        return benv.batch_oracle(states)
+    else
+        # Fall back to sequential oracle calls
+        return [benv.env.oracle(state) for state in states]
+    end
 end
 
-"""
-Evaluate pending simulations using a batched oracle call.
-"""
+"""Evaluate pending simulations using a batched oracle call."""
 function batch_evaluate_pending!(benv::BatchedEnv{S}) where S
     env = benv.env
 
-    # Collect states that need evaluation (properly typed)
-    states_to_eval = S[]
-    eval_indices = Int[]
+    # Reuse pre-allocated vectors (avoid per-call allocation)
+    states_to_eval = benv._eval_states
+    eval_indices = benv._eval_indices
+    empty!(states_to_eval)
+    empty!(eval_indices)
 
     for (i, sim) in enumerate(benv.pending)
         if sim.is_new_node
@@ -228,7 +246,7 @@ function batch_evaluate_pending!(benv::BatchedEnv{S}) where S
     for (i, result_idx) in enumerate(eval_indices)
         sim = benv.pending[result_idx]
         P, V = results[i]
-        info = MCTS.init_state_info(P, V, env.prior_temperature)
+        info = MCTS.init_state_info(P, V, env.prior_temperature, sim.leaf_actions)
         env.tree[sim.leaf_state] = info
         sim.terminal_value = V  # Store for backpropagation
     end
@@ -240,13 +258,16 @@ end
 
 """
 Backpropagate value through the path, removing virtual losses.
+Combined remove_virtual_loss + update_state_info into single Dict lookup per node
+(was: 3 lookups per node = haskey + index for remove_VL + index for update).
 """
 function backpropagate!(benv::BatchedEnv, sim::PendingSimulation)
     env = benv.env
 
-    # Get leaf value
-    if sim.is_new_node && haskey(env.tree, sim.leaf_state)
-        q = env.tree[sim.leaf_state].Vest
+    # Get leaf value (single lookup via get instead of haskey + index)
+    if sim.is_new_node
+        leaf_info = get(env.tree, sim.leaf_state, nothing)
+        q = leaf_info !== nothing ? Float64(leaf_info.Vest) : sim.terminal_value
     else
         q = sim.terminal_value
     end
@@ -257,15 +278,19 @@ function backpropagate!(benv::BatchedEnv, sim::PendingSimulation)
         reward = sim.rewards[i]
         pswitch = sim.player_switches[i]
 
-        # Remove virtual loss first
-        remove_virtual_loss!(env, state, action_id)
-
         # Compute Q-value for this step
         q = pswitch ? -q : q
         q = reward + env.gamma * q
 
-        # Update state info (adds N=1 and W=q)
-        MCTS.update_state_info!(env, state, action_id, q)
+        # Combined: remove virtual loss + update (1 lookup instead of 3)
+        # VL removal: W += VL, N -= 1; Update: W += q, N += 1; Net: W += (VL + q), N unchanged
+        info = get(env.tree, state, nothing)
+        if info !== nothing
+            @inbounds begin
+                astats = info.stats[action_id]
+                info.stats[action_id] = MCTS.ActionStats(astats.P, astats.W + VIRTUAL_LOSS + q, astats.N)
+            end
+        end
     end
 end
 
@@ -287,16 +312,47 @@ Each batch:
 function batched_explore!(benv::BatchedEnv, game, nsims)
     env = benv.env
 
-    # Generate Dirichlet noise once for root
-    η = if env.noise_α > 0
-        actions = GI.available_actions(game)
-        rand(Dirichlet(length(actions), Float64(env.noise_α)))
+    # Ensure root is in the tree before generating noise (need action count).
+    # Without this, if batch_size >= nsims, ALL simulations hit an empty tree,
+    # no actions are selected, visit counts stay at 0, and policy() returns NaN.
+    state = GI.current_state(game)
+    if !GI.game_terminated(game) && !GI.is_chance_node(game) && !haskey(env.tree, state)
+        empty!(benv.pending)
+        env.total_simulations += 1
+        # Use pool sim for root init too
+        if isempty(benv.sim_pool)
+            _init_sim_pool!(benv, game)
+        end
+        traverse_to_leaf!(benv.sim_pool[1], benv, GI.clone(game), Float64[])
+        push!(benv.pending, benv.sim_pool[1])
+        batch_evaluate_pending!(benv)
+        for s in benv.pending
+            backpropagate!(benv, s)
+        end
+        nsims -= 1
+    end
+
+    # Generate Dirichlet noise using cached actions from tree (avoids GI.available_actions)
+    η = if env.noise_α != 0 && haskey(env.tree, state)
+        n_actions = length(env.tree[state].actions)
+        rand(Dirichlet(n_actions, Float64(env.noise_α)))
+    elseif env.noise_α != 0
+        n_actions = length(GI.available_actions(game))
+        rand(Dirichlet(n_actions, Float64(env.noise_α)))
     else
         Float64[]
     end
 
     batch_size = benv.batch_size
     num_batches = cld(nsims, batch_size)  # Ceiling division
+
+    # Initialize pools on first call (reused across moves/games)
+    if isempty(benv.game_pool)
+        benv.game_pool = [GI.clone(game) for _ in 1:batch_size]
+    end
+    if isempty(benv.sim_pool)
+        _init_sim_pool!(benv, game)
+    end
 
     sims_done = 0
     for batch_idx in 1:num_batches
@@ -307,11 +363,16 @@ function batched_explore!(benv::BatchedEnv, game, nsims)
         # Clear pending simulations
         empty!(benv.pending)
 
-        # Phase 1: Traverse to leaves
-        for _ in 1:current_batch_size
+        # Phase 1: Traverse to leaves (reuse pool games + pool sims)
+        for sim_idx in 1:current_batch_size
             env.total_simulations += 1
-            game_clone = GI.clone(game)
-            sim = traverse_to_leaf(benv, game_clone, η)
+            if sim_idx <= length(benv.game_pool)
+                game_clone = GI.clone_into!(benv.game_pool[sim_idx], game)
+            else
+                game_clone = GI.clone(game)
+            end
+            sim = benv.sim_pool[sim_idx]
+            traverse_to_leaf!(sim, benv, game_clone, η)
             push!(benv.pending, sim)
         end
 
@@ -334,8 +395,8 @@ end
 """
 Create a batched MCTS environment from a regular one.
 """
-function make_batched(env::MCTS.Env, batch_size::Int)
-    return BatchedEnv(env, batch_size)
+function make_batched(env::MCTS.Env, batch_size::Int; batch_oracle=nothing)
+    return BatchedEnv(env, batch_size; batch_oracle=batch_oracle)
 end
 
 """
@@ -369,17 +430,18 @@ struct BatchedMctsPlayer{B} <: Function
 end
 
 """
-    BatchedMctsPlayer(game_spec, oracle, params; batch_size=32)
+    BatchedMctsPlayer(game_spec, oracle, params; batch_size=32, batch_oracle=nothing)
 
 Create a batched MCTS player.
 
 # Arguments
 - `game_spec`: Game specification
-- `oracle`: Neural network oracle
+- `oracle`: Neural network oracle (single-state fallback)
 - `params`: MctsParams with MCTS hyperparameters
 - `batch_size`: Number of simulations to batch together (default: 32)
+- `batch_oracle`: Optional batched oracle `(Vector{S}) -> Vector{(P,V)}` for GPU eval
 """
-function BatchedMctsPlayer(game_spec, oracle, params; batch_size=32)
+function BatchedMctsPlayer(game_spec, oracle, params; batch_size=32, batch_oracle=nothing)
     mcts = MCTS.Env(game_spec, oracle,
         gamma=params.gamma,
         cpuct=params.cpuct,
@@ -389,7 +451,7 @@ function BatchedMctsPlayer(game_spec, oracle, params; batch_size=32)
         chance_mode=params.chance_mode,
         progressive_widening_alpha=params.progressive_widening_alpha,
         prior_virtual_visits=params.prior_virtual_visits)
-    benv = BatchedEnv(mcts, batch_size)
+    benv = BatchedEnv(mcts, batch_size; batch_oracle=batch_oracle)
     return BatchedMctsPlayer(benv, params.num_iters_per_turn, batch_size, params.temperature)
 end
 

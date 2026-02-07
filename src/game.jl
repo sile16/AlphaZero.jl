@@ -443,6 +443,18 @@ function clone(game::AbstractGameEnv)
 end
 
 """
+    clone_into!(dst::AbstractGameEnv, src::AbstractGameEnv)
+
+Copy the state from `src` into `dst`, reusing `dst`'s allocated memory.
+Returns `dst`. Games can specialize this to avoid allocations.
+Default falls back to `set_state!(dst, current_state(src))`.
+"""
+function clone_into!(dst::AbstractGameEnv, src::AbstractGameEnv)
+  set_state!(dst, current_state(src))
+  return dst
+end
+
+"""
     available_actions(::AbstractGameEnv)
 
 Return the vector of all available actions.

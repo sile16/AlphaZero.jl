@@ -94,6 +94,7 @@ end
 
 struct StateInfo
   stats :: Vector{ActionStats}
+  actions :: Vector{Int} # Available actions (cached to avoid recomputing during traversal)
   Vest  :: Float32 # Value estimate given by the oracle
 end
 
@@ -125,8 +126,8 @@ mutable struct ChanceNodeInfo
 end
 
 # Constructor for backward compatibility
-function ChanceNodeInfo(outcomes::Vector{ChanceOutcomeStats}, Vest::Float32, expanded::Bool)
-  return ChanceNodeInfo(outcomes, collect(1:length(outcomes)), Vest, expanded, expanded ? length(outcomes) : 0)
+function ChanceNodeInfo(outcomes::Vector{ChanceOutcomeStats}, Vest, expanded::Bool)
+  return ChanceNodeInfo(outcomes, collect(1:length(outcomes)), Float32(Vest), expanded, expanded ? length(outcomes) : 0)
 end
 
 Ntot(c::ChanceNodeInfo) = sum(o.N for o in c.outcomes)
@@ -209,20 +210,20 @@ end
 ##### Access and initialize state information
 #####
 
-function init_state_info(P, V, prior_temperature)
+function init_state_info(P, V, prior_temperature, actions::Vector{Int})
   P = Util.apply_temperature(P, prior_temperature)
   stats = [ActionStats(p, 0, 0) for p in P]
-  return StateInfo(stats, V)
+  return StateInfo(stats, actions, V)
 end
 
 # Returns statistics for the current player, along with a boolean indicating
 # whether or not a new node has been created.
-function state_info(env, state)
+function state_info(env, state, actions::Vector{Int})
   if haskey(env.tree, state)
     return (env.tree[state], false)
   else
     (P, V) = env.oracle(state)
-    info = init_state_info(P, V, env.prior_temperature)
+    info = init_state_info(P, V, env.prior_temperature, actions)
     env.tree[state] = info
     return (info, true)
   end
@@ -240,6 +241,23 @@ function uct_scores(info::StateInfo, cpuct, ϵ, η)
     P = iszero(ϵ) ? a.P : (1-ϵ) * a.P + ϵ * η[i]
     Q + cpuct * P * sqrtNtot / (a.N + 1)
   end
+end
+
+"""Allocation-free UCT action selection: returns the action_id with highest UCT score."""
+function best_uct_action(info::StateInfo, cpuct, ϵ, η)
+  sqrtNtot = sqrt(Ntot(info))
+  best_score = -Inf
+  best_id = 1
+  @inbounds for (i, a) in enumerate(info.stats)
+    Q = a.W / max(a.N, 1)
+    P = iszero(ϵ) ? a.P : (1-ϵ) * a.P + ϵ * η[i]
+    score = Q + cpuct * P * sqrtNtot / (a.N + 1)
+    if score > best_score
+      best_score = score
+      best_id = i
+    end
+  end
+  return best_id
 end
 
 function update_state_info!(env, state, action_id, q)
@@ -273,27 +291,32 @@ end
 # Handle simulation at a decision node (original MCTS logic).
 function run_simulation_decision!(env::Env, game; η, root, depth)
   state = GI.current_state(game)
-  actions = GI.available_actions(game)
-  info, new_node = state_info(env, state)
-  if new_node
-    return info.Vest
+  if haskey(env.tree, state)
+    # Existing node: use cached actions (no allocation)
+    info = env.tree[state]
+    actions = info.actions
   else
-    ϵ = root ? env.noise_ϵ : 0.
-    scores = uct_scores(info, env.cpuct, ϵ, η)
-    action_id = argmax(scores)
-    action = actions[action_id]
-    wp = GI.white_playing(game)
-    GI.play!(game, action)
-    wr = GI.white_reward(game)
-    r = wp ? wr : -wr
-    pswitch = wp != GI.white_playing(game)
-    qnext = run_simulation!(env, game, η=η, root=false, depth=depth+1)
-    qnext = pswitch ? -qnext : qnext
-    q = r + env.gamma * qnext
-    update_state_info!(env, state, action_id, q)
-    env.total_nodes_traversed += 1
-    return q
+    # New node: compute available actions and create tree entry
+    actions = GI.available_actions(game)
+    (P, V) = env.oracle(state)
+    info = init_state_info(P, V, env.prior_temperature, actions)
+    env.tree[state] = info
+    return info.Vest
   end
+  ϵ = root ? env.noise_ϵ : 0.
+  action_id = best_uct_action(info, env.cpuct, ϵ, η)
+  action = actions[action_id]
+  wp = GI.white_playing(game)
+  GI.play!(game, action)
+  wr = GI.white_reward(game)
+  r = wp ? wr : -wr
+  pswitch = wp != GI.white_playing(game)
+  qnext = run_simulation!(env, game, η=η, root=false, depth=depth+1)
+  qnext = pswitch ? -qnext : qnext
+  q = r + env.gamma * qnext
+  update_state_info!(env, state, action_id, q)
+  env.total_nodes_traversed += 1
+  return q
 end
 
 #####
@@ -789,7 +812,6 @@ A call to this function must always be preceded by
 a call to [`MCTS.explore!`](@ref).
 """
 function policy(env::Env, game)
-  actions = GI.available_actions(game)
   state = GI.current_state(game)
   info =
     try env.tree[state]
@@ -801,9 +823,15 @@ function policy(env::Env, game)
       end
     end
   Ntot = sum(a.N for a in info.stats)
+  if Ntot == 0
+    # No visits — fall back to uniform policy over available actions
+    n = length(info.stats)
+    π = fill(1.0 / n, n)
+    return info.actions, π
+  end
   π = [a.N / Ntot for a in info.stats]
   π ./= sum(π)
-  return actions, π
+  return info.actions, π
 end
 
 """
@@ -842,8 +870,9 @@ function memory_footprint_per_node(gspec)
   # The hashtable is at most twice the number of stored elements
   # For every element, a state and a pointer are stored
   size_key = 2 * (GI.state_memsize(gspec) + sizeof(Int))
+  n = GI.num_actions(gspec)
   dummy_stats = StateInfo([
-    ActionStats(0, 0, 0) for i in 1:GI.num_actions(gspec)], 0)
+    ActionStats(0, 0, 0) for i in 1:n], collect(1:n), 0)
   size_stats = Base.summarysize(dummy_stats)
   return size_key + size_stats
 end
