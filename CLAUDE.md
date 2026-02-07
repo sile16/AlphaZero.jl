@@ -53,12 +53,17 @@ julia --project scripts/quick_eval.jl
 
 ## Performance Baselines (post-initial-position-fix, BackgammonNet v0.3.2+)
 
-All use FCResNetMultiHead 128w x 3b (283K params), MINIMAL observations, 400 MCTS sims.
+All use FCResNetMultiHead 128w x 3b (283K params), MINIMAL observations, 400 MCTS sims, AdamW lr=0.001.
 
-| Run | Config | Iters | Loss | vs Random | vs GnuBG 0-ply | vs GnuBG 1-ply |
-|-----|--------|-------|------|-----------|----------------|----------------|
-| **AdamW lr=0.001** | AdamW, wd=1e-4, α=0.3 | 50 | 5.01→3.97 | +2.19 | +0.94 (79%) | **+0.55 (66%)** |
-| AdamW lr=0.0005 | AdamW, wd=1e-4, dyn-α | 50 | 5.26→4.08 | +2.29 | +0.97 (79%) | +0.36 (59%) |
+| Experiment | Iters | Loss (final) | vs GnuBG 0-ply | vs GnuBG 1-ply | Time (min) |
+|-----------|-------|-------------|----------------|----------------|------------|
+| **Baseline** | 200 | 3.89 | +1.31 (89%) | **+1.05 (78%)** | 254.5 |
+| Baseline | 50 | 3.97 | +0.94 (79%) | +0.55 (66%) | 75.0 |
+| Bear-off rollouts | 50 | 3.98 | +1.00 (81%) | +0.83 (72%) | 67.1 |
+| PER | 50 | 4.07 | +1.08 (83%) | +0.79 (72%) | 74.4 |
+| Reanalyze | 50 | 3.98 | +0.97 (79%) | +0.69 (71%) | 80.0 |
+
+See `notes/experiment_results_20260207.md` for full analysis and raw GnuBG evaluation details.
 
 **Note**: Pre-v0.3.2 results used asymmetric initial positions and are NOT comparable.
 
@@ -85,10 +90,11 @@ All use FCResNetMultiHead 128w x 3b (283K params), MINIMAL observations, 400 MCT
 - `scripts/GnubgPlayer.jl` / `GnubgPlayerFast.jl` - GnuBG integration
 - `scripts/diagnose_loss.jl` - Per-component loss analysis across checkpoints
 
-### PER + Reanalyze Reference (in `src/cluster/`, to be ported to train_distributed.jl)
-- `src/cluster/coordinator.jl` - PER sampling, TD-error priority updates
-- `src/cluster/types.jl` - ClusterSample with priority/reanalyze fields
-- `src/cluster/async_workers.jl` - Async reanalyze and eval workers
+### PER + Reanalyze + Bear-off (implemented in train_distributed.jl)
+- PER: `--use-per` — proportional priority sampling with IS weights (α=0.6, β=0.4→1.0)
+- Reanalyze: `--use-reanalyze` — buffer reanalysis with EMA value blending (25% per iter)
+- Bear-off: `--use-bearoff` — rollout equity for no-contact race positions (50 rollouts)
+- Resume: `--resume <session_dir>` — load weights from checkpoint, continue iteration count
 
 ### Archived
 - `scripts/archive/` - Archived scripts including train_cluster.jl
@@ -110,29 +116,42 @@ Sessions saved to `sessions/distributed_YYYYMMDD_HHMMSS/` containing:
 - `final_eval_results.txt` - Final evaluation results
 
 ### Active Sessions
-- `distributed_20260206_204548` - Best run (AdamW lr=0.001, +0.55 vs GnuBG 1-ply)
-- `distributed_20260206_172527` - AdamW lr=0.0005 comparison run
+- `distributed_20260206_223524` - **Best overall** (200 iter baseline, +1.05 vs GnuBG 1-ply)
+- `distributed_20260207_061713_bearoff` - Best 50-iter (bear-off rollouts, +0.83 vs GnuBG 1-ply)
+- `distributed_20260207_030412_per` - PER experiment (+0.79 vs GnuBG 1-ply)
+- `distributed_20260207_043500_reanalyze` - Reanalyze experiment (+0.69 vs GnuBG 1-ply)
+- `distributed_20260206_204548` - Original 50-iter baseline (+0.55 vs GnuBG 1-ply)
 
 ## Key Lessons
 
-1. **Random baseline is misleading** -- always evaluate vs GnuBG
-2. **AdamW > Adam + L2 in loss** -- decoupled weight decay prevents loss explosion while maintaining play strength
-3. **Learning rate matters most** -- lr=0.001 vs 0.0005 was the main factor in GnuBG strength
-4. **inference_batch_size << mcts_iters** -- batch=400 with iters=400 → depth-1 trees → divergence
+### Training Dynamics
+1. **Training longer >> any single technique** -- 200-iter baseline (+1.05) beats all 50-iter experiments. Scale compute first.
+2. **Loss plateau ≠ strength plateau** -- loss plateaus at ~3.95 by iter 50, but GnuBG strength improves steadily through iter 200
+3. **AdamW + lr=0.001 is best optimizer config** -- decoupled weight decay prevents loss explosion
+4. **inference_batch_size << mcts_iters** -- batch=50 with iters=400 → depth ~8 (batch=400 → depth-1 → divergence)
 5. **Buffer must hold 3-5 iterations** -- too small = buffer churn → divergence
-6. **Dynamic Dirichlet unnecessary** -- fixed α=0.3 works fine for ~680 action space
-7. **MINIMAL features generalize best** -- simpler obs beats larger feature sets against GnuBG
-8. **1000+ eval games** for reliable comparisons (100-game evals show ±0.2 variance)
+
+### Technique Insights (2026-02-07 experiments)
+6. **Bear-off rollouts = best single improvement** -- +51% equity gain at 50 iter, and actually faster (better endgame targets)
+7. **PER raises loss but strengthens play** -- IS weights focus on hard positions → higher avg loss but better decisions
+8. **Reanalyze gives moderate gains** -- +25% equity gain, refreshes stale value targets, slight overhead
+9. **Bear-off + PER likely compound** -- they address orthogonal aspects (endgame accuracy vs sampling efficiency)
+
+### Evaluation
+10. **Random baseline is misleading** -- always evaluate vs GnuBG
+11. **MINIMAL features generalize best** -- simpler obs beats larger feature sets against GnuBG
+12. **2000+ eval games** for reliable comparisons (500-game matchups × 4 = 2000 total, both sides)
 
 ## Next Steps
 
-### Priority
-1. **Scale up training** -- longer runs (200+ iter), larger model (256w×10b)
-2. **Port PER + reanalyze to train_distributed.jl** -- reference implementation in `src/cluster/`
+### Priority (next experiments)
+1. **200 iter with PER + bear-off combined** -- best two techniques, test if improvements compound
+2. **Larger model (256w×10b)** -- loss plateau at ~3.95 suggests 128w×3b (283K) may be capacity-limited
+3. **200 iter with all three (PER + bear-off + reanalyze)** -- full kitchen sink if #1 shows compounding
 
 ### Future
-3. Web-based workers (WASM + WebGPU) via sibling project `/home/sile/github/tavlatalk/`
-4. Cloud remote workers for distributed self-play
-5. Match equity table (MET) for proper match play scoring
-6. Bear-off database integration
-7. Exam eval (known tricky positions)
+4. Web-based workers (WASM + WebGPU) via sibling project `/home/sile/github/tavlatalk/`
+5. Cloud remote workers for distributed self-play
+6. Match equity table (MET) for proper match play scoring
+7. Bear-off database (exact lookup vs rollouts) for endgame
+8. Exam eval (known tricky positions from GnuBG analysis)

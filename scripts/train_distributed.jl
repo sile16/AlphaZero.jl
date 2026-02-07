@@ -110,6 +110,39 @@ function parse_args()
             help = "Session directory (auto-generated if not specified)"
             arg_type = String
             default = ""
+        "--resume"
+            help = "Resume from session directory (loads weights + continues iteration count)"
+            arg_type = String
+            default = ""
+        "--use-per"
+            help = "Enable Prioritized Experience Replay"
+            action = :store_true
+        "--per-alpha"
+            help = "PER prioritization exponent (0=uniform, 1=full priority)"
+            arg_type = Float32
+            default = 0.6f0
+        "--per-beta"
+            help = "PER importance sampling initial beta (anneals to 1.0)"
+            arg_type = Float32
+            default = 0.4f0
+        "--per-epsilon"
+            help = "PER small constant for priority stability"
+            arg_type = Float32
+            default = 0.01f0
+        "--use-reanalyze"
+            help = "Enable buffer reanalysis with latest network"
+            action = :store_true
+        "--reanalyze-fraction"
+            help = "Fraction of buffer to reanalyze per iteration"
+            arg_type = Float64
+            default = 0.25
+        "--use-bearoff"
+            help = "Enable bear-off rollout value targets for endgame positions"
+            action = :store_true
+        "--bearoff-rollouts"
+            help = "Number of rollouts for bear-off value estimation"
+            arg_type = Int
+            default = 100
     end
 
     return ArgParse.parse_args(s)
@@ -131,9 +164,19 @@ const BUFFER_CAPACITY = ARGS["buffer_capacity"]
 const BATCH_SIZE = ARGS["batch_size"]
 
 # Setup session directory
-const SESSION_DIR = if isempty(ARGS["session_dir"])
+const RESUME_DIR = ARGS["resume"]
+const RESUMING = !isempty(RESUME_DIR)
+const SESSION_DIR = if RESUMING
+    RESUME_DIR
+elseif isempty(ARGS["session_dir"])
     timestamp = Dates.format(now(), "yyyymmdd_HHMMSS")
-    joinpath("sessions", "distributed_$(timestamp)")
+    # Build descriptive suffix
+    suffixes = String[]
+    ARGS["use_per"] && push!(suffixes, "per")
+    ARGS["use_reanalyze"] && push!(suffixes, "reanalyze")
+    ARGS["use_bearoff"] && push!(suffixes, "bearoff")
+    suffix = isempty(suffixes) ? "" : "_" * join(suffixes, "_")
+    joinpath("sessions", "distributed_$(timestamp)$(suffix)")
 else
     ARGS["session_dir"]
 end
@@ -146,7 +189,7 @@ mkpath(TB_DIR)
 const TB_LOGGER = TBLogger(TB_DIR, tb_append)
 
 println("=" ^ 60)
-println("Threaded AlphaZero Training")
+println(RESUMING ? "Threaded AlphaZero Training (RESUMING)" : "Threaded AlphaZero Training")
 println("=" ^ 60)
 println("Session: $SESSION_DIR")
 println("Game: $GAME_NAME")
@@ -205,6 +248,25 @@ network = FluxLib.FCResNetMultiHead(
     gspec, FluxLib.FCResNetMultiHeadHP(width=NET_WIDTH, num_blocks=NET_BLOCKS))
 if USE_GPU
     network = Network.to_gpu(network)
+end
+
+# Resume: load weights from checkpoint
+START_ITER = 0
+if RESUMING
+    ckpt_path = joinpath(RESUME_DIR, "checkpoints", "latest.data")
+    iter_path = joinpath(RESUME_DIR, "checkpoints", "iter.txt")
+    if isfile(ckpt_path)
+        FluxLib.load_weights(ckpt_path, network)
+        println("Resumed weights from: $ckpt_path")
+    else
+        error("Resume checkpoint not found: $ckpt_path")
+    end
+    if isfile(iter_path)
+        START_ITER = parse(Int, strip(read(iter_path, String)))
+        println("Resuming from iteration: $START_ITER")
+    else
+        @warn "iter.txt not found, starting from iteration 0"
+    end
 end
 
 println("Network parameters: $(sum(length, Flux.params(network)))")
@@ -619,6 +681,80 @@ function refresh_fast_weights!()
 end
 
 #####
+##### Bear-off detection and rollout
+#####
+
+const USE_BEAROFF = ARGS["use_bearoff"]
+const BEAROFF_ROLLOUTS = ARGS["bearoff_rollouts"]
+
+"""Check if a BackgammonGame position is a no-contact bear-off race.
+Both players have all checkers in their home board (or off), no bar checkers."""
+function is_bearoff_race(game::BackgammonNet.BackgammonGame)
+    p0, p1 = game.p0, game.p1
+    # Bitmask checks: any bits set in masked region means checkers outside home
+    _MASK_1_18 = BackgammonNet.MASK_1_18
+    _MASK_7_24 = BackgammonNet.MASK_7_24
+    # P0: no checkers outside home (points 1-18) and not on bar
+    p0_outside = (p0 & _MASK_1_18) != 0
+    p0_bar = BackgammonNet.get_count(p0, BackgammonNet.IDX_P0_BAR) > 0
+    if p0_outside || p0_bar; return false; end
+    # P1: no checkers outside home (points 7-24) and not on bar
+    p1_outside = (p1 & _MASK_7_24) != 0
+    p1_bar = BackgammonNet.get_count(p1, BackgammonNet.IDX_P1_BAR) > 0
+    if p1_outside || p1_bar; return false; end
+    return true
+end
+
+"""Run fast rollouts from a bear-off position to estimate equity.
+Returns (value, equity_5tuple) from current player's perspective."""
+function bearoff_rollout_equity(game::BackgammonNet.BackgammonGame, n_rollouts::Int, rng)
+    wins = 0; gammon_wins = 0; bg_wins = 0; gammon_losses = 0; bg_losses = 0
+    wp = game.current_player == 0  # white playing (P0)?
+
+    for _ in 1:n_rollouts
+        g = BackgammonNet.clone(game)
+        # Play out to completion with random dice and greedy moves
+        # Ensure we start from a non-chance state
+        if BackgammonNet.is_chance_node(g)
+            BackgammonNet.sample_chance!(g, rng)
+        end
+        max_moves = 200
+        for _ in 1:max_moves
+            BackgammonNet.game_terminated(g) && break
+            acts = BackgammonNet.legal_actions(g)
+            isempty(acts) && break
+            a = acts[1]  # First legal action (greedy bear-off)
+            BackgammonNet.step!(g, a, rng)  # apply_action! + sample_chance!
+        end
+
+        if BackgammonNet.game_terminated(g)
+            r = g.reward
+            won = (wp && r > 0) || (!wp && r < 0)
+            if won
+                wins += 1
+                abs(r) >= 2 && (gammon_wins += 1)
+                abs(r) >= 3 && (bg_wins += 1)
+            else
+                abs(r) >= 2 && (gammon_losses += 1)
+                abs(r) >= 3 && (bg_losses += 1)
+            end
+        end
+    end
+
+    p_win = Float32(wins / n_rollouts)
+    p_gw = wins > 0 ? Float32(gammon_wins / wins) : 0f0
+    p_bgw = wins > 0 ? Float32(bg_wins / wins) : 0f0
+    losses = n_rollouts - wins
+    p_gl = losses > 0 ? Float32(gammon_losses / losses) : 0f0
+    p_bgl = losses > 0 ? Float32(bg_losses / losses) : 0f0
+
+    # Value: equity scaled to [-3, 3]
+    value = Float32((p_win * (1 + p_gw + p_bgw) - (1 - p_win) * (1 + p_gl + p_bgl)))
+
+    return (value=value, equity=Float32[p_win, p_gw, p_bgw, p_gl, p_bgl])
+end
+
+#####
 ##### Helper functions
 #####
 
@@ -634,7 +770,7 @@ function sample_from_policy(policy::AbstractVector{<:Real}, rng)
     return length(policy)
 end
 
-function convert_trace_to_samples(gspec, states, policies, trace_actions, rewards, is_chance, final_reward, outcome)
+function convert_trace_to_samples(gspec, states, policies, trace_actions, rewards, is_chance, final_reward, outcome; rng=nothing)
     n = length(states)
     samples = []
     num_actions = GI.num_actions(gspec)
@@ -673,6 +809,16 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
             else
                 eq[4] = outcome.is_gammon ? 1.0f0 : 0.0f0
                 eq[5] = outcome.is_backgammon ? 1.0f0 : 0.0f0
+            end
+        end
+
+        # Bear-off override: use rollout equity for no-contact race positions
+        if USE_BEAROFF && !is_ch && !isnothing(rng) && state isa BackgammonNet.BackgammonGame
+            if is_bearoff_race(state)
+                bo = bearoff_rollout_equity(state, BEAROFF_ROLLOUTS, rng)
+                z = bo.value
+                eq = bo.equity
+                has_eq = true
             end
         end
 
@@ -1088,7 +1234,7 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         outcome = GI.game_outcome(env)
         samples = convert_trace_to_samples(
             gspec, trace_states, trace_policies, trace_actions, trace_rewards, trace_is_chance,
-            final_reward, outcome)
+            final_reward, outcome; rng=rng)
         append!(all_samples, samples)
     end
 
@@ -1397,11 +1543,102 @@ function prepare_batch(batch, num_actions, use_gpu_flag, net)
     return batch_data
 end
 
-# Replay buffer
-replay_buffer = []
+#####
+##### PER (Prioritized Experience Replay)
+#####
+
+const USE_PER = ARGS["use_per"]
+const PER_ALPHA = ARGS["per_alpha"]
+const PER_BETA_INIT = ARGS["per_beta"]
+const PER_EPSILON = ARGS["per_epsilon"]
+
+"""Prioritized Experience Replay buffer.
+Wraps a flat buffer with per-sample priorities for proportional sampling."""
+mutable struct PERBuffer
+    samples::Vector{Any}       # The actual samples
+    priorities::Vector{Float32} # Priority for each sample (|TD-error| + ε)
+    capacity::Int
+    beta::Float32              # Current IS beta (anneals to 1.0)
+    beta_init::Float32
+    beta_annealing_iters::Int
+    current_iter::Int
+end
+
+function PERBuffer(capacity::Int; beta_init=0.4f0, annealing_iters=200)
+    PERBuffer(Any[], Float32[], capacity, beta_init, beta_init, annealing_iters, 0)
+end
+
+function per_add!(buf::PERBuffer, samples, initial_priority::Float32=1.0f0)
+    append!(buf.samples, samples)
+    append!(buf.priorities, fill(initial_priority, length(samples)))
+    if length(buf.samples) > buf.capacity
+        excess = length(buf.samples) - buf.capacity
+        deleteat!(buf.samples, 1:excess)
+        deleteat!(buf.priorities, 1:excess)
+    end
+end
+
+function per_anneal_beta!(buf::PERBuffer)
+    buf.current_iter += 1
+    frac = min(1.0f0, Float32(buf.current_iter) / Float32(buf.beta_annealing_iters))
+    buf.beta = buf.beta_init + (1.0f0 - buf.beta_init) * frac
+end
+
+"""Sample from PER buffer. Returns (indices, samples, importance_weights)."""
+function per_sample(buf::PERBuffer, batch_size::Int, alpha::Float32, epsilon::Float32)
+    n = length(buf.samples)
+    n < batch_size && error("Buffer too small")
+
+    # Compute priorities^alpha
+    pα = similar(buf.priorities)
+    @inbounds for i in 1:n
+        pα[i] = (buf.priorities[i] + epsilon) ^ alpha
+    end
+    total = sum(pα)
+
+    # Proportional sampling
+    probs = pα ./ total
+    indices = Vector{Int}(undef, batch_size)
+    for j in 1:batch_size
+        r = rand(Float32) * total
+        cumsum = 0.0f0
+        idx = n  # fallback
+        @inbounds for i in 1:n
+            cumsum += pα[i]
+            if cumsum >= r
+                idx = i
+                break
+            end
+        end
+        indices[j] = idx
+    end
+
+    # Importance sampling weights: w_i = (N * P(i))^(-beta) / max(w)
+    weights = Vector{Float32}(undef, batch_size)
+    @inbounds for j in 1:batch_size
+        weights[j] = (Float32(n) * probs[indices[j]]) ^ (-buf.beta)
+    end
+    max_w = maximum(weights)
+    weights ./= max_w  # Normalize so max weight = 1.0
+
+    samples = [buf.samples[i] for i in indices]
+    return (indices, samples, weights)
+end
+
+"""Update priorities for given indices with new TD-errors."""
+function per_update_priorities!(buf::PERBuffer, indices::Vector{Int}, td_errors::Vector{Float32})
+    @inbounds for (idx, td) in zip(indices, td_errors)
+        if 1 <= idx <= length(buf.priorities)
+            buf.priorities[idx] = abs(td)
+        end
+    end
+end
+
+# Replay buffer (PER or uniform)
+replay_buffer = USE_PER ? PERBuffer(BUFFER_CAPACITY; beta_init=PER_BETA_INIT, annealing_iters=ARGS["total_iterations"]) : Any[]
 
 # Training metrics
-total_games = 0
+total_games = START_ITER * ARGS["games_per_iteration"]  # Approximate for resume
 total_samples = 0
 start_time = time()
 
@@ -1448,24 +1685,49 @@ flush(stdout)
 ##### Training loop
 #####
 
+"""Buffer length helper (works for both PER and plain array)."""
+buf_length(buf::PERBuffer) = length(buf.samples)
+buf_length(buf::Vector) = length(buf)
+
 """Train on replay buffer (GPU). Returns avg loss.
 Caps training at min(buffer_size, games_per_iter * avg_moves) / batch_size batches
 to prevent training from exceeding self-play time at large buffer sizes."""
 function train_on_buffer!(replay_buffer, network, opt_state)
-    length(replay_buffer) < BATCH_SIZE && return (avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0)
+    n_buf = buf_length(replay_buffer)
+    n_buf < BATCH_SIZE && return (avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0)
     # Cap at ~1 epoch of new data (avg ~200 samples/game × games_per_iter)
     max_batches = max(1, ARGS["games_per_iteration"] * 200 ÷ BATCH_SIZE)
-    num_batches = min(max(1, length(replay_buffer) ÷ BATCH_SIZE), max_batches)
+    num_batches = min(max(1, n_buf ÷ BATCH_SIZE), max_batches)
     total_loss = 0.0
     total_Lp = 0.0
     total_Lv = 0.0
     total_Linv = 0.0
 
+    if USE_PER && replay_buffer isa PERBuffer
+        per_anneal_beta!(replay_buffer)
+    end
+
     for _ in 1:num_batches
-        indices = rand(1:length(replay_buffer), BATCH_SIZE)
-        batch = [replay_buffer[i] for i in indices]
+        local indices, batch, is_weights
+
+        if USE_PER && replay_buffer isa PERBuffer
+            indices, batch, is_weights = per_sample(replay_buffer, BATCH_SIZE, PER_ALPHA, PER_EPSILON)
+        else
+            indices = rand(1:n_buf, BATCH_SIZE)
+            batch = USE_PER ? [replay_buffer.samples[i] for i in indices] : [replay_buffer[i] for i in indices]
+            is_weights = ones(Float32, BATCH_SIZE)
+        end
 
         batch_data = prepare_batch(batch, NUM_ACTIONS, USE_GPU, network)
+
+        # Apply importance sampling weights to sample weights
+        if USE_PER
+            W_is = reshape(Float32.(is_weights), 1, BATCH_SIZE)
+            if USE_GPU
+                W_is = Network.convert_input_tuple(network, (; W=W_is)).W
+            end
+            batch_data = merge(batch_data, (; W=batch_data.W .* W_is))
+        end
 
         Wmean = mean(batch_data.W)
         Hp = 0.0f0
@@ -1481,13 +1743,122 @@ function train_on_buffer!(replay_buffer, network, opt_state)
         total_Lp += Float64(Lp)
         total_Lv += Float64(Lv)
         total_Linv += Float64(Linv)
+
+        # Update PER priorities with TD-errors
+        if USE_PER && replay_buffer isa PERBuffer
+            # Compute per-sample value prediction vs target for TD-error
+            td_errors = compute_td_errors(network, batch_data)
+            per_update_priorities!(replay_buffer, indices, td_errors)
+        end
     end
 
     return (avg_loss=total_loss / num_batches, avg_Lp=total_Lp / num_batches,
             avg_Lv=total_Lv / num_batches, avg_Linv=total_Linv / num_batches)
 end
 
-for iter in 1:ARGS["total_iterations"]
+"""Compute per-sample TD-errors for PER priority updates."""
+function compute_td_errors(nn, batch_data)
+    X, A, V = batch_data.X, batch_data.A, batch_data.V
+
+    is_multihead = nn isa FluxLib.FCResNetMultiHead
+    if is_multihead
+        _, V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl, _ =
+            FluxLib.forward_normalized_multihead(nn, X, A)
+        # Compute equity: (P(win) + P(gammon|win) + P(bg|win)) - (P(gammon|loss) + P(bg|loss))
+        equity = FluxLib.compute_equity(V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl)
+        V̂_combined = equity ./ 3f0  # Scale to [-1, 1]
+        td = abs.(Flux.cpu(V̂_combined) .- Flux.cpu(V))
+    else
+        _, V̂, _ = Network.forward_normalized(nn, X, A)
+        td = abs.(Flux.cpu(V̂) .- Flux.cpu(V))
+    end
+
+    return Float32.(vec(td))
+end
+
+#####
+##### Reanalyze
+#####
+
+const USE_REANALYZE = ARGS["use_reanalyze"]
+const REANALYZE_FRACTION = ARGS["reanalyze_fraction"]
+
+"""Reanalyze a fraction of buffer positions with the latest network.
+Updates value targets with blended old/new values (EMA with α=0.5).
+If PER is enabled, also updates priorities."""
+function reanalyze_buffer!(replay_buffer, network)
+    samples = replay_buffer isa PERBuffer ? replay_buffer.samples : replay_buffer
+    n = length(samples)
+    n == 0 && return 0
+
+    num_to_reanalyze = max(1, round(Int, n * REANALYZE_FRACTION))
+    # Random subset (or prioritize stale samples if PER)
+    reanalyze_indices = randperm(n)[1:min(num_to_reanalyze, n)]
+
+    batch_size = min(512, length(reanalyze_indices))
+    total_updated = 0
+
+    for batch_start in 1:batch_size:length(reanalyze_indices)
+        batch_end = min(batch_start + batch_size - 1, length(reanalyze_indices))
+        batch_indices = reanalyze_indices[batch_start:batch_end]
+        batch = [samples[i] for i in batch_indices]
+
+        batch_data = prepare_batch(batch, NUM_ACTIONS, USE_GPU, network)
+
+        # Get current network's value predictions
+        is_multihead = network isa FluxLib.FCResNetMultiHead
+        if is_multihead
+            _, V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl, _ =
+                FluxLib.forward_normalized_multihead(network, batch_data.X, batch_data.A)
+            equity = FluxLib.compute_equity(V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl)
+            new_values = Float32.(vec(Flux.cpu(equity ./ 3f0)))
+
+            # Also update equity targets with EMA blend
+            new_eq_win = Float32.(vec(Flux.cpu(V̂_win)))
+            new_eq_gw = Float32.(vec(Flux.cpu(V̂_gw)))
+            new_eq_bgw = Float32.(vec(Flux.cpu(V̂_bgw)))
+            new_eq_gl = Float32.(vec(Flux.cpu(V̂_gl)))
+            new_eq_bgl = Float32.(vec(Flux.cpu(V̂_bgl)))
+        else
+            _, V̂, _ = Network.forward_normalized(network, batch_data.X, batch_data.A)
+            new_values = Float32.(vec(Flux.cpu(V̂)))
+        end
+
+        # Update each sample with blended value (EMA α=0.5)
+        α_blend = 0.5f0
+        for (j, buf_idx) in enumerate(batch_indices)
+            old = samples[buf_idx]
+            old_val = old.value
+            blended_val = (1f0 - α_blend) * old_val + α_blend * new_values[j]
+
+            if is_multihead && old.has_equity
+                old_eq = old.equity
+                new_eq = Float32[
+                    (1f0 - α_blend) * old_eq[1] + α_blend * new_eq_win[j],
+                    (1f0 - α_blend) * old_eq[2] + α_blend * new_eq_gw[j],
+                    (1f0 - α_blend) * old_eq[3] + α_blend * new_eq_bgw[j],
+                    (1f0 - α_blend) * old_eq[4] + α_blend * new_eq_gl[j],
+                    (1f0 - α_blend) * old_eq[5] + α_blend * new_eq_bgl[j],
+                ]
+                samples[buf_idx] = merge(old, (value=blended_val, equity=new_eq))
+            else
+                samples[buf_idx] = merge(old, (value=blended_val,))
+            end
+
+            # Update PER priorities
+            if replay_buffer isa PERBuffer
+                td_error = abs(new_values[j] - old_val)
+                replay_buffer.priorities[buf_idx] = td_error
+            end
+
+            total_updated += 1
+        end
+    end
+
+    return total_updated
+end
+
+for iter in (START_ITER + 1):ARGS["total_iterations"]
     iter_start = time()
 
     local new_samples, games_this_iter, avg_loss, train_result
@@ -1521,18 +1892,29 @@ for iter in 1:ARGS["total_iterations"]
     end
 
     # Update buffer
-    append!(replay_buffer, new_samples)
+    if USE_PER && replay_buffer isa PERBuffer
+        per_add!(replay_buffer, new_samples)
+    else
+        append!(replay_buffer, new_samples)
+        if length(replay_buffer) > BUFFER_CAPACITY
+            deleteat!(replay_buffer, 1:(length(replay_buffer) - BUFFER_CAPACITY))
+        end
+    end
     global total_games += games_this_iter
     global total_samples += length(new_samples)
-    if length(replay_buffer) > BUFFER_CAPACITY
-        deleteat!(replay_buffer, 1:(length(replay_buffer) - BUFFER_CAPACITY))
+
+    # Reanalyze buffer positions with latest network
+    reanalyzed_count = 0
+    if USE_REANALYZE && buf_length(replay_buffer) >= BATCH_SIZE
+        reanalyzed_count = reanalyze_buffer!(replay_buffer, network)
     end
 
+    cur_buf_size = buf_length(replay_buffer)
     iter_time = time() - iter_start
     elapsed = time() - start_time
     games_per_min = total_games / (elapsed / 60)
 
-    @info "Iteration $iter" avg_loss buffer_size=length(replay_buffer) total_games games_per_min iter_time
+    @info "Iteration $iter" avg_loss buffer_size=cur_buf_size total_games games_per_min iter_time
     flush(stdout)
     flush(stderr)
 
@@ -1543,7 +1925,7 @@ for iter in 1:ARGS["total_iterations"]
         @info "train/loss_policy" value=train_result.avg_Lp log_step_increment=0
         @info "train/loss_value" value=train_result.avg_Lv log_step_increment=0
         @info "train/loss_invalid" value=train_result.avg_Linv log_step_increment=0
-        @info "train/buffer_size" value=length(replay_buffer) log_step_increment=0
+        @info "train/buffer_size" value=cur_buf_size log_step_increment=0
         @info "perf/games_per_min" value=games_per_min log_step_increment=0
         @info "perf/iter_time_s" value=iter_time log_step_increment=0
         @info "train/total_games" value=total_games log_step_increment=0
