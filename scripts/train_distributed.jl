@@ -750,7 +750,8 @@ const BEAROFF_TABLE = if USE_BEAROFF
     end
     println("Loading k=6 bear-off table from $table_dir ...")
     t = BearoffTable(table_dir)
-    println("  Pairs: $(t.n_pairs) ($(round(length(t.data)/1e9, digits=1)) GB)")
+    println("  c14: $(t.c14_pairs) pairs ($(round(length(t.c14_data)/1e9, digits=1)) GB)")
+    println("  c15: $(t.c15_pairs) pairs ($(round(length(t.c15_data)/1e9, digits=1)) GB)")
     flush(stdout)
     t
 else
