@@ -10,7 +10,7 @@ Julia implementation of AlphaZero for backgammon with:
 - Multi-head equity network (5 value heads: P(win), P(gammon|win), P(bg|win), P(gammon|loss), P(bg|loss))
 - Threaded training with CPU inference (14 workers on i7-10700K)
 - GnuBG evaluation for meaningful benchmarks
-- Exact k=6 bear-off table (5.5GB, from BackgammonNet.jl) for MCTS and training
+- Exact k=6 bear-off table (c14: 3.0GB + c15: 5.8GB from BackgammonNet.jl) for training targets, with gammon conditionals for c15 positions
 
 ## Best Practices
 
@@ -70,13 +70,14 @@ All use FCResNetMultiHead 128w x 3b (283K params), MINIMAL observations, 400 MCT
 
 | Experiment | Iters | Loss (final) | vs GnuBG 0-ply | vs GnuBG 1-ply | Time (min) |
 |-----------|-------|-------------|----------------|----------------|------------|
-| **Baseline** | 200 | 3.89 | +1.31 (89%) | **+1.05 (78%)** | 254.5 |
-| Baseline | 50 | 3.97 | +0.94 (79%) | +0.55 (66%) | 75.0 |
+| **PER** | **200** | **3.90** | **+1.38 (92%)** | **+1.21 (82%)** | **312** |
+| Baseline | 200 | 3.89 | +1.31 (89%) | +1.05 (78%) | 254.5 |
+| PER | 50 | 4.12 | +1.06 (83%) | +0.87 (74%) | — |
 | Bear-off rollouts | 50 | 3.98 | +1.00 (81%) | +0.83 (72%) | 67.1 |
-| PER | 50 | 4.07 | +1.08 (83%) | +0.79 (72%) | 74.4 |
+| Baseline | 50 | 3.97 | +0.94 (79%) | +0.55 (66%) | 75.0 |
 | Reanalyze | 50 | 3.98 | +0.97 (79%) | +0.69 (71%) | 80.0 |
 
-See `notes/experiment_results_20260207.md` for full analysis and raw GnuBG evaluation details.
+See `notes/experiment_results_20260207.md` and `notes/experiment_results_20260209.md` for full analysis.
 
 **Note**: Pre-v0.3.2 results used asymmetric initial positions and are NOT comparable.
 
@@ -129,26 +130,28 @@ Sessions saved to `sessions/distributed_YYYYMMDD_HHMMSS/` containing:
 - `final_eval_results.txt` - Final evaluation results
 
 ### Active Sessions
-- `distributed_20260206_223524` - **Best overall** (200 iter baseline, +1.05 vs GnuBG 1-ply)
+- `distributed_20260209_215824_per` - **Best overall** (200 iter PER, +1.21 vs GnuBG 1-ply)
+- `distributed_20260206_223524` - 200 iter baseline (+1.05 vs GnuBG 1-ply)
 - `distributed_20260207_061713_bearoff` - Best 50-iter (bear-off rollouts, +0.83 vs GnuBG 1-ply)
-- `distributed_20260207_030412_per` - PER experiment (+0.79 vs GnuBG 1-ply)
+- `distributed_20260207_030412_per` - PER 50-iter experiment (+0.79 vs GnuBG 1-ply)
 - `distributed_20260207_043500_reanalyze` - Reanalyze experiment (+0.69 vs GnuBG 1-ply)
 - `distributed_20260206_204548` - Original 50-iter baseline (+0.55 vs GnuBG 1-ply)
 
 ## Key Lessons
 
 ### Training Dynamics
-1. **Training longer >> any single technique** -- 200-iter baseline (+1.05) beats all 50-iter experiments. Scale compute first.
-2. **Loss plateau ≠ strength plateau** -- loss plateaus at ~3.95 by iter 50, but GnuBG strength improves steadily through iter 200
-3. **AdamW + lr=0.001 is best optimizer config** -- decoupled weight decay prevents loss explosion
-4. **inference_batch_size << mcts_iters** -- batch=50 with iters=400 → depth ~8 (batch=400 → depth-1 → divergence)
-5. **Buffer must hold 3-5 iterations** -- too small = buffer churn → divergence
+1. **PER 200-iter is the new best** -- +1.21 vs GnuBG 1-ply (82% wins), +15% equity over baseline 200-iter (+1.05)
+2. **PER benefit compounds with training length** -- at 50 iter: +58% equity over baseline; at 200 iter: +15% equity. PER is consistently better.
+3. **Loss plateau ≠ strength plateau** -- loss plateaus at ~3.95 by iter 50, but GnuBG strength improves steadily through iter 200
+4. **AdamW + lr=0.001 is best optimizer config** -- decoupled weight decay prevents loss explosion
+5. **inference_batch_size << mcts_iters** -- batch=50 with iters=400 → depth ~8 (batch=400 → depth-1 → divergence)
+6. **Buffer must hold 3-5 iterations** -- too small = buffer churn → divergence
 
-### Technique Insights (2026-02-07 experiments)
-6. **Bear-off rollouts = best single improvement** -- +51% equity gain at 50 iter, and actually faster (better endgame targets)
-7. **PER raises loss but strengthens play** -- IS weights focus on hard positions → higher avg loss but better decisions
-8. **Reanalyze gives moderate gains** -- +25% equity gain, refreshes stale value targets, slight overhead
-9. **Bear-off + PER likely compound** -- they address orthogonal aspects (endgame accuracy vs sampling efficiency)
+### Technique Insights
+7. **PER is the single best improvement** -- raises loss but strengthens play. IS weights focus on hard positions → better decisions.
+8. **Bear-off rollouts = best 50-iter endgame improvement** -- +51% equity gain at 50 iter, actually faster (better endgame targets)
+9. **Reanalyze gives moderate gains** -- +25% equity gain, refreshes stale value targets, slight overhead
+10. **Bear-off table has signal mismatch** -- table values are pre-dice, game states are post-dice. See `notes/bearoff_chance_node_issue.md`
 
 ### Evaluation
 10. **Random baseline is misleading** -- always evaluate vs GnuBG
@@ -158,13 +161,12 @@ Sessions saved to `sessions/distributed_YYYYMMDD_HHMMSS/` containing:
 ## Next Steps
 
 ### Priority (next experiments)
-1. **200 iter with PER + bear-off combined** -- best two techniques, test if improvements compound
-2. **Larger model (256w×10b)** -- loss plateau at ~3.95 suggests 128w×3b (283K) may be capacity-limited
-3. **200 iter with all three (PER + bear-off + reanalyze)** -- full kitchen sink if #1 shows compounding
+1. **Fix bear-off table usage** -- compute post-dice values (move enumeration) or use explicit chance nodes. See `notes/bearoff_chance_node_issue.md`
+2. **PER + bear-off (200 iter)** -- combine top 2 techniques with fixed bear-off integration
+3. **Larger model (256w×10b)** -- loss plateau at ~3.95 suggests 128w×3b (283K) may be capacity-limited
 
 ### Future
 4. Web-based workers (WASM + WebGPU) via sibling project `/home/sile/github/tavlatalk/`
 5. Cloud remote workers for distributed self-play
 6. Match equity table (MET) for proper match play scoring
-7. Bear-off database (exact lookup vs rollouts) for endgame
-8. Exam eval (known tricky positions from GnuBG analysis)
+7. Exam eval (known tricky positions from GnuBG analysis)
