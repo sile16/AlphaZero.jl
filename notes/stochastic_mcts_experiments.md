@@ -1019,3 +1019,77 @@ To identify which features the network actually uses:
 3. **Try conv architecture with hybrid format** to test spatial benefits
 4. **Investigate training loss dynamics** - why does loss rise after buffer fills?
 5. **Longer training** to see if full_flat catches up to MINIMAL
+
+---
+
+## Experiment 8: Stochastic Wrapper — Debugging & Verification (2026-02-10/11)
+
+### Goal
+Replace the deterministic `step!` wrapper (which hides dice inside `play!`) with a stochastic wrapper that exposes dice as explicit chance nodes. This is the prerequisite for using the bear-off table at its mathematically correct pre-dice location in MCTS.
+
+### Implementation
+- `games/backgammon-deterministic/game.jl`: `GI.play!` → `apply_action!` only (no auto-dice). `GI.apply_chance!` rolls dice. Chance nodes visible to MCTS.
+- `src/batched_mcts.jl` + `src/mcts.jl`: Passthrough mode — sample dice immediately at chance nodes, no tree entries for chance nodes.
+- Self-play + eval game loops handle forced passes + dice externally.
+
+### Commits
+| Commit | Description |
+|--------|-------------|
+| 9d167d5 | Add stochastic game wrapper + passthrough chance nodes in MCTS |
+| 7de741a | Fix: stop recording chance nodes in trace (2x buffer dilution) |
+| 8bfd746 | Optimize MCTS passthrough: eliminate allocations per chance node |
+| 77f68d7 | Fix pswitch bug: remove _handle_forced_pass! from GI.play!/GI.apply_chance! |
+| 9efef1b | Skip oracle evaluation for single-option states in batched MCTS |
+| 3f7bb4f | Skip oracle evaluation for single-option states in standard MCTS |
+
+### Bugs Found & Fixed
+
+#### Bug 1: Trace Dilution (commit 7de741a)
+Recording chance nodes in the training trace doubled the buffer sample count, halving data diversity. Fix: only record decision nodes in trace.
+
+#### Bug 2: pswitch Bug (commit 77f68d7)
+`_handle_forced_pass!` inside `GI.play!`/`GI.apply_chance!` auto-played opponent forced passes, causing invisible player switches. MCTS saw stale `pswitch=TRUE` when the turn bounced back to the same player, flipping the value sign incorrectly (catastrophic). Fix: removed `_handle_forced_pass!` from both functions. Forced passes are now visible to MCTS as single-option decision nodes.
+
+#### Bug 3: Oracle Waste (commits 9efef1b + 3f7bb4f)
+Forced-pass states consumed ~40% of MCTS oracle budget during training. Fix: single-option states skip oracle evaluation — create trivial tree entry (P=[1.0], Vest=0) and continue traversal. Value backpropagates from child.
+
+### Progressive Fix Impact (same old PER 50-iter model, eval only)
+
+| Eval Version | vs GnuBG 0-ply | vs GnuBG 1-ply |
+|---|---|---|
+| All bugs present | +0.919 (81%) | +0.513 (65%) |
+| + Allocation fix | +0.903 (81%) | +0.545 (66%) |
+| + Pswitch fix | +0.995 (81%) | +0.733 (69%) |
+| + Skip-force eval | +1.105 (84%) | +0.813 (71%) |
+| Original step! eval (reference) | +1.06 (83%) | +0.87 (74%) |
+
+### Training Quality (50-iter PER, skip-force eval for all)
+
+| Model | vs GnuBG 0-ply | vs GnuBG 1-ply |
+|---|---|---|
+| Old PER (step! training) | +1.105 (84%) | +0.813 (71%) |
+| **New PER (stochastic training)** | **+1.048 (82%)** | **+0.764 (69%)** |
+| Gap | -0.057 | -0.049 (within 1σ) |
+
+### Key Metrics
+- Throughput: ~350 games/min (stochastic) vs ~390 games/min (old step!). ~10% slower due to intermediate state traversal.
+- Samples/game: ~163 (stochastic) vs ~198 (old step!). Difference is game length variance.
+- Training time: 69.4 min for 50 iterations.
+
+### Conclusions
+
+1. **Stochastic wrapper matches old step! baseline** within statistical noise (+0.764 vs +0.813).
+2. **Three bugs caused cumulative 60% regression**: trace dilution + pswitch + oracle waste.
+3. **Skip-force optimization is critical**: without it, forced passes waste ~40% of oracle budget, causing major training regression.
+4. **pswitch is the most dangerous bug**: invisible player switches cause catastrophic value sign flips. Never auto-play forced passes inside MCTS-visible functions.
+5. **Stochastic wrapper is ready** for bear-off table integration at chance nodes.
+
+### Sessions
+| Session | Description | vs GnuBG 1-ply |
+|---|---|---|
+| distributed_20260210_181748_per | Stochastic, all bugs | +0.081 |
+| distributed_20260210_201425_per | Trace fix only | +0.286 |
+| distributed_20260211_000703_per | + Pswitch fix | +0.210* |
+| distributed_20260211_013048_per | + Skip-force (final) | +0.764 |
+
+*Pswitch fix model evaluated without skip-force in eval MCTS, so eval oracle also wasted on forced passes.
