@@ -1435,14 +1435,10 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         trace_is_chance = Bool[]
 
         while !GI.game_terminated(env)
-            # Handle chance nodes: record state for value-head training, then sample dice
+            # Handle chance nodes: sample dice and continue (don't record in trace)
+            # Recording chance nodes doubles buffer samples and halves data diversity,
+            # causing severe regression. Keep trace = decision nodes only.
             if GI.is_chance_node(env)
-                state = GI.current_state(env)
-                push!(trace_states, state)
-                push!(trace_policies, Float32[])
-                push!(trace_actions, Int[])
-                push!(trace_is_chance, true)
-                push!(trace_rewards, 0.0f0)
                 outcomes = GI.chance_outcomes(env)
                 idx = _sample_chance(rng, outcomes)
                 GI.apply_chance!(env, outcomes[idx][1])
