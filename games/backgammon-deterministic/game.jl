@@ -230,10 +230,14 @@ function GI.is_chance_node(g::GameEnv)
   return BackgammonNet.is_chance_node(g.game)
 end
 
+# Cache chance outcomes to avoid per-call allocation (21 outcomes are always the same)
+# BackgammonNet.DICE_OUTCOMES and DICE_PROBS are module constants
+const _CACHED_OUTCOMES = Tuple{Int, Float64}[
+  (i, Float64(BackgammonNet.DICE_PROBS[i])) for i in 1:21
+]
+
 function GI.chance_outcomes(g::GameEnv)
-  # BackgammonNet returns Vector{Tuple{Int, Float32}}, convert to Float64
-  outcomes = BackgammonNet.chance_outcomes(g.game)
-  return [(idx, Float64(p)) for (idx, p) in outcomes]
+  return _CACHED_OUTCOMES
 end
 
 const PASS_ACTION = BackgammonNet.encode_action(25, 25)
