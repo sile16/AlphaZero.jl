@@ -190,11 +190,23 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
         # Single Dict lookup (was: haskey + env.tree[state] = 2 lookups)
         info = get(env.tree, state, nothing)
         if info === nothing
-            sim.leaf_state = state
-            sim.leaf_actions = GI.available_actions(game)
-            sim.is_new_node = true
-            sim.terminal_value = 0.0
-            return sim
+            leaf_actions = GI.available_actions(game)
+
+            # Single-option states (e.g., forced PASS): create trivial tree entry
+            # and continue traversal. No oracle evaluation needed since P=[1.0]
+            # and the value will come from the child via backpropagation.
+            if length(leaf_actions) == 1
+                stats = [MCTS.ActionStats(Float32(1.0), Float64(0), 0)]
+                info = MCTS.StateInfo(stats, leaf_actions, Float32(0))
+                env.tree[state] = info
+                # Fall through to normal traversal below (info is now set)
+            else
+                sim.leaf_state = state
+                sim.leaf_actions = leaf_actions
+                sim.is_new_node = true
+                sim.terminal_value = 0.0
+                return sim
+            end
         end
 
         actions = info.actions
