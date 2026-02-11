@@ -1445,6 +1445,16 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
                 continue
             end
 
+            # Auto-play forced single-option states (e.g., forced PASS)
+            # Forced passes must NOT be auto-played inside GI.play!/GI.apply_chance!
+            # because MCTS pswitch would see stale player info when the turn bounces
+            # back to the same player. Here in the game loop, it's safe.
+            avail = GI.available_actions(env)
+            if length(avail) == 1
+                GI.play!(env, avail[1])
+                continue
+            end
+
             # Decision node: MCTS think + record trace
             state = GI.current_state(env)
             push!(trace_states, state)
@@ -1574,11 +1584,17 @@ function _eval_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
                 outcomes = GI.chance_outcomes(env)
                 idx = _sample_chance(rng, outcomes)
                 GI.apply_chance!(env, outcomes[idx][1])
-            elseif play_as_white == GI.white_playing(env)
-                actions, policy = BatchedMCTS.think(eval_player, env)
-                GI.play!(env, actions[argmax(policy)])
             else
-                GI.play!(env, rand(rng, GI.available_actions(env)))
+                avail = GI.available_actions(env)
+                if length(avail) == 1
+                    # Auto-play forced single-option states (e.g., forced PASS)
+                    GI.play!(env, avail[1])
+                elseif play_as_white == GI.white_playing(env)
+                    actions, policy = BatchedMCTS.think(eval_player, env)
+                    GI.play!(env, actions[argmax(policy)])
+                else
+                    GI.play!(env, rand(rng, avail))
+                end
             end
         end
 

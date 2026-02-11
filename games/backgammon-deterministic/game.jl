@@ -256,7 +256,11 @@ end
 
 function GI.apply_chance!(g::GameEnv, outcome)
   BackgammonNet.apply_chance!(g.game, outcome)
-  _handle_forced_pass!(g)
+  # NOTE: Do NOT call _handle_forced_pass! here. Forced passes must be visible
+  # to MCTS as single-option decision nodes so that pswitch (player perspective
+  # tracking) correctly handles each player switch individually. If forced passes
+  # are auto-played here, MCTS sees stale pswitch when the turn bounces back
+  # to the same player (value sign is flipped incorrectly).
 end
 
 #####
@@ -295,8 +299,8 @@ end
 
 function GI.play!(g::GameEnv, action)
   # Apply action only (no auto-dice-roll). Leaves game at chance node or decision node.
+  # NOTE: Do NOT call _handle_forced_pass! here. See apply_chance! comment.
   BackgammonNet.apply_action!(g.game, action)
-  _handle_forced_pass!(g)
 end
 
 #####

@@ -130,15 +130,23 @@ end
             continue
         end
 
+        # Auto-play forced single-option states (e.g., forced PASS)
+        # to avoid wasting MCTS budget on obvious decisions
+        actions = GI.available_actions(env)
+        if length(actions) == 1
+            GI.play!(env, actions[1])
+            continue
+        end
+
         is_white = GI.white_playing(env)
         use_az = (is_white && az_is_white) || (!is_white && !az_is_white)
 
         if use_az
-            actions, π = AlphaZero.think(az_player, env)
-            action = actions[argmax(π)]
+            actions_az, π = AlphaZero.think(az_player, env)
+            action = actions_az[argmax(π)]
         else
-            actions, π = AlphaZero.think(gnubg_player, env)
-            action = actions[argmax(π)]
+            actions_gnubg, π = AlphaZero.think(gnubg_player, env)
+            action = actions_gnubg[argmax(π)]
         end
         GI.play!(env, action)
     end

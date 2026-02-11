@@ -352,8 +352,8 @@ Four modes controlled by env.chance_mode:
 """
 function run_simulation_chance!(env::Env, game; η, root, depth)
   if env.chance_mode == :passthrough
-    # Passthrough: sample one outcome, continue as if deterministic.
-    # No tree entry, no NN eval at chance node. Allocation-free inline sampling.
+    # Passthrough: sample one dice outcome, apply, continue to decision node.
+    # Uses default RNG (matching old step! behavior which used Random.default_rng()).
     outcomes = GI.chance_outcomes(game)
     r_val = rand()
     idx = length(outcomes)
