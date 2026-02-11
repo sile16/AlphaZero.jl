@@ -27,8 +27,14 @@ for g in 1:200
     game = GI.init(gspec)
     states = []; is_chance_flags = Bool[]
     while !GI.game_terminated(game)
+        if GI.is_chance_node(game)
+            outcomes = GI.chance_outcomes(game)
+            outcome = outcomes[rand(1:length(outcomes))][1]
+            GI.apply_chance!(game, outcome)
+            continue
+        end
         push!(states, GI.current_state(game))
-        push!(is_chance_flags, GI.is_chance_node(game))
+        push!(is_chance_flags, false)
         actions = GI.available_actions(game)
         GI.play!(game, rand(actions))
     end

@@ -1,10 +1,10 @@
 #####
-##### Backgammon (Deterministic) - AlphaZero.jl wrapper for BackgammonNet.jl
+##### Backgammon (Stochastic) - AlphaZero.jl wrapper for BackgammonNet.jl
 #####
 #
-# This is the DETERMINISTIC version where dice rolls are handled automatically.
-# Stochasticity is hidden inside step! - MCTS never sees chance nodes.
-# This matches the "standard" AlphaZero approach for stochastic games.
+# Dice rolls are exposed as explicit chance nodes. MCTS sees chance nodes
+# and can use the bear-off table at its mathematically correct location
+# (pre-dice, where table values = E[equity | board]).
 #
 # Configuration:
 # - short_game=true: Faster games with pieces closer to bearing off
@@ -86,8 +86,8 @@ function GI.actions(::GameSpec)
   return collect(1:NUM_ACTIONS)
 end
 
-# NO chance outcomes - stochasticity is hidden
-GI.num_chance_outcomes(::GameSpec) = 0
+# 21 dice outcomes (6 doubles + 15 non-doubles)
+GI.num_chance_outcomes(::GameSpec) = 21
 
 function GI.vectorize_state(::GameSpec, game::BackgammonNet.BackgammonGame)
   # Use observe() which dispatches based on game.obs_type
@@ -192,11 +192,6 @@ function GI.set_state!(g::GameEnv, state::BackgammonNet.BackgammonGame)
   # Clone the state into our game
   cloned = BackgammonNet.clone(state)
   g.game = cloned
-
-  # If at chance node, auto-roll to get to player turn
-  if BackgammonNet.is_chance_node(g.game) && !BackgammonNet.game_terminated(g.game)
-    BackgammonNet.sample_chance!(g.game, g.rng)
-  end
 end
 
 GI.white_playing(g::GameEnv) = g.game.current_player == 0
@@ -228,22 +223,36 @@ function GI.white_reward(g::GameEnv)
 end
 
 #####
-##### NO Chance Node Interface (deterministic version)
+##### Chance Node Interface (stochastic — dice exposed)
 #####
 
 function GI.is_chance_node(g::GameEnv)
-  # Never expose chance nodes - always return false
-  return false
+  return BackgammonNet.is_chance_node(g.game)
 end
 
 function GI.chance_outcomes(g::GameEnv)
-  # Should never be called since is_chance_node always returns false
-  return Tuple{Int, Float64}[]
+  # BackgammonNet returns Vector{Tuple{Int, Float32}}, convert to Float64
+  outcomes = BackgammonNet.chance_outcomes(g.game)
+  return [(idx, Float64(p)) for (idx, p) in outcomes]
+end
+
+const PASS_ACTION = BackgammonNet.encode_action(25, 25)
+
+"""Handle forced passes (auto-play when only move is pass|pass)."""
+function _handle_forced_pass!(g::GameEnv)
+  while !BackgammonNet.game_terminated(g.game) && !BackgammonNet.is_chance_node(g.game)
+    legal = BackgammonNet.legal_actions(g.game)
+    if length(legal) == 1 && legal[1] == PASS_ACTION
+      BackgammonNet.apply_action!(g.game, PASS_ACTION)
+    else
+      break
+    end
+  end
 end
 
 function GI.apply_chance!(g::GameEnv, outcome)
-  # Should never be called
-  error("apply_chance! should not be called in deterministic mode")
+  BackgammonNet.apply_chance!(g.game, outcome)
+  _handle_forced_pass!(g)
 end
 
 #####
@@ -253,12 +262,7 @@ end
 function GI.actions_mask(g::GameEnv)
   mask = falses(NUM_ACTIONS)
 
-  # Handle internal chance nodes by auto-rolling (shouldn't happen after init)
-  if BackgammonNet.is_chance_node(g.game) && !BackgammonNet.game_terminated(g.game)
-    BackgammonNet.sample_chance!(g.game, g.rng)
-  end
-
-  if BackgammonNet.game_terminated(g.game)
+  if BackgammonNet.game_terminated(g.game) || BackgammonNet.is_chance_node(g.game)
     return mask
   end
 
@@ -277,12 +281,8 @@ end
 # Override default available_actions to avoid expensive collect(1:676) + indexing.
 # Returns sorted legal action indices directly from BackgammonNet.
 function GI.available_actions(g::GameEnv)
-  if BackgammonNet.game_terminated(g.game)
+  if BackgammonNet.game_terminated(g.game) || BackgammonNet.is_chance_node(g.game)
     return Int[]
-  end
-  # Handle internal chance nodes
-  if BackgammonNet.is_chance_node(g.game) && !BackgammonNet.game_terminated(g.game)
-    BackgammonNet.sample_chance!(g.game, g.rng)
   end
   legal = BackgammonNet.legal_actions(g.game)
   # Must be sorted to match oracle P indexing (findall order)
@@ -290,8 +290,9 @@ function GI.available_actions(g::GameEnv)
 end
 
 function GI.play!(g::GameEnv, action)
-  # Use step! which applies action AND auto-rolls dice for next turn
-  BackgammonNet.step!(g.game, action, g.rng)
+  # Apply action only (no auto-dice-roll). Leaves game at chance node or decision node.
+  BackgammonNet.apply_action!(g.game, action)
+  _handle_forced_pass!(g)
 end
 
 #####
@@ -301,7 +302,7 @@ end
 function GI.render(g::GameEnv)
   game = g.game
   println("=" ^ 50)
-  println("Backgammon DETERMINISTIC (short_game=$SHORT_GAME, doubles=$DOUBLES_ONLY)")
+  println("Backgammon STOCHASTIC (short_game=$SHORT_GAME, doubles=$DOUBLES_ONLY)")
   println("Observation type: $(game.obs_type) ($(OBS_SIZE) features)")
   println("-" ^ 50)
 
@@ -321,6 +322,9 @@ function GI.render(g::GameEnv)
     mult = abs(game.reward)
     wtype = mult == 1 ? "single" : (mult == 2 ? "gammon" : "backgammon")
     println("Game Over! $winner wins ($wtype)")
+  elseif BackgammonNet.is_chance_node(game)
+    player = game.current_player == 0 ? "Player 0" : "Player 1"
+    println("$player's turn - Waiting for dice roll (chance node)")
   else
     player = game.current_player == 0 ? "Player 0" : "Player 1"
     d1, d2 = game.dice

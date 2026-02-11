@@ -354,7 +354,14 @@ function run_simulation_chance!(env::Env, game; η, root, depth)
   state = GI.current_state(game)
   wp = GI.white_playing(game)  # Player who will act AFTER the chance event
 
-  if env.chance_mode == :sampling
+  if env.chance_mode == :passthrough
+    # Passthrough: sample one outcome, continue as if deterministic.
+    # No tree entry, no NN eval at chance node. Equivalent to old deterministic wrapper.
+    outcomes = GI.chance_outcomes(game)
+    idx = Util.rand_categorical([p for (_, p) in outcomes])
+    GI.apply_chance!(game, outcomes[idx][1])
+    return run_simulation!(env, game, η=η, root=false, depth=depth)
+  elseif env.chance_mode == :sampling
     return run_simulation_chance_sampling!(env, game, state, η, depth)
   elseif env.chance_mode == :stratified
     return run_simulation_chance_stratified!(env, game, state, η, depth)

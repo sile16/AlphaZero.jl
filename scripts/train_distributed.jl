@@ -767,6 +767,23 @@ function bearoff_table_equity(game::BackgammonNet.BackgammonGame)
     return (value=value, equity=eq)
 end
 
+"""Create bear-off evaluator for MCTS chance nodes.
+Returns exact pre-dice value at bear-off chance nodes, nothing otherwise.
+Value is from current player's perspective (matches MCTS terminal_value convention)."""
+function make_bearoff_evaluator(table)
+    table === nothing && return nothing
+    return function(game_env)
+        bg = game_env.game  # Unwrap GameEnv → BackgammonGame
+        if BearoffK6.is_bearoff_position(bg.p0, bg.p1)
+            r = BearoffK6.lookup(table, bg)
+            return Float64(BearoffK6.compute_equity(r))
+        end
+        return nothing
+    end
+end
+
+const BEAROFF_EVALUATOR = USE_BEAROFF ? make_bearoff_evaluator(BEAROFF_TABLE) : nothing
+
 #####
 ##### Bear-off accuracy benchmark (fixed 10K positions, evaluated each iteration)
 #####
@@ -987,8 +1004,10 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
             end
         end
 
-        # Bear-off positions only: replace with exact table equity (training targets only)
-        if USE_BEAROFF && !is_ch && state isa BackgammonNet.BackgammonGame &&
+        # Bear-off positions: replace with exact table equity (training targets only)
+        # For chance nodes (pre-dice), table is mathematically exact.
+        # For decision nodes (post-dice), table is noisy but unbiased.
+        if USE_BEAROFF && state isa BackgammonNet.BackgammonGame &&
                 BearoffK6.is_bearoff_position(state.p0, state.p1)
             bo = bearoff_table_equity(state)
             z = wp ? bo.value : -bo.value
@@ -1281,6 +1300,19 @@ flush(stdout)
 ##### Worker functions (self-contained, run on worker threads)
 #####
 
+"""Sample a chance outcome index from (outcome, probability) pairs."""
+function _sample_chance(rng, outcomes)
+    r = rand(rng)
+    acc = 0.0
+    @inbounds for i in eachindex(outcomes)
+        acc += outcomes[i][2]
+        if r <= acc
+            return i
+        end
+    end
+    return length(outcomes)
+end
+
 """Core game-playing loop. Uses GPU mailbox inference, channel server, or local CPU inference."""
 function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
                           req_chan::Channel, resp_chan::Channel, rng::MersenneTwister;
@@ -1386,7 +1418,8 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         dirichlet_noise_α=0.3)
     player = BatchedMCTS.BatchedMctsPlayer(
         gspec, single_oracle, mcts_params;
-        batch_size=INFERENCE_BATCH_SIZE, batch_oracle=batch_oracle)
+        batch_size=INFERENCE_BATCH_SIZE, batch_oracle=batch_oracle,
+        bearoff_evaluator=BEAROFF_EVALUATOR)
 
     all_samples = []
     while Threads.atomic_add!(games_claimed, 1) < total_games
@@ -1402,25 +1435,33 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         trace_is_chance = Bool[]
 
         while !GI.game_terminated(env)
-            state = GI.current_state(env)
-            push!(trace_states, state)
-
+            # Handle chance nodes: record state for value-head training, then sample dice
             if GI.is_chance_node(env)
+                state = GI.current_state(env)
+                push!(trace_states, state)
                 push!(trace_policies, Float32[])
                 push!(trace_actions, Int[])
                 push!(trace_is_chance, true)
-                GI.play!(env, rand(rng, GI.available_actions(env)))
-            else
-                t_m0 = time_ns()
-                actions, policy = BatchedMCTS.think(player, env)
-                t_m1 = time_ns()
-                t_mcts_cpu += (t_m1 - t_m0)
-                push!(trace_policies, Float32.(policy))
-                push!(trace_actions, actions)
-                push!(trace_is_chance, false)
-                action = actions[sample_from_policy(policy, rng)]
-                GI.play!(env, action)
+                push!(trace_rewards, 0.0f0)
+                outcomes = GI.chance_outcomes(env)
+                idx = _sample_chance(rng, outcomes)
+                GI.apply_chance!(env, outcomes[idx][1])
+                continue
             end
+
+            # Decision node: MCTS think + record trace
+            state = GI.current_state(env)
+            push!(trace_states, state)
+
+            t_m0 = time_ns()
+            actions, policy = BatchedMCTS.think(player, env)
+            t_m1 = time_ns()
+            t_mcts_cpu += (t_m1 - t_m0)
+            push!(trace_policies, Float32.(policy))
+            push!(trace_actions, actions)
+            push!(trace_is_chance, false)
+            action = actions[sample_from_policy(policy, rng)]
+            GI.play!(env, action)
 
             push!(trace_rewards, 0.0f0)
         end
@@ -1522,7 +1563,8 @@ function _eval_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         dirichlet_noise_α=1.0)
     eval_player = BatchedMCTS.BatchedMctsPlayer(
         gspec, single_oracle, eval_mcts_params;
-        batch_size=INFERENCE_BATCH_SIZE, batch_oracle=batch_oracle)
+        batch_size=INFERENCE_BATCH_SIZE, batch_oracle=batch_oracle,
+        bearoff_evaluator=BEAROFF_EVALUATOR)
 
     rewards = Float64[]
     while Threads.atomic_add!(games_claimed, 1) < total_games
@@ -1533,7 +1575,9 @@ function _eval_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
 
         while !GI.game_terminated(env)
             if GI.is_chance_node(env)
-                GI.play!(env, rand(rng, GI.available_actions(env)))
+                outcomes = GI.chance_outcomes(env)
+                idx = _sample_chance(rng, outcomes)
+                GI.apply_chance!(env, outcomes[idx][1])
             elseif play_as_white == GI.white_playing(env)
                 actions, policy = BatchedMCTS.think(eval_player, env)
                 GI.play!(env, actions[argmax(policy)])
@@ -2117,10 +2161,13 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     # TensorBoard logging
     with_logger(TB_LOGGER) do
         set_step!(TB_LOGGER, iter)
-        @info "train/loss" value=avg_loss log_step_increment=0
-        @info "train/loss_policy" value=train_result.avg_Lp log_step_increment=0
-        @info "train/loss_value" value=train_result.avg_Lv log_step_increment=0
-        @info "train/loss_invalid" value=train_result.avg_Linv log_step_increment=0
+        # Only log loss metrics when actual training happened (skip iter 1 with empty buffer)
+        if avg_loss > 0
+            @info "train/loss" value=avg_loss log_step_increment=0
+            @info "train/loss_policy" value=train_result.avg_Lp log_step_increment=0
+            @info "train/loss_value" value=train_result.avg_Lv log_step_increment=0
+            @info "train/loss_invalid" value=train_result.avg_Linv log_step_increment=0
+        end
         @info "train/buffer_size" value=cur_buf_size log_step_increment=0
         @info "perf/games_per_min" value=games_per_min log_step_increment=0
         @info "perf/iter_time_s" value=iter_time log_step_increment=0

@@ -1,6 +1,8 @@
-# Bear-off Table: Chance Node Issue
+# Bear-off Table: Chance Node Issue (FIXED)
 
-## The Problem
+**Status**: Fixed — game wrapper now exposes chance nodes, MCTS uses bear-off table at pre-dice chance nodes.
+
+## The Problem (historical)
 
 Bear-off table values are **pre-dice expectations**: E[equity | board_position], averaged over all 21 possible dice outcomes. They are valid at **chance nodes** (before dice are rolled).
 
@@ -68,3 +70,20 @@ Option B is the most practical near-term fix. It gives exact post-dice values wi
 ## Key Insight
 
 The bear-off table is a **state-value function V(s)** at chance nodes. To use it at decision nodes (post-dice), we need **Q(s, dice) = max_move V(result(s, dice, move))** — which requires move enumeration.
+
+## Future Ideas
+
+### A. Stochastic Nodes for Bear-off Table
+
+The bear-off table is pre-dice, so the correct integration requires stochastic (chance) nodes in MCTS at bear-off positions. The MCTS infrastructure already supports this (`src/mcts.jl` has 4 chance node modes), but the deterministic game wrapper hides all dice rolls. To use the table correctly, we need to expose chance nodes — at minimum for bear-off positions, ideally for all positions long-term. This is a prerequisite for any proper bear-off table integration.
+
+### B. Race-Only Evaluation via Contact NN
+
+Currently we evaluate against GnuBG over full games (opening → contact → race → bear-off). This conflates contact play with race/endgame play. To isolate race evaluation:
+
+1. Run ~1000 full self-play games using the contact NN
+2. Capture the board state at the moment each game transitions from contact to pure race
+3. Use these captured race starting positions as a fixed eval set
+4. Play out just the race portion against GnuBG from each starting position
+
+This gives a **race-specific GnuBG benchmark** using realistic race positions (not synthetic ones). The starting positions come from the contact NN's actual game distribution, so they reflect the kinds of races the model actually reaches. This would let us measure endgame improvement independently from opening/middlegame strength.

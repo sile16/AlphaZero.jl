@@ -22,6 +22,12 @@ We do:
 
 This reduces neural network calls from N to ceil(N/batch_size) and uses
 larger batch sizes for better GPU utilization.
+
+Chance nodes (stochastic events like dice rolls) are stored as explicit nodes
+as passthrough: dice are sampled immediately and traversal continues to decision node
+is sampled. On revisit, an outcome is sampled by probability and traversal
+continues into the child. No NN evaluation at chance nodes — values propagate
+up from child decision nodes.
 """
 module BatchedMCTS
 
@@ -48,6 +54,10 @@ mutable struct PendingSimulation{S}
 end
 
 #####
+##### Chance node storage
+#####
+
+#####
 ##### Batched MCTS Environment
 #####
 
@@ -66,13 +76,16 @@ mutable struct BatchedEnv{S, O}
     # Pre-allocated buffers for batch_evaluate_pending! (avoid per-call allocation)
     _eval_states::Vector{S}
     _eval_indices::Vector{Int}
+    # Bear-off evaluator: (game) -> Union{Float64, Nothing}
+    bearoff_evaluator::Any
 end
 
-function BatchedEnv(env::MCTS.Env{S, O}, batch_size::Int; batch_oracle=nothing) where {S, O}
+function BatchedEnv(env::MCTS.Env{S, O}, batch_size::Int; batch_oracle=nothing, bearoff_evaluator=nothing) where {S, O}
     eval_states = S[]; sizehint!(eval_states, batch_size)
     eval_indices = Int[]; sizehint!(eval_indices, batch_size)
     BatchedEnv{S, O}(env, batch_size, PendingSimulation{S}[], batch_oracle, [],
-                     PendingSimulation{S}[], eval_states, eval_indices)
+                     PendingSimulation{S}[], eval_states, eval_indices,
+                     bearoff_evaluator)
 end
 
 """Pre-allocate sim pool with sizehinted vectors (called once, reused forever)."""
@@ -120,6 +133,9 @@ end
 In-place traversal: fills a pre-allocated PendingSimulation, reusing its vectors.
 Eliminates 3 vector allocations per simulation (path, rewards, player_switches).
 Uses get() + inlined virtual loss to reduce Dict lookups from 4 to 1 per node visit.
+
+Chance nodes use passthrough: sample one outcome, apply, continue to decision node.
+No tree entry or backprop path entry for chance nodes. Equivalent to old deterministic wrapper.
 """
 function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game, η) where S
     env = benv.env
@@ -140,11 +156,32 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
         end
 
         if GI.is_chance_node(game)
+            # Bear-off table: return exact value if available at chance node
+            if benv.bearoff_evaluator !== nothing
+                val = benv.bearoff_evaluator(game)
+                if val !== nothing
+                    sim.leaf_state = GI.current_state(game)
+                    sim.leaf_actions = Int[]
+                    sim.is_new_node = false
+                    sim.terminal_value = val
+                    return sim
+                end
+            end
+
+            # Passthrough: sample one outcome, continue to decision node.
+            # No tree entry, no backprop path entry. Equivalent to old deterministic wrapper.
             outcomes = GI.chance_outcomes(game)
-            probs = [p for (_, p) in outcomes]
-            idx = Util.rand_categorical(probs)
-            outcome, _ = outcomes[idx]
-            GI.apply_chance!(game, outcome)
+            r_val = rand()
+            idx = length(outcomes)
+            acc = 0.0
+            @inbounds for i in eachindex(outcomes)
+                acc += outcomes[i][2]
+                if r_val <= acc
+                    idx = i
+                    break
+                end
+            end
+            GI.apply_chance!(game, outcomes[idx][1])
             continue
         end
 
@@ -260,6 +297,8 @@ end
 Backpropagate value through the path, removing virtual losses.
 Combined remove_virtual_loss + update_state_info into single Dict lookup per node
 (was: 3 lookups per node = haskey + index for remove_VL + index for update).
+
+Chance nodes use passthrough (no tree entries, not in backprop path).
 """
 function backpropagate!(benv::BatchedEnv, sim::PendingSimulation)
     env = benv.env
@@ -282,7 +321,7 @@ function backpropagate!(benv::BatchedEnv, sim::PendingSimulation)
         q = pswitch ? -q : q
         q = reward + env.gamma * q
 
-        # Combined: remove virtual loss + update (1 lookup instead of 3)
+        # Decision node: remove virtual loss + update (1 lookup instead of 3)
         # VL removal: W += VL, N -= 1; Update: W += q, N += 1; Net: W += (VL + q), N unchanged
         info = get(env.tree, state, nothing)
         if info !== nothing
@@ -430,7 +469,7 @@ struct BatchedMctsPlayer{B} <: Function
 end
 
 """
-    BatchedMctsPlayer(game_spec, oracle, params; batch_size=32, batch_oracle=nothing)
+    BatchedMctsPlayer(game_spec, oracle, params; batch_size=32, batch_oracle=nothing, bearoff_evaluator=nothing)
 
 Create a batched MCTS player.
 
@@ -440,8 +479,9 @@ Create a batched MCTS player.
 - `params`: MctsParams with MCTS hyperparameters
 - `batch_size`: Number of simulations to batch together (default: 32)
 - `batch_oracle`: Optional batched oracle `(Vector{S}) -> Vector{(P,V)}` for GPU eval
+- `bearoff_evaluator`: Optional `(game) -> Union{Float64, Nothing}` for exact bear-off values at chance nodes
 """
-function BatchedMctsPlayer(game_spec, oracle, params; batch_size=32, batch_oracle=nothing)
+function BatchedMctsPlayer(game_spec, oracle, params; batch_size=32, batch_oracle=nothing, bearoff_evaluator=nothing)
     mcts = MCTS.Env(game_spec, oracle,
         gamma=params.gamma,
         cpuct=params.cpuct,
@@ -451,7 +491,7 @@ function BatchedMctsPlayer(game_spec, oracle, params; batch_size=32, batch_oracl
         chance_mode=params.chance_mode,
         progressive_widening_alpha=params.progressive_widening_alpha,
         prior_virtual_visits=params.prior_virtual_visits)
-    benv = BatchedEnv(mcts, batch_size; batch_oracle=batch_oracle)
+    benv = BatchedEnv(mcts, batch_size; batch_oracle=batch_oracle, bearoff_evaluator=bearoff_evaluator)
     return BatchedMctsPlayer(benv, params.num_iters_per_turn, batch_size, params.temperature)
 end
 

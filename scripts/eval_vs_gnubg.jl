@@ -92,11 +92,25 @@ addprocs(num_workers_main; exeflags=`--project=$(Base.active_project())`)
         cpuct=2.0,
         temperature=ConstSchedule(0.0),
         dirichlet_noise_ϵ=0.0,
-        dirichlet_noise_α=1.0
+        dirichlet_noise_α=1.0,
+        chance_mode=:passthrough
     )
     global az_player = MctsPlayer(gspec, network, mcts_params)
     global gnubg_0ply = GnubgPlayer.GnubgBaseline(ply=0)
     global gnubg_1ply = GnubgPlayer.GnubgBaseline(ply=1)
+end
+
+# Sample chance outcome helper
+@everywhere function _sample_chance(rng, outcomes)
+    r = rand(rng)
+    acc = 0.0
+    @inbounds for i in eachindex(outcomes)
+        acc += outcomes[i][2]
+        if r <= acc
+            return i
+        end
+    end
+    return length(outcomes)
 end
 
 # Define game function on all workers
@@ -104,13 +118,21 @@ end
     rng = MersenneTwister(seed)
     env = GI.init(gspec)
     env.rng = rng
-    
+
     gnubg_player = gnubg_ply == 0 ? gnubg_0ply : gnubg_1ply
-    
+
     while !GI.game_terminated(env)
+        # Handle chance nodes (dice rolls)
+        if GI.is_chance_node(env)
+            outcomes = GI.chance_outcomes(env)
+            idx = _sample_chance(rng, outcomes)
+            GI.apply_chance!(env, outcomes[idx][1])
+            continue
+        end
+
         is_white = GI.white_playing(env)
         use_az = (is_white && az_is_white) || (!is_white && !az_is_white)
-        
+
         if use_az
             actions, π = AlphaZero.think(az_player, env)
             action = actions[argmax(π)]
@@ -120,9 +142,9 @@ end
         end
         GI.play!(env, action)
     end
-    
+
     AlphaZero.reset_player!(az_player)
-    
+
     reward = GI.white_reward(env)
     return az_is_white ? reward : -reward
 end
