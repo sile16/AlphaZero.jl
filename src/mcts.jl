@@ -298,10 +298,20 @@ function run_simulation_decision!(env::Env, game; η, root, depth)
   else
     # New node: compute available actions and create tree entry
     actions = GI.available_actions(game)
-    (P, V) = env.oracle(state)
-    info = init_state_info(P, V, env.prior_temperature, actions)
-    env.tree[state] = info
-    return info.Vest
+    # Single-option states (e.g., forced PASS): create trivial tree entry
+    # and continue traversal. No oracle evaluation needed since P=[1.0]
+    # and the value will come from the child via backpropagation.
+    if length(actions) == 1
+      stats = [ActionStats(Float32(1.0), 0, 0)]
+      info = StateInfo(stats, actions, Float32(0))
+      env.tree[state] = info
+      # Fall through to normal traversal below
+    else
+      (P, V) = env.oracle(state)
+      info = init_state_info(P, V, env.prior_temperature, actions)
+      env.tree[state] = info
+      return info.Vest
+    end
   end
   ϵ = root ? env.noise_ϵ : 0.
   action_id = best_uct_action(info, env.cpuct, ϵ, η)
