@@ -27,9 +27,6 @@ const DOUBLES_INDICES = [1, 7, 12, 16, 19, 21]  # 1-1, 2-2, 3-3, 4-4, 5-5, 6-6
 const NUM_CHANCE_OUTCOMES = DOUBLES_ONLY ? 6 : 21
 const CHANCE_PROB = 1.0 / NUM_CHANCE_OUTCOMES
 
-# Observation size (using observe_full: 86 features)
-const OBS_SIZE = 86
-
 const Player = Bool
 const WHITE = true   # Player 0
 const BLACK = false  # Player 1
@@ -65,29 +62,31 @@ end
 GI.spec(::GameEnv) = GameSpec()
 
 function GI.current_state(g::GameEnv)
-  # Return a COPY of the game state, not a reference
-  # This is important because MCTS captures state before playing actions
-  game = g.game
-  return BackgammonNet.BackgammonGame(
-    game.p0, game.p1, game.dice, game.remaining_actions,
-    game.current_player, game.terminated, game.reward,
-    copy(game.history), game.doubles_only,
-    Int[], Int[], Int[]  # Fresh buffers for the copy
-  )
+  return BackgammonNet.clone(g.game)
 end
 
 function GI.set_state!(g::GameEnv, state::BackgammonNet.BackgammonGame)
-  # Copy state from another game
-  g.game.p0 = state.p0
-  g.game.p1 = state.p1
-  g.game.dice = state.dice
-  g.game.remaining_actions = state.remaining_actions
-  g.game.current_player = state.current_player
-  g.game.terminated = state.terminated
-  g.game.reward = state.reward
-  g.game.doubles_only = state.doubles_only
-  empty!(g.game.history)
-  append!(g.game.history, state.history)
+  game = g.game
+  game.p0 = state.p0
+  game.p1 = state.p1
+  game.dice = state.dice
+  game.remaining_actions = state.remaining_actions
+  game.current_player = state.current_player
+  game.terminated = state.terminated
+  game.reward = state.reward
+  game.doubles_only = state.doubles_only
+  game.obs_type = state.obs_type
+  game.cube_value = state.cube_value
+  game.cube_owner = state.cube_owner
+  game.phase = state.phase
+  game.cube_enabled = state.cube_enabled
+  game.my_away = state.my_away
+  game.opp_away = state.opp_away
+  game.is_crawford = state.is_crawford
+  game.is_post_crawford = state.is_post_crawford
+  game.jacoby_enabled = state.jacoby_enabled
+  game.tavla = state.tavla
+  game._legal_actions_valid = false
 end
 
 GI.white_playing(g::GameEnv) = g.game.current_player == 0

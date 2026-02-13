@@ -47,7 +47,7 @@ Knet = "1902f260-5fb4-5aff-8c31-6271790ab950"
 
 [compat]
 ArgParse = "1.1.4"
-BackgammonNet = "0.4"
+BackgammonNet = "0.6"
 CUDA = "3, 5"
 Colors = "0.12.7, 0.13"
 CommonRLInterface = "0.3.1"

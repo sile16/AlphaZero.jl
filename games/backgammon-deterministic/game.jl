@@ -11,7 +11,7 @@
 # - doubles_only=true: Only doubles dice rolls (simpler game)
 # - OBSERVATION_TYPE: :minimal_flat (330), :full_flat (362), :minimal (780), :full (1612)
 #
-# BackgammonNet v0.3.2+ required
+# BackgammonNet v0.6.0+ required (344 minimal_flat features)
 
 import AlphaZero.GI
 using StaticArrays
@@ -38,13 +38,17 @@ const DOUBLES_ONLY = false  # Full 21 dice outcomes for proper stochastic testin
 const OBS_TYPE_MAP = Dict(
     "minimal" => :minimal_flat,      # Default to flat for MLP networks
     "minimal_flat" => :minimal_flat,
+    "min_plus" => :min_plus_flat,
+    "min_plus_flat" => :min_plus_flat,
     "full" => :full_flat,
     "full_flat" => :full_flat,
     "biased" => :biased_flat,
     "biased_flat" => :biased_flat,
     "minimal_conv" => :minimal,      # For conv networks
+    "min_plus_conv" => :min_plus,
     "full_conv" => :full,
     "minimal_hybrid" => :minimal_hybrid,  # For hybrid networks
+    "min_plus_hybrid" => :min_plus_hybrid,
     "full_hybrid" => :full_hybrid,
     "biased_hybrid" => :biased_hybrid,
 )
@@ -101,16 +105,13 @@ function GI.vectorize_state(::GameSpec, game::BackgammonNet.BackgammonGame)
 end
 
 # In-place version: writes observation directly into buffer (zero intermediate allocation).
-# Only works for flat observation types (minimal_flat, full_flat, biased_flat).
-# For minimal_flat, bypasses observe_minimal_flat! to skip redundant fill!
-# (all 330 values are explicitly written by the encoding functions).
+# Uses BackgammonNet v0.6.0 public observe_*_flat! API.
 function vectorize_state_into!(buf::AbstractVector{Float32}, ::GameSpec, game::BackgammonNet.BackgammonGame)
   ot = game.obs_type
   if ot === :minimal_flat
-    # Skip fill! — all 330 values explicitly set by encoders (verified in BackgammonNet v0.3.2+)
-    idx = BackgammonNet._encode_board_flat!(buf, game, 0)
-    idx = BackgammonNet._encode_dice_flat!(buf, game, idx, nothing)
-    idx = BackgammonNet._encode_off_flat!(buf, game, idx)
+    BackgammonNet.observe_minimal_flat!(buf, game)
+  elseif ot === :min_plus_flat
+    BackgammonNet.observe_min_plus_flat!(buf, game)
   elseif ot === :full_flat
     BackgammonNet.observe_full_flat!(buf, game)
   elseif ot === :biased_flat
@@ -142,38 +143,16 @@ function GI.clone(g::GameEnv)
 end
 
 # Zero-allocation clone: copies game state fields into pre-allocated dst,
-# reusing dst's history/actions/sources buffers. Used by batched MCTS game pool.
-# Safe: observe() and hash/== don't use history or scratch buffers.
+# reusing dst's internal buffers. Used by batched MCTS game pool.
+# Uses BackgammonNet v0.6.0 copy_state! API (handles all fields, invalidates cache).
 function GI.clone_into!(dst::GameEnv, src::GameEnv)
-  sg = src.game
-  dg = dst.game
-  dg.p0 = sg.p0
-  dg.p1 = sg.p1
-  dg.dice = sg.dice
-  dg.remaining_actions = sg.remaining_actions
-  dg.current_player = sg.current_player
-  dg.terminated = sg.terminated
-  dg.reward = sg.reward
-  empty!(dg.history)
-  append!(dg.history, sg.history)
-  dg.doubles_only = sg.doubles_only
-  dg.obs_type = sg.obs_type
-  dg.cube_value = sg.cube_value
-  dg.cube_owner = sg.cube_owner
-  dg.phase = sg.phase
-  dg.cube_enabled = sg.cube_enabled
-  dg.my_away = sg.my_away
-  dg.opp_away = sg.opp_away
-  dg.is_crawford = sg.is_crawford
-  dg.is_post_crawford = sg.is_post_crawford
-  dg.jacoby_enabled = sg.jacoby_enabled
-  dg._actions_cached = false
+  BackgammonNet.copy_state!(dst.game, src.game)
   dst.rng = src.rng
   return dst
 end
 
 function GI.current_state(g::GameEnv)
-  # Lightweight clone: shares internal buffers (history, actions_buf, sources).
+  # Lightweight clone: shares internal buffers (actions_buf, sources).
   # Safe because MCTS tree states are read-only (only used as Dict keys and
   # for oracle evaluation). Eliminates ~3KB allocation per clone (~10K/game).
   game = g.game
@@ -182,8 +161,8 @@ function GI.current_state(g::GameEnv)
     game.current_player, game.terminated, game.reward,
     game.doubles_only, game.obs_type,
     game.cube_value, game.cube_owner, game.phase, game.cube_enabled,
-    game.my_away, game.opp_away, game.is_crawford, game.is_post_crawford, game.jacoby_enabled,
-    game.tavla,
+    game.my_away, game.opp_away, game.is_crawford, game.is_post_crawford,
+    game.jacoby_enabled, game.tavla,
     game._actions_buffer, false, game._sources_buffer1, game._sources_buffer2
   )
 end
