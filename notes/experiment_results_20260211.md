@@ -8,7 +8,8 @@
 
 | Experiment | Loss | vs GnuBG 0-ply | vs GnuBG 1-ply | Time |
 |-----------|------|----------------|----------------|------|
-| **PER + Reanalyze** | **4.35** | **+1.341 (90%)** | **+0.974 (76%)** | 89 min |
+| **PER + Reanalyze (v0.6.0)** | **4.44** | **+1.403 (92%)** | **+1.146 (82%)** | **72 min** |
+| PER + Reanalyze (v0.4.1) | 4.35 | +1.341 (90%) | +0.974 (76%) | 89 min |
 | PER baseline | ~4.12 | +1.019 (82%) | +0.670 (67%) | ~80 min |
 | PER + Bearoff Soft (trunc) | 4.43 | +0.982 (81%) | +0.587 (64%) | 67 min |
 | PER + Bearoff Full Play | 4.30 | +0.942 (81%) | +0.587 (67%) | 73 min |
@@ -36,10 +37,13 @@
 - Result: **+1.466 (93%)** vs GnuBG 0-ply, **+1.338 (84%)** vs GnuBG 1-ply
 - **New overall best.** Beats old PER 200-iter (+1.21) by +10.6% equity.
 
-## Running: BackgammonNet v0.6.0 Reproduction (50-iter PER + Reanalyze)
-- Session: distributed_20260212_*_per_reanalyze (started 2026-02-12)
-- BackgammonNet upgraded v0.4.1 → v0.6.0 (obs 330→344 features)
-- Target: reproduce +0.974 ± ~0.15 vs GnuBG 1-ply
+## Completed: BackgammonNet v0.6.0 Reproduction (50-iter PER + Reanalyze)
+- Session: distributed_20260212_220302_per_reanalyze
+- BackgammonNet upgraded v0.4.1 → v0.6.0 (obs 330→344 features, +14 cube/match/context)
+- Result: **+1.403 (92%)** vs GnuBG 0-ply, **+1.146 (82%)** vs GnuBG 1-ply
+- **New best 50-iter result!** +17.7% equity improvement over v0.4.1 baseline (+0.974)
+- 72 min (faster than v0.4.1's 89 min due to throughput improvements)
+- 14 new constant features (cube disabled in money play) appear to help as implicit regularization
 
 ---
 
@@ -91,11 +95,11 @@ All experiments start from locked-in baseline: PER + Reanalyze, stochastic wrapp
 - **Design**: Spawn reanalyze thread alongside self-play. Use `cpu_network` (previous iter weights, read-only). Iterate buffer front-to-back (oldest first). Lock-free: reanalyze writes to existing buffer entries (value blend), self-play only appends.
 - **Code**: Moderate — move `reanalyze_buffer!` to use CPU network, spawn as `Threads.@spawn`, add buffer locking if needed
 
-### 8. BackgammonNet v0.6.0 Integration — IN PROGRESS
+### 8. BackgammonNet v0.6.0 Integration — DONE (+17.7% improvement!)
 - **Upgrade**: v0.4.1 → v0.6.0 (obs 330→344 features, +14 cube/match/context channels)
 - **Changes**: `clone_into!` uses `copy_state!` API, `vectorize_state_into!` uses public `observe_minimal_flat!`, `current_state` updated for new struct (no `history`, add `tavla`)
-- **Impact**: New 344-dim input requires retraining from scratch. Network auto-adjusts (283K → 283.4K params).
-- **Status**: Smoke tests pass. 2-iter sanity test pass. 50-iter reproduction running.
+- **Result**: +1.146 vs GnuBG 1-ply (82% wins). New best 50-iter, exceeding v0.4.1's +0.974 by +17.7%.
+- **Why**: 14 additional constant features (cube/match channels all zero in money play) may act as implicit regularization or provide a richer gradient landscape for the first layer.
 
 ### 9. Concurrent Reanalyze — DONE (worse)
 - **Result**: Both approaches regressed from baseline:
@@ -106,9 +110,10 @@ All experiments start from locked-in baseline: PER + Reanalyze, stochastic wrapp
 ### Priority Order
 1. ~~Temperature schedule~~ — **DONE, all worse. τ=1 is optimal.**
 2. ~~Concurrent reanalyze~~ — **DONE, all worse. Sequential is optimal.**
-3. **BackgammonNet v0.6.0 reproduction** — IN PROGRESS
-4. Larger model (addresses known capacity bottleneck)
+3. ~~BackgammonNet v0.6.0~~ — **DONE, +17.7% improvement! New 50-iter best.**
+4. **Larger model** (addresses known capacity bottleneck)
 5. Dirichlet noise (quick param change)
 6. CPUCT (quick param change)
 7. Reanalyze params (tune best feature)
 8. MCTS sims (slowest experiment)
+9. **200-iter run with v0.6.0** (current best is v0.4.1 200-iter +1.338)
