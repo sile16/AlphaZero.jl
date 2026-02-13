@@ -140,6 +140,27 @@ function parse_args()
         "--use-bearoff"
             help = "Enable exact bear-off table value targets (k=6 two-sided database)"
             action = :store_true
+        "--bearoff-hard-targets"
+            help = "Sample hard 0/1 targets from bear-off probabilities each iteration (requires --use-bearoff)"
+            action = :store_true
+        "--bearoff-truncation"
+            help = "Truncate games at bear-off positions (requires --use-bearoff). Without this, games play to completion."
+            action = :store_true
+        "--temp-move-cutoff"
+            help = "After this many decision moves, reduce temperature (0=disabled)"
+            arg_type = Int
+            default = 0
+        "--temp-final"
+            help = "Temperature after move cutoff (0.0=greedy, 0.3=soft)"
+            arg_type = Float64
+            default = 0.0
+        "--temp-iter-decay"
+            help = "Enable linear temperature decay across training iterations"
+            action = :store_true
+        "--temp-iter-final"
+            help = "Final temperature at last iteration when using --temp-iter-decay"
+            arg_type = Float64
+            default = 0.3
     end
 
     return ArgParse.parse_args(s)
@@ -159,6 +180,11 @@ const LEARNING_RATE = Float32(ARGS["learning_rate"])
 const L2_REG = Float32(ARGS["l2_reg"])
 const BUFFER_CAPACITY = ARGS["buffer_capacity"]
 const BATCH_SIZE = ARGS["batch_size"]
+const TEMP_MOVE_CUTOFF = ARGS["temp_move_cutoff"]
+const TEMP_FINAL = Float64(ARGS["temp_final"])
+const TEMP_ITER_DECAY = ARGS["temp_iter_decay"]
+const TEMP_ITER_FINAL = Float64(ARGS["temp_iter_final"])
+const TOTAL_ITERS = ARGS["total_iterations"]
 
 # Setup session directory
 const RESUME_DIR = ARGS["resume"]
@@ -171,7 +197,15 @@ elseif isempty(ARGS["session_dir"])
     suffixes = String[]
     ARGS["use_per"] && push!(suffixes, "per")
     ARGS["use_reanalyze"] && push!(suffixes, "reanalyze")
-    ARGS["use_bearoff"] && push!(suffixes, "bearoff")
+    if ARGS["use_bearoff"]
+        if ARGS["bearoff_truncation"]
+            push!(suffixes, ARGS["bearoff_hard_targets"] ? "bearoff_hard" : "bearoff_soft")
+        else
+            push!(suffixes, "bearoff")
+        end
+    end
+    TEMP_MOVE_CUTOFF > 0 && push!(suffixes, "temp$(TEMP_MOVE_CUTOFF)")
+    TEMP_ITER_DECAY && push!(suffixes, "iterdecay")
     suffix = isempty(suffixes) ? "" : "_" * join(suffixes, "_")
     joinpath("sessions", "distributed_$(timestamp)$(suffix)")
 else
@@ -205,7 +239,22 @@ with_logger(TB_LOGGER) do
     features = String[]
     ARGS["use_per"] && push!(features, "PER (α=$(ARGS["per_alpha"]), β=$(ARGS["per_beta"]))")
     ARGS["use_reanalyze"] && push!(features, "Reanalyze ($(ARGS["reanalyze_fraction"]*100)%)")
-    ARGS["use_bearoff"] && push!(features, "Bear-off table (k=6 exact, MCTS+TD-bootstrap)")
+    if ARGS["use_bearoff"]
+        push!(features, "Bear-off MCTS evaluator (k=6 exact)")
+        if ARGS["bearoff_truncation"]
+            push!(features, ARGS["bearoff_hard_targets"] ?
+                "Bear-off hard targets (truncation + resample)" :
+                "Bear-off soft targets (truncation + table probs)")
+        else
+            push!(features, "Bear-off full play (table targets, first-bearoff value)")
+        end
+    end
+    if TEMP_MOVE_CUTOFF > 0
+        push!(features, "Temp cutoff move $(TEMP_MOVE_CUTOFF) (τ→$(TEMP_FINAL))")
+    end
+    if TEMP_ITER_DECAY
+        push!(features, "Iter temp decay (1.0→$(TEMP_ITER_FINAL))")
+    end
     features_str = isempty(features) ? "Baseline (no enhancements)" : join(features, ", ")
 
     repro_text = """
@@ -725,6 +774,8 @@ end
 #####
 
 const USE_BEAROFF = ARGS["use_bearoff"]
+const BEAROFF_HARD_TARGETS = ARGS["bearoff_hard_targets"]
+const BEAROFF_TRUNCATION = ARGS["bearoff_truncation"]
 
 # Load BearoffK6 module from local BackgammonNet.jl dev repo
 # (bearoff_k6.jl and 5.5GB data files are not in the published package)
@@ -910,6 +961,68 @@ function eval_bearoff_accuracy(net)
 end
 
 #####
+##### System utilization monitoring (background thread, 5s interval)
+#####
+
+const UTIL_MONITOR_RUNNING = Threads.Atomic{Bool}(true)
+const UTIL_TB_LOGGER = TBLogger(joinpath(TB_DIR, "utilization"), tb_overwrite)
+
+function start_utilization_monitor(; interval_s::Float64=5.0)
+    prev_cpu_total, prev_cpu_idle = 0, 0
+    # Initialize CPU baseline
+    try
+        line = readline("/proc/stat")
+        parts = split(line)
+        vals = parse.(Int, parts[2:end])
+        prev_cpu_total = sum(vals)
+        prev_cpu_idle = vals[4] + (length(vals) >= 5 ? vals[5] : 0)
+    catch; end
+
+    sample_num = 0
+    Threads.@spawn begin
+        while UTIL_MONITOR_RUNNING[]
+            sample_num += 1
+            elapsed_s = round(Int, sample_num * interval_s)
+
+            # GPU utilization via nvidia-smi
+            try
+                result = read(`nvidia-smi --query-gpu=utilization.gpu,utilization.memory --format=csv,noheader,nounits`, String)
+                parts = split(strip(result), ",")
+                gpu_util = parse(Float32, strip(parts[1]))
+                gpu_mem = parse(Float32, strip(parts[2]))
+                with_logger(UTIL_TB_LOGGER) do
+                    set_step!(UTIL_TB_LOGGER, elapsed_s)
+                    @info "util/gpu_pct" value=gpu_util log_step_increment=0
+                    @info "util/gpu_mem_pct" value=gpu_mem log_step_increment=0
+                end
+            catch; end
+
+            # CPU utilization via /proc/stat
+            try
+                line = readline("/proc/stat")
+                parts = split(line)
+                vals = parse.(Int, parts[2:end])
+                total = sum(vals)
+                idle = vals[4] + (length(vals) >= 5 ? vals[5] : 0)
+                total_diff = total - prev_cpu_total
+                idle_diff = idle - prev_cpu_idle
+                prev_cpu_total, prev_cpu_idle = total, idle
+                if total_diff > 0
+                    cpu_util = Float32(100.0 * (1.0 - idle_diff / total_diff))
+                    with_logger(UTIL_TB_LOGGER) do
+                        set_step!(UTIL_TB_LOGGER, elapsed_s)
+                        @info "util/cpu_pct" value=cpu_util log_step_increment=0
+                    end
+                end
+            catch; end
+
+            sleep(interval_s)
+        end
+        close(UTIL_TB_LOGGER)
+    end
+end
+
+#####
 ##### Helper functions
 #####
 
@@ -923,6 +1036,27 @@ function sample_from_policy(policy::AbstractVector{<:Real}, rng)
         end
     end
     return length(policy)
+end
+
+# Shared iteration counter for temperature scheduling (readable by all workers)
+const CURRENT_ITERATION = Threads.Atomic{Int}(1)
+
+"""Compute temperature for action selection based on move number and training iteration."""
+function get_temperature(move_num::Int)
+    # In-game temperature
+    τ = if TEMP_MOVE_CUTOFF > 0 && move_num > TEMP_MOVE_CUTOFF
+        TEMP_FINAL
+    else
+        1.0
+    end
+    # Cross-training decay (multiply)
+    if TEMP_ITER_DECAY
+        iter = CURRENT_ITERATION[]
+        progress = clamp((iter - 1) / max(TOTAL_ITERS - 1, 1), 0.0, 1.0)
+        iter_τ = 1.0 + progress * (TEMP_ITER_FINAL - 1.0)
+        τ *= iter_τ
+    end
+    return τ
 end
 
 """Sample a hard game outcome from bear-off probability distribution.
@@ -975,10 +1109,37 @@ function sample_bearoff_outcome(probs::Vector{Float32}, wp::Bool, rng)
     return (value=z, equity=eq)
 end
 
-function convert_trace_to_samples(gspec, states, policies, trace_actions, rewards, is_chance, final_reward, outcome; rng=nothing)
+function convert_trace_to_samples(gspec, states, policies, trace_actions, rewards, is_chance, final_reward, outcome; rng=nothing,
+        bearoff_equity=nothing, bearoff_wp=nothing,
+        first_bearoff_equity=nothing, first_bearoff_wp=nothing)
     n = length(states)
     samples = []
     num_actions = GI.num_actions(gspec)
+
+    # For truncated games: compute white-perspective probs once
+    probs_white = if bearoff_equity !== nothing
+        if bearoff_wp
+            copy(bearoff_equity)
+        else
+            # Flip to white's perspective
+            Float32[1.0f0 - bearoff_equity[1], bearoff_equity[4], bearoff_equity[5],
+                    bearoff_equity[2], bearoff_equity[3]]
+        end
+    else
+        nothing
+    end
+
+    # For non-truncation mode: first bear-off value (white-perspective) for non-bearoff positions
+    first_bo_probs_white = if first_bearoff_equity !== nothing
+        if first_bearoff_wp
+            copy(first_bearoff_equity)
+        else
+            Float32[1.0f0 - first_bearoff_equity[1], first_bearoff_equity[4], first_bearoff_equity[5],
+                    first_bearoff_equity[2], first_bearoff_equity[3]]
+        end
+    else
+        nothing
+    end
 
     for i in 1:n
         state = states[i]
@@ -987,11 +1148,23 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
         is_ch = is_chance[i]
         wp = GI.white_playing(gspec, state)
 
-        # Default: use actual game outcome
+        # Default: use actual game outcome (or first bear-off value as final_reward)
         z = wp ? final_reward : -final_reward
         eq = zeros(Float32, 5)
         has_eq = false
-        if !isnothing(outcome)
+
+        if bearoff_equity !== nothing
+            # Truncated game: use bear-off table value for ALL positions
+            has_eq = true
+            if wp
+                eq = copy(probs_white)
+            else
+                # Flip from white's to black's perspective
+                eq = Float32[1.0f0 - probs_white[1], probs_white[4], probs_white[5],
+                             probs_white[2], probs_white[3]]
+            end
+            # z already correct from final_reward perspective adjustment above
+        elseif !isnothing(outcome)
             has_eq = true
             won = outcome.white_won == wp
             if won
@@ -1004,10 +1177,9 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
             end
         end
 
-        # Bear-off positions: replace with exact table equity (training targets only)
-        # For chance nodes (pre-dice), table is mathematically exact.
-        # For decision nodes (post-dice), table is noisy but unbiased.
-        if USE_BEAROFF && state isa BackgammonNet.BackgammonGame &&
+        # Bear-off positions: per-position table lookup (overrides game outcome with exact values)
+        is_bearoff_pos = false
+        if bearoff_equity === nothing && USE_BEAROFF && state isa BackgammonNet.BackgammonGame &&
                 BearoffK6.is_bearoff_position(state.p0, state.p1)
             bo = bearoff_table_equity(state)
             z = wp ? bo.value : -bo.value
@@ -1017,6 +1189,30 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
                 eq = Float32[1.0f0 - bo.equity[1], bo.equity[4], bo.equity[5], bo.equity[2], bo.equity[3]]
             end
             has_eq = true
+            is_bearoff_pos = true
+        end
+
+        # Non-bearoff positions in games that reached bear-off: use first bear-off equity
+        if !is_bearoff_pos && first_bo_probs_white !== nothing
+            has_eq = true
+            if wp
+                eq = copy(first_bo_probs_white)
+            else
+                eq = Float32[1.0f0 - first_bo_probs_white[1], first_bo_probs_white[4], first_bo_probs_white[5],
+                             first_bo_probs_white[2], first_bo_probs_white[3]]
+            end
+            # z already uses first bear-off value as final_reward (set by caller)
+        end
+
+        # Store white-perspective probs for hard-target resampling:
+        # - Truncated games: probs_white (same for all positions)
+        # - Non-truncated with bear-off: first_bo_probs_white for non-bearoff, nothing for bearoff (exact)
+        sample_probs = if probs_white !== nothing
+            probs_white
+        elseif !is_bearoff_pos && first_bo_probs_white !== nothing
+            first_bo_probs_white
+        else
+            nothing
         end
 
         state_arr = GI.vectorize_state(gspec, state)
@@ -1038,6 +1234,8 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
             equity=eq,
             has_equity=has_eq,
             is_chance=is_ch,
+            bearoff_probs=sample_probs,
+            wp=wp,
         ))
     end
 
@@ -1328,6 +1526,7 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
     t_gpu_wait = 0.0
     t_mcts_cpu = 0.0
     n_oracle_calls = 0
+    n_bearoff_truncated = 0
 
     function batch_oracle(states::Vector)
         n = length(states)
@@ -1433,12 +1632,35 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         trace_actions = Vector{Int}[]  # Store actions list to avoid GI.init in trace conversion
         trace_rewards = Float32[]
         trace_is_chance = Bool[]
+        bearoff_truncated = false
+        bearoff_bo = nothing
+        bearoff_wp_at_trunc = true
+        first_bearoff_bo = nothing       # First bear-off table value (for non-truncation mode)
+        decision_move_num = 0            # Move counter for temperature scheduling
+        first_bearoff_wp = true
 
         while !GI.game_terminated(env)
             # Handle chance nodes: sample dice and continue (don't record in trace)
             # Recording chance nodes doubles buffer samples and halves data diversity,
             # causing severe regression. Keep trace = decision nodes only.
             if GI.is_chance_node(env)
+                # Check for bear-off BEFORE rolling dice (table values are pre-dice)
+                if USE_BEAROFF
+                    bg = env.game
+                    if BearoffK6.is_bearoff_position(bg.p0, bg.p1)
+                        # Record first bear-off value (used for non-bearoff positions)
+                        if first_bearoff_bo === nothing
+                            first_bearoff_bo = bearoff_table_equity(bg)
+                            first_bearoff_wp = (bg.current_player == 0)
+                        end
+                        if BEAROFF_TRUNCATION
+                            bearoff_truncated = true
+                            bearoff_bo = first_bearoff_bo
+                            bearoff_wp_at_trunc = first_bearoff_wp
+                            break
+                        end
+                    end
+                end
                 outcomes = GI.chance_outcomes(env)
                 idx = _sample_chance(rng, outcomes)
                 GI.apply_chance!(env, outcomes[idx][1])
@@ -1466,23 +1688,53 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
             push!(trace_policies, Float32.(policy))
             push!(trace_actions, actions)
             push!(trace_is_chance, false)
-            action = actions[sample_from_policy(policy, rng)]
+            # Apply temperature for action selection (training target stays as raw policy)
+            decision_move_num += 1
+            τ = get_temperature(decision_move_num)
+            if isone(τ)
+                action = actions[sample_from_policy(policy, rng)]
+            elseif iszero(τ)
+                action = actions[argmax(policy)]
+            else
+                temp_policy = Util.apply_temperature(policy, τ)
+                action = actions[sample_from_policy(temp_policy, rng)]
+            end
             GI.play!(env, action)
 
             push!(trace_rewards, 0.0f0)
         end
 
         BatchedMCTS.reset_player!(player)
-        final_reward = Float32(GI.white_reward(env))
-        outcome = GI.game_outcome(env)
-        samples = convert_trace_to_samples(
-            gspec, trace_states, trace_policies, trace_actions, trace_rewards, trace_is_chance,
-            final_reward, outcome; rng=rng)
+        if bearoff_truncated
+            n_bearoff_truncated += 1
+            # Bear-off table value as terminal (white's perspective for final_reward)
+            final_reward = Float32(bearoff_wp_at_trunc ? bearoff_bo.value : -bearoff_bo.value)
+            samples = convert_trace_to_samples(
+                gspec, trace_states, trace_policies, trace_actions, trace_rewards, trace_is_chance,
+                final_reward, nothing; rng=rng,
+                bearoff_equity=bearoff_bo.equity, bearoff_wp=bearoff_wp_at_trunc)
+        elseif first_bearoff_bo !== nothing
+            # No truncation, but we hit bear-off: use first bear-off value as final_reward
+            # for non-bearoff positions. Bear-off positions get per-position table values.
+            final_reward = Float32(first_bearoff_wp ? first_bearoff_bo.value : -first_bearoff_bo.value)
+            outcome = GI.game_outcome(env)
+            samples = convert_trace_to_samples(
+                gspec, trace_states, trace_policies, trace_actions, trace_rewards, trace_is_chance,
+                final_reward, outcome; rng=rng,
+                first_bearoff_equity=first_bearoff_bo.equity, first_bearoff_wp=first_bearoff_wp)
+        else
+            final_reward = Float32(GI.white_reward(env))
+            outcome = GI.game_outcome(env)
+            samples = convert_trace_to_samples(
+                gspec, trace_states, trace_policies, trace_actions, trace_rewards, trace_is_chance,
+                final_reward, outcome; rng=rng)
+        end
         append!(all_samples, samples)
     end
 
     return (samples=all_samples, t_vectorize=t_vectorize, t_gpu_wait=t_gpu_wait,
-            t_mcts_cpu=t_mcts_cpu, n_oracle_calls=n_oracle_calls)
+            t_mcts_cpu=t_mcts_cpu, n_oracle_calls=n_oracle_calls,
+            n_bearoff_truncated=n_bearoff_truncated)
 end
 
 const ASYNC_GAMES_PER_THREAD = 1  # Green threads per OS thread (1 = disabled)
@@ -1515,6 +1767,7 @@ function worker_play_games(worker_id::Int, games_claimed::Threads.Atomic{Int}, t
     total_gpu_wait = 0.0
     total_mcts = 0.0
     total_oracle = 0
+    total_bearoff_truncated = 0
     for t in sub_tasks
         result = fetch(t)
         append!(all_samples, result.samples)
@@ -1522,11 +1775,12 @@ function worker_play_games(worker_id::Int, games_claimed::Threads.Atomic{Int}, t
         total_gpu_wait += result.t_gpu_wait
         total_mcts += result.t_mcts_cpu
         total_oracle += result.n_oracle_calls
+        total_bearoff_truncated += result.n_bearoff_truncated
     end
 
     if worker_id <= 3
         t_mcts_pure = total_mcts - total_vectorize - total_gpu_wait
-        @info "Worker $worker_id timing ($(ASYNC_GAMES_PER_THREAD) green threads)" vectorize_s=round(total_vectorize/1e9, digits=2) gpu_wait_s=round(total_gpu_wait/1e9, digits=2) mcts_total_s=round(total_mcts/1e9, digits=2) mcts_pure_s=round(t_mcts_pure/1e9, digits=2) oracle_calls=total_oracle
+        @info "Worker $worker_id timing ($(ASYNC_GAMES_PER_THREAD) green threads)" vectorize_s=round(total_vectorize/1e9, digits=2) gpu_wait_s=round(total_gpu_wait/1e9, digits=2) mcts_total_s=round(total_mcts/1e9, digits=2) mcts_pure_s=round(t_mcts_pure/1e9, digits=2) oracle_calls=total_oracle bearoff_truncated=total_bearoff_truncated
     end
 
     return all_samples
@@ -1786,6 +2040,23 @@ function prepare_batch(batch, num_actions, use_gpu_flag, net)
         end
     end
 
+    # Hard targets: resample discrete outcomes from stored bear-off probabilities
+    if BEAROFF_HARD_TARGETS
+        for i in 1:n
+            bp = batch[i].bearoff_probs
+            if bp !== nothing
+                sampled = sample_bearoff_outcome(bp, batch[i].wp, Random.default_rng())
+                EqWin[1, i] = sampled.equity[1]
+                EqGW[1, i] = sampled.equity[2]
+                EqBGW[1, i] = sampled.equity[3]
+                EqGL[1, i] = sampled.equity[4]
+                EqBGL[1, i] = sampled.equity[5]
+                V[1, i] = sampled.value
+                HasEquity[1, i] = 1.0f0
+            end
+        end
+    end
+
     batch_data = (; W, X, A, P, V, IsChance, EqWin, EqGW, EqBGW, EqGL, EqBGL, HasEquity)
 
     if use_gpu_flag
@@ -1912,6 +2183,9 @@ println("Starting training...")
 println("=" ^ 60)
 flush(stdout)
 
+# Start background utilization monitor (GPU/CPU every 5s → TensorBoard)
+start_utilization_monitor(interval_s=5.0)
+
 # Pre-compile training path (prevents ~70s JIT penalty on iteration 2)
 print("Pre-compiling training path...")
 flush(stdout)
@@ -1921,7 +2195,8 @@ let
     dummy_state = zeros(Float32, _state_dim)
     dummy_policy = zeros(Float32, NUM_ACTIONS); dummy_policy[1] = 1.0f0
     dummy_sample = (state=dummy_state, policy=dummy_policy, value=0.0f0,
-                    equity=zeros(Float32, 5), has_equity=false, is_chance=false)
+                    equity=zeros(Float32, 5), has_equity=false, is_chance=false,
+                    bearoff_probs=nothing, wp=true)
     dummy_buffer = fill(dummy_sample, BATCH_SIZE)
     bd = prepare_batch(dummy_buffer, NUM_ACTIONS, USE_GPU, warmup_net)
     Wmean = 1.0f0; Hp = 0.0f0
@@ -2044,10 +2319,10 @@ function reanalyze_buffer!(replay_buffer, network)
     n == 0 && return 0
 
     num_to_reanalyze = max(1, round(Int, n * REANALYZE_FRACTION))
-    # Random subset (or prioritize stale samples if PER)
+    # Random subset across entire buffer
     reanalyze_indices = randperm(n)[1:min(num_to_reanalyze, n)]
 
-    batch_size = min(512, length(reanalyze_indices))
+    batch_size = min(4096, length(reanalyze_indices))
     total_updated = 0
 
     for batch_start in 1:batch_size:length(reanalyze_indices)
@@ -2112,6 +2387,7 @@ end
 
 for iter in (START_ITER + 1):ARGS["total_iterations"]
     iter_start = time()
+    CURRENT_ITERATION[] = iter  # Update for temperature scheduling
 
     local new_samples, games_this_iter, avg_loss, train_result
 
@@ -2155,7 +2431,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     global total_games += games_this_iter
     global total_samples += length(new_samples)
 
-    # Reanalyze buffer positions with latest network
+    # Reanalyze buffer positions with latest network (sequential, after buffer update)
     reanalyzed_count = 0
     if USE_REANALYZE && buf_length(replay_buffer) >= BATCH_SIZE
         reanalyzed_count = reanalyze_buffer!(replay_buffer, network)
@@ -2184,6 +2460,13 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         @info "perf/games_per_min" value=games_per_min log_step_increment=0
         @info "perf/iter_time_s" value=iter_time log_step_increment=0
         @info "train/total_games" value=total_games log_step_increment=0
+        if USE_BEAROFF
+            n_trunc = count(s -> s.bearoff_probs !== nothing, new_samples)
+            n_total = length(new_samples)
+            trunc_frac = n_total > 0 ? Float32(n_trunc / n_total) : 0f0
+            @info "bearoff/truncated_sample_frac" value=trunc_frac log_step_increment=0
+            @info "bearoff/truncated_samples" value=n_trunc log_step_increment=0
+        end
 
         # Bear-off accuracy benchmark (fast, runs every iteration)
         if USE_BEAROFF
@@ -2290,7 +2573,8 @@ if final_eval_games > 0
     println("Results saved to: $(joinpath(SESSION_DIR, "final_eval_results.txt"))")
 end
 
-# Close TensorBoard logger
+# Stop utilization monitor and close TensorBoard loggers
+UTIL_MONITOR_RUNNING[] = false
 close(TB_LOGGER)
 
 # Training complete
