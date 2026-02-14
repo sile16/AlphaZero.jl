@@ -34,32 +34,31 @@ end
 # =============================================================================
 
 function _to_gnubg_board(g::BackgammonGame)
-    # gnubg format: board[opponent][25], board[on_roll][25]
-    # Index 0 = bar, indices 1-24 = points 1-24
+    # gnubg format (0-indexed): indices 0-23 = points (ace=0, 24-pt=23), index 24 = bar
+    # Each array uses its OWN player's perspective:
+    #   P0: gnubg index i → BNet point (24-i)  (P0 bears off from BNet 24 side)
+    #   P1: gnubg index i → BNet point (i+1)   (P1 bears off from BNet 1 side)
     board = zeros(Int, 2, 25)
     cp = Int(g.current_player)
     p0, p1 = g.p0, g.p1
 
+    # Julia 1-indexed: col 1-24 = points, col 25 = bar
     if cp == 0
-        # Player 0 on roll - gnubg point N = BackgammonNet point (25-N)
-        for pt in 1:24
-            idx = 25 - pt
-            board[2, pt + 1] = Int((p0 >> (idx << 2)) & 0xF)  # our checkers
-            board[1, pt + 1] = Int((p1 >> (idx << 2)) & 0xF)  # opponent
+        for col in 1:24
+            board[2, col] = Int((p0 >> ((25 - col) << 2)) & 0xF)  # P0 on-roll: BNet(25-col)
+            board[1, col] = Int((p1 >> (col << 2)) & 0xF)          # P1 opponent: BNet(col)
         end
-        board[2, 1] = Int((p0 >> (BackgammonNet.IDX_P0_BAR << 2)) & 0xF)  # our bar
-        board[1, 1] = Int((p1 >> (BackgammonNet.IDX_P1_BAR << 2)) & 0xF)  # opp bar
+        board[2, 25] = Int((p0 >> (BackgammonNet.IDX_P0_BAR << 2)) & 0xF)
+        board[1, 25] = Int((p1 >> (BackgammonNet.IDX_P1_BAR << 2)) & 0xF)
     else
-        # Player 1 on roll - gnubg point N = BackgammonNet point N
-        for pt in 1:24
-            board[2, pt + 1] = Int((p1 >> (pt << 2)) & 0xF)   # our checkers
-            board[1, pt + 1] = Int((p0 >> (pt << 2)) & 0xF)   # opponent
+        for col in 1:24
+            board[2, col] = Int((p1 >> (col << 2)) & 0xF)          # P1 on-roll: BNet(col)
+            board[1, col] = Int((p0 >> ((25 - col) << 2)) & 0xF)  # P0 opponent: BNet(25-col)
         end
-        board[2, 1] = Int((p1 >> (BackgammonNet.IDX_P1_BAR << 2)) & 0xF)  # our bar
-        board[1, 1] = Int((p0 >> (BackgammonNet.IDX_P0_BAR << 2)) & 0xF)  # opp bar
+        board[2, 25] = Int((p1 >> (BackgammonNet.IDX_P1_BAR << 2)) & 0xF)
+        board[1, 25] = Int((p0 >> (BackgammonNet.IDX_P0_BAR << 2)) & 0xF)
     end
 
-    # Return as list of lists for Python (0-indexed)
     return [board[1, :], board[2, :]]
 end
 
@@ -237,7 +236,7 @@ function _evaluate(g::BackgammonGame; ply::Int=0)
     win_bg = Float64(probs[3])
     lose_g = Float64(probs[4])
     lose_bg = Float64(probs[5])
-    return (win - (1.0 - win)) + (win_g - lose_g) + 2.0 * (win_bg - lose_bg)
+    return (win - (1.0 - win)) + (win_g - lose_g) + (win_bg - lose_bg)
 end
 
 # =============================================================================

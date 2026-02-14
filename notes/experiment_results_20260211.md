@@ -151,13 +151,67 @@ Sessions:
 - `distributed_20260212_220302_per_reanalyze` — 128w×3b minimal_flat (resumed 50→200)
 - `distributed_20260213_031243_per_reanalyze` — 256w×5b min_plus_flat (resumed 50→200)
 
-### Priority Order
-1. ~~Temperature schedule~~ — **DONE, all worse. τ=1 is optimal.**
-2. ~~Concurrent reanalyze~~ — **DONE, all worse. Sequential is optimal.**
-3. ~~BackgammonNet v0.6.0~~ — **DONE, +17.7% improvement! New 50-iter best.**
-4. ~~Larger model + obs type~~ — **DONE, 128w×3b minimal_flat still best at 50 iter. 256w×5b needs 200+ iter.**
-5. ~~200-iter runs~~ — **DONE, 256w×5b min_plus_flat is new overall best (+1.484 vs 1-ply).**
-6. Dirichlet noise (quick param change)
-7. CPUCT (quick param change)
-8. Reanalyze params (tune best feature)
-9. MCTS sims (slowest experiment)
+### 12. Dirichlet Noise Tuning — DONE (worse)
+
+Tested α=0.10 (vs default α=0.30). Go uses α=0.03, but backgammon has ~680 actions.
+
+| Dirichlet α | vs GnuBG 1-ply | vs GnuBG 2-ply | Time |
+|------------|---------------|---------------|------|
+| **0.30 (default)** | **+1.146 (82%)** | **+1.409 (92.4%)** | **72 min** |
+| 0.10 | +0.813 (71.5%) | +1.027 (83.8%) | 78 min |
+
+**Result**: α=0.10 gives **-29% regression** vs 1-ply. Lower alpha concentrates noise on fewer actions, reducing exploration breadth. Unlike Go, backgammon's dice already provide natural exploration. α=0.30 is optimal.
+
+Session: `distributed_20260214_013428_per_reanalyze` — 128w×3b minimal_flat, 50 iter
+
+---
+
+## CRITICAL: GnuBG Board Encoding Bug (2026-02-14)
+
+### ALL PREVIOUS GNUBG RESULTS IN THIS FILE ARE INVALID
+
+**Root cause**: `_to_gnubg_board()` had THREE bugs in how it converted BackgammonNet positions to gnubg's board format:
+
+1. **Off-by-one point indexing**: Points were placed at gnubg index N instead of N-1 (bar occupied index 0, pushing all points right by 1)
+2. **Bar at wrong position**: Bar was at Python index 0; gnubg expects index 24 (last element)
+3. **Opponent perspective wrong**: Both arrays used the on-roll player's coordinate mapping; gnubg expects each array to use its OWN player's perspective
+
+**gnubg board format** (verified against `gnubg.board_from_position_id('4HPwATDgc/ABMA')`):
+- 0-indexed points: index 0 = ace point (point 1), index 23 = 24-point, index 24 = bar
+- `board[0]` = opponent checkers using **opponent's own** perspective
+- `board[1]` = on-roll checkers using **on-roll's own** perspective
+- Each player's perspective: P0 gnubg[i] = BNet(24-i), P1 gnubg[i] = BNet(i+1)
+
+**Impact**: gnubg evaluated completely fictional positions → chose moves for wrong board → played terribly → our model beat a crippled gnubg, giving massively inflated win rates.
+
+**Proof**: BGBlitz evaluation (correct opponent) showed 0.5% win rate and -2.0 avg reward (gammoned nearly every game), while gnubg eval showed 82-88% wins.
+
+**Re-evaluation with corrected encoding (256w×5b min_plus_flat, 200 iter)**:
+
+| Matchup | Old (BUGGY) | New (CORRECT) |
+|---------|-------------|---------------|
+| AZ(white) vs GnuBG-1ply | +1.516 (89.8%) | **-1.486 (8.2%)** |
+| GnuBG-1ply vs AZ(black) | +1.452 (87.0%) | **-1.402 (10.4%)** |
+| **Combined 1-ply** | **+1.484 (88.4%)** | **-1.444 (9.3%)** |
+
+**Equity formula also fixed**: `2*(wbg-lbg)` → `1*(wbg-lbg)` (minor, <0.001 effect on move selection).
+
+**Fixed files**: GnubgInterface.jl (BackgammonNet), GnubgPlayerFast.jl, verify_board_reward.jl
+
+### Key Lessons
+
+1. **Self-consistency checks are NOT sufficient**: `verify_board_reward.jl` passed all 4059 checks because it verified our encoding against itself, not against gnubg's actual expected format. Always verify against external ground truth.
+2. **The 2-ply anomaly was a red flag**: Models scoring HIGHER vs gnubg 2-ply than 1-ply should have been a warning sign that something was wrong with gnubg's play quality.
+3. **Relative experiment comparisons MAY still be valid**: Since all experiments used the same buggy encoding, relative improvements might still hold. But absolute numbers are meaningless.
+4. **Our model is genuinely weak**: ~9% win rate vs gnubg 1-ply means our self-play training produces a model far below gnubg 0-ply quality. This is the real baseline we need to improve from.
+
+### Priority Order (UPDATED)
+1. ~~Temperature schedule~~ — DONE, all worse
+2. ~~Concurrent reanalyze~~ — DONE, all worse
+3. ~~BackgammonNet v0.6.0~~ — DONE (relative improvement unclear now)
+4. ~~Larger model + obs type~~ — DONE (relative improvement unclear now)
+5. ~~200-iter runs~~ — DONE (model is weak regardless)
+6. ~~Dirichlet noise~~ — DONE, all worse
+7. **Fix model quality** — PRIORITY: understand why self-play produces weak play
+8. CPUCT tuning (with correct eval)
+9. Reanalyze params (with correct eval)

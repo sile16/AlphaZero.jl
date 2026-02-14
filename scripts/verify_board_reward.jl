@@ -69,21 +69,23 @@ function verify_board_encoding(game::BackgammonNet.BackgammonGame, context::Stri
     our_onroll = zeros(Int, 25)
     our_opp = zeros(Int, 25)
 
+    # gnubg format (0-indexed): indices 0-23 = points (ace=0), index 24 = bar
+    # Each array uses its OWN player's perspective
+    # Julia 1-indexed: col 1-24 = points, col 25 = bar
     if cp == 0
-        for pt in 1:24
-            idx = 25 - pt
-            our_onroll[pt + 1] = Int((game.p0 >> (idx << 2)) & 0xF)
-            our_opp[pt + 1] = Int((game.p1 >> (idx << 2)) & 0xF)
+        for col in 1:24
+            our_onroll[col] = Int((game.p0 >> ((25 - col) << 2)) & 0xF)  # P0: BNet(25-col)
+            our_opp[col] = Int((game.p1 >> (col << 2)) & 0xF)            # P1: BNet(col)
         end
-        our_onroll[1] = Int((game.p0 >> (BackgammonNet.IDX_P0_BAR << 2)) & 0xF)
-        our_opp[1] = Int((game.p1 >> (BackgammonNet.IDX_P1_BAR << 2)) & 0xF)
+        our_onroll[25] = Int((game.p0 >> (BackgammonNet.IDX_P0_BAR << 2)) & 0xF)
+        our_opp[25] = Int((game.p1 >> (BackgammonNet.IDX_P1_BAR << 2)) & 0xF)
     else
-        for pt in 1:24
-            our_onroll[pt + 1] = Int((game.p1 >> (pt << 2)) & 0xF)
-            our_opp[pt + 1] = Int((game.p0 >> (pt << 2)) & 0xF)
+        for col in 1:24
+            our_onroll[col] = Int((game.p1 >> (col << 2)) & 0xF)          # P1: BNet(col)
+            our_opp[col] = Int((game.p0 >> ((25 - col) << 2)) & 0xF)     # P0: BNet(25-col)
         end
-        our_onroll[1] = Int((game.p1 >> (BackgammonNet.IDX_P1_BAR << 2)) & 0xF)
-        our_opp[1] = Int((game.p0 >> (BackgammonNet.IDX_P0_BAR << 2)) & 0xF)
+        our_onroll[25] = Int((game.p1 >> (BackgammonNet.IDX_P1_BAR << 2)) & 0xF)
+        our_opp[25] = Int((game.p0 >> (BackgammonNet.IDX_P0_BAR << 2)) & 0xF)
     end
 
     gnubg_opp = Int.(board[1])
