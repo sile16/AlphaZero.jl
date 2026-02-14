@@ -21,7 +21,7 @@ obs_type_main = length(args) >= 2 ? args[2] : "minimal"
 num_games_main = length(args) >= 3 ? parse(Int, strip(args[3])) : 500
 net_width_main = length(args) >= 4 ? parse(Int, strip(args[4])) : 256
 net_blocks_main = length(args) >= 5 ? parse(Int, strip(args[5])) : 6
-num_workers_main = length(args) >= 6 ? parse(Int, strip(args[6])) : 4
+num_workers_main = length(args) >= 6 ? parse(Int, strip(args[6])) : 16
 mcts_iters_main = length(args) >= 7 ? parse(Int, strip(args[7])) : 100
 script_dir_main = @__DIR__
 
@@ -98,6 +98,7 @@ addprocs(num_workers_main; exeflags=`--project=$(Base.active_project())`)
     global az_player = MctsPlayer(gspec, network, mcts_params)
     global gnubg_0ply = GnubgPlayer.GnubgBaseline(ply=0)
     global gnubg_1ply = GnubgPlayer.GnubgBaseline(ply=1)
+    global gnubg_2ply = GnubgPlayer.GnubgBaseline(ply=2)
 end
 
 # Sample chance outcome helper
@@ -119,7 +120,7 @@ end
     env = GI.init(gspec)
     env.rng = rng
 
-    gnubg_player = gnubg_ply == 0 ? gnubg_0ply : gnubg_1ply
+    gnubg_player = gnubg_ply == 0 ? gnubg_0ply : gnubg_ply == 1 ? gnubg_1ply : gnubg_2ply
 
     while !GI.game_terminated(env)
         # Handle chance nodes (dice rolls)
@@ -210,17 +211,17 @@ flush(stdout)
 results = Dict{String, Any}()
 total_start = time()
 
-r = evaluate_matchup(0, true, NUM_GAMES, base_seed=1000)
-results["az_vs_gnubg0_white"] = r
-
-r = evaluate_matchup(0, false, NUM_GAMES, base_seed=2000)
-results["az_vs_gnubg0_black"] = r
-
 r = evaluate_matchup(1, true, NUM_GAMES, base_seed=3000)
 results["az_vs_gnubg1_white"] = r
 
 r = evaluate_matchup(1, false, NUM_GAMES, base_seed=4000)
 results["az_vs_gnubg1_black"] = r
+
+r = evaluate_matchup(2, true, NUM_GAMES, base_seed=5000)
+results["az_vs_gnubg2_white"] = r
+
+r = evaluate_matchup(2, false, NUM_GAMES, base_seed=6000)
+results["az_vs_gnubg2_black"] = r
 
 total_time = time() - total_start
 
@@ -234,19 +235,17 @@ println("Workers: $NUM_WORKERS, MCTS iters: $MCTS_ITERS_LOCAL")
 println("Total time: $(round(total_time, digits=1))s ($(round(total_time/60, digits=1)) min)")
 println()
 
-gnubg0_combined = (results["az_vs_gnubg0_white"].avg + results["az_vs_gnubg0_black"].avg) / 2
-gnubg1_combined = (results["az_vs_gnubg1_white"].avg + results["az_vs_gnubg1_black"].avg) / 2
-gnubg0_wr = (results["az_vs_gnubg0_white"].win_rate + results["az_vs_gnubg0_black"].win_rate) / 2
-gnubg1_wr = (results["az_vs_gnubg1_white"].win_rate + results["az_vs_gnubg1_black"].win_rate) / 2
+for ply in [1, 2]
+    key_w = "az_vs_gnubg$(ply)_white"
+    key_b = "az_vs_gnubg$(ply)_black"
+    combined = (results[key_w].avg + results[key_b].avg) / 2
+    wr = (results[key_w].win_rate + results[key_b].win_rate) / 2
+    @printf("vs GnuBG %d-ply: Combined reward = %.3f, Win rate = %.1f%%\n", ply, combined, 100*wr)
+    @printf("  As white: %.3f (%.1f%% wins)\n", results[key_w].avg, 100*results[key_w].win_rate)
+    @printf("  As black: %.3f (%.1f%% wins)\n", results[key_b].avg, 100*results[key_b].win_rate)
+    println()
+end
 
-@printf("vs GnuBG 0-ply: Combined reward = %.3f, Win rate = %.1f%%\n", gnubg0_combined, 100*gnubg0_wr)
-@printf("  As white: %.3f (%.1f%% wins)\n", results["az_vs_gnubg0_white"].avg, 100*results["az_vs_gnubg0_white"].win_rate)
-@printf("  As black: %.3f (%.1f%% wins)\n", results["az_vs_gnubg0_black"].avg, 100*results["az_vs_gnubg0_black"].win_rate)
-println()
-@printf("vs GnuBG 1-ply: Combined reward = %.3f, Win rate = %.1f%%\n", gnubg1_combined, 100*gnubg1_wr)
-@printf("  As white: %.3f (%.1f%% wins)\n", results["az_vs_gnubg1_white"].avg, 100*results["az_vs_gnubg1_white"].win_rate)
-@printf("  As black: %.3f (%.1f%% wins)\n", results["az_vs_gnubg1_black"].avg, 100*results["az_vs_gnubg1_black"].win_rate)
-
-println("\n" * "=" ^ 60)
+println("=" ^ 60)
 
 rmprocs(workers())

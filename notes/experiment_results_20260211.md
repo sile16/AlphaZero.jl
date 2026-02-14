@@ -107,13 +107,57 @@ All experiments start from locked-in baseline: PER + Reanalyze, stochastic wrapp
   - Random targeting (2048 batch): +0.692 vs 1-ply (**-29%**). GPU reanalyze time exceeds self-play CPU window.
 - **Conclusion**: Sequential reanalyze after buffer update with latest weights remains optimal.
 
+### 10. Network Architecture + Observation Type Sweep — DONE
+
+Tested 256w×5b (1.13M params, 4x larger) and min_plus_flat (350 features, +6 pre-computed) vs baseline.
+
+| Model | Obs | Params | vs GnuBG 0-ply | vs GnuBG 1-ply | Time |
+|-------|-----|--------|----------------|----------------|------|
+| **128w×3b** | **minimal_flat (344)** | **283K** | **+1.403 (92%)** | **+1.146 (82%)** | **72 min** |
+| 256w×5b | min_plus_flat (350) | 1.13M | +1.325 (90%) | +1.158 (82%) | 163 min |
+| 256w×5b | minimal_flat (344) | 1.13M | +1.328 (90%) | +0.980 (75%) | 126 min |
+| 128w×3b | min_plus_flat (350) | 284K | +1.054 (83%) | +0.667 (68%) | 114 min |
+
+**Key findings**:
+- **128w×3b minimal_flat remains the best at 50 iterations**. The smaller model learns more efficiently with less data.
+- **256w×5b underfits at 50 iterations**: 4x more parameters need proportionally more training. With minimal_flat, 256w×5b (+0.980) is -14% worse than 128w×3b (+1.146).
+- **min_plus_flat helps large models but hurts small ones**: For 256w×5b, min_plus raises performance from +0.980 to +1.158 (+18%). But for 128w×3b, min_plus *drops* performance from +1.146 to +0.667 (-42%).
+- **Hypothesis**: The 6 extra pre-computed features (pip counts, contact flags, bearoff indicators) provide useful shortcuts for the larger model (saving capacity for other patterns), but the small model lacks capacity to integrate them and they dilute the core 344 features.
+- **256w×5b min_plus_flat matches 128w×3b minimal_flat** (+1.158 vs +1.146) at 50 iter, but takes 2.3x longer. The larger model needs a 200-iter run to show its potential.
+
+Sessions:
+- `distributed_20260212_220302_per_reanalyze` — 128w×3b minimal_flat (best 50-iter)
+- `distributed_20260213_010615_per_reanalyze` — 256w×5b minimal_flat
+- `distributed_20260213_031243_per_reanalyze` — 256w×5b min_plus_flat
+- `distributed_20260213_055608_per_reanalyze` — 128w×3b min_plus_flat
+
+### 11. 200-Iteration Runs — DONE
+
+Both 50-iter sessions resumed to 200 iterations with 2-ply evaluation added.
+
+| Model | Obs | vs GnuBG 1-ply | vs GnuBG 2-ply | Train Time |
+|-------|-----|---------------|---------------|------------|
+| **256w×5b** | **min_plus_flat (350)** | **+1.484 (88.4%)** | **+1.526 (94.0%)** | **359 min** |
+| 128w×3b | minimal_flat (344) | +1.353 (84.8%) | +1.409 (92.4%) | 211 min |
+| *Old best (PER+RA v0.4.1)* | *minimal (330)* | *+1.338 (84%)* | *N/A* | *—* |
+
+**Key findings**:
+- **256w×5b min_plus_flat is the new overall best**: +1.484 vs 1-ply (88.4%), +9.7% equity over 128w×3b. Larger model excels with more training.
+- **128w×3b 200-iter also improves**: +1.353 vs 1-ply (84.8%), +1.1% over old best (+1.338). v0.6.0 obs helps marginally.
+- **2-ply anomaly**: Both models score HIGHER vs 2-ply than 1-ply. Verified ply is working (different moves/timing). Likely SHORT_GAME artifact — 2-ply's strategy in near-bearoff positions is more exploitable by MCTS-100 tree search.
+- **Board/reward verification**: 20 full games verified with strict @assert — checker counts, board encoding, gnubg evaluation sanity, and reward calculation all match exactly.
+
+Sessions:
+- `distributed_20260212_220302_per_reanalyze` — 128w×3b minimal_flat (resumed 50→200)
+- `distributed_20260213_031243_per_reanalyze` — 256w×5b min_plus_flat (resumed 50→200)
+
 ### Priority Order
 1. ~~Temperature schedule~~ — **DONE, all worse. τ=1 is optimal.**
 2. ~~Concurrent reanalyze~~ — **DONE, all worse. Sequential is optimal.**
 3. ~~BackgammonNet v0.6.0~~ — **DONE, +17.7% improvement! New 50-iter best.**
-4. **Larger model** (addresses known capacity bottleneck)
-5. Dirichlet noise (quick param change)
-6. CPUCT (quick param change)
-7. Reanalyze params (tune best feature)
-8. MCTS sims (slowest experiment)
-9. **200-iter run with v0.6.0** (current best is v0.4.1 200-iter +1.338)
+4. ~~Larger model + obs type~~ — **DONE, 128w×3b minimal_flat still best at 50 iter. 256w×5b needs 200+ iter.**
+5. ~~200-iter runs~~ — **DONE, 256w×5b min_plus_flat is new overall best (+1.484 vs 1-ply).**
+6. Dirichlet noise (quick param change)
+7. CPUCT (quick param change)
+8. Reanalyze params (tune best feature)
+9. MCTS sims (slowest experiment)

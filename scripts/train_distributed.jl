@@ -2390,25 +2390,33 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     CURRENT_ITERATION[] = iter  # Update for temperature scheduling
 
     local new_samples, games_this_iter, avg_loss, train_result
+    local t_sp, t_train, t_reanalyze
 
     if USE_GPU_INFERENCE
         # Sequential: GPU can't do training + inference simultaneously
         # 1. Self-play (GPU inference server)
+        t0 = time()
         new_samples, games_this_iter = parallel_self_play(ARGS["games_per_iteration"])
+        t_sp = time() - t0
         # 2. Train on buffer (GPU training)
+        t0 = time()
         train_result = train_on_buffer!(replay_buffer, network, opt_state)
+        t_train = time() - t0
         avg_loss = train_result.avg_loss
     else
         # Overlapped: self-play (CPU) runs concurrently with training (GPU)
         # Self-play uses cpu_network (read-only), training uses network (GPU, write)
+        t0 = time()
         sp_task = Threads.@spawn parallel_self_play(ARGS["games_per_iteration"])
 
         # Train on existing buffer while self-play runs (iter 1: buffer empty, no-op)
         train_result = train_on_buffer!(replay_buffer, network, opt_state)
+        t_train = time() - t0
         avg_loss = train_result.avg_loss
 
         # Wait for self-play to complete
         new_samples, games_this_iter = fetch(sp_task)
+        t_sp = time() - t0  # wall time including overlap with training
 
         # Sync GPU→CPU weights AFTER self-play done (safe: no concurrent reads)
         if avg_loss > 0
@@ -2433,16 +2441,18 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
 
     # Reanalyze buffer positions with latest network (sequential, after buffer update)
     reanalyzed_count = 0
+    t0 = time()
     if USE_REANALYZE && buf_length(replay_buffer) >= BATCH_SIZE
         reanalyzed_count = reanalyze_buffer!(replay_buffer, network)
     end
+    t_reanalyze = time() - t0
 
     cur_buf_size = buf_length(replay_buffer)
     iter_time = time() - iter_start
     elapsed = time() - start_time
     games_per_min = total_games / (elapsed / 60)
 
-    @info "Iteration $iter" avg_loss buffer_size=cur_buf_size total_games games_per_min iter_time
+    @info "Iteration $iter" avg_loss buffer_size=cur_buf_size total_games games_per_min iter_time t_sp t_train t_reanalyze
     flush(stdout)
     flush(stderr)
 
@@ -2459,6 +2469,9 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         @info "train/buffer_size" value=cur_buf_size log_step_increment=0
         @info "perf/games_per_min" value=games_per_min log_step_increment=0
         @info "perf/iter_time_s" value=iter_time log_step_increment=0
+        @info "perf/selfplay_s" value=t_sp log_step_increment=0
+        @info "perf/train_s" value=t_train log_step_increment=0
+        @info "perf/reanalyze_s" value=t_reanalyze log_step_increment=0
         @info "train/total_games" value=total_games log_step_increment=0
         if USE_BEAROFF
             n_trunc = count(s -> s.bearoff_probs !== nothing, new_samples)
