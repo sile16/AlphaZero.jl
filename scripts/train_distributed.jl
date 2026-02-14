@@ -161,6 +161,18 @@ function parse_args()
             help = "Final temperature at last iteration when using --temp-iter-decay"
             arg_type = Float64
             default = 0.3
+        "--dirichlet-alpha"
+            help = "Dirichlet noise alpha (lower = more concentrated, Go uses 0.03)"
+            arg_type = Float64
+            default = 0.3
+        "--dirichlet-epsilon"
+            help = "Dirichlet noise epsilon (fraction of noise vs prior)"
+            arg_type = Float64
+            default = 0.25
+        "--cpuct"
+            help = "CPUCT exploration constant for MCTS"
+            arg_type = Float64
+            default = 2.0
     end
 
     return ArgParse.parse_args(s)
@@ -1611,10 +1623,10 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
 
     mcts_params = MctsParams(
         num_iters_per_turn=MCTS_ITERS,
-        cpuct=2.0,
+        cpuct=Float64(ARGS["cpuct"]),
         temperature=ConstSchedule(1.0),
-        dirichlet_noise_ϵ=0.25,
-        dirichlet_noise_α=0.3)
+        dirichlet_noise_ϵ=Float64(ARGS["dirichlet_epsilon"]),
+        dirichlet_noise_α=Float64(ARGS["dirichlet_alpha"]))
     player = BatchedMCTS.BatchedMctsPlayer(
         gspec, single_oracle, mcts_params;
         batch_size=INFERENCE_BATCH_SIZE, batch_oracle=batch_oracle,
