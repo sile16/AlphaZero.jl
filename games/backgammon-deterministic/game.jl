@@ -180,10 +180,10 @@ function GI.current_state(g::GameEnv)
   return BackgammonNet.BackgammonGame(
     game.p0, game.p1, game.dice, game.remaining_actions,
     game.current_player, game.terminated, game.reward,
-    game.history,  # shared
     game.doubles_only, game.obs_type,
     game.cube_value, game.cube_owner, game.phase, game.cube_enabled,
     game.my_away, game.opp_away, game.is_crawford, game.is_post_crawford, game.jacoby_enabled,
+    game.tavla,
     game._actions_buffer, false, game._sources_buffer1, game._sources_buffer2
   )
 end
