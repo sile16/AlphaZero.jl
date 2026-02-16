@@ -64,22 +64,26 @@ julia --project scripts/quick_eval.jl
 
 **Always evaluate against GnuBG**, not just random. Random baseline is misleading -- models that dominate random may not generalize.
 
-## Performance Baselines (post-initial-position-fix, BackgammonNet v0.3.2+)
+## Performance Baselines (corrected 2026-02-14, post-board-encoding-fix)
 
-All use FCResNetMultiHead 128w x 3b (283K params), MINIMAL observations, 400 MCTS sims, AdamW lr=0.001.
+**CRITICAL**: All GnuBG eval results before 2026-02-14 were invalid due to a board encoding bug (commit e164a85). The bug caused GnuBG to evaluate wrong positions and play terribly, inflating our win rates from ~3-10% to 65-92%. See `notes/corrected_eval_results_20260214.md` for details.
 
-| Experiment | Iters | Loss (final) | vs GnuBG 0-ply | vs GnuBG 1-ply | Time (min) |
-|-----------|-------|-------------|----------------|----------------|------------|
-| **PER** | **200** | **3.90** | **+1.38 (92%)** | **+1.21 (82%)** | **312** |
-| Baseline | 200 | 3.89 | +1.31 (89%) | +1.05 (78%) | 254.5 |
-| PER | 50 | 4.12 | +1.06 (83%) | +0.87 (74%) | — |
-| Bear-off rollouts | 50 | 3.98 | +1.00 (81%) | +0.83 (72%) | 67.1 |
-| Baseline | 50 | 3.97 | +0.94 (79%) | +0.55 (66%) | 75.0 |
-| Reanalyze | 50 | 3.98 | +0.97 (79%) | +0.69 (71%) | 80.0 |
+Corrected results below (vs GnuBG 0-ply, 1000 games, 100 MCTS iters, 8 workers):
 
-See `notes/experiment_results_20260207.md` and `notes/experiment_results_20260209.md` for full analysis.
+| Rank | Experiment | Architecture | Iters | Equity | Win% |
+|------|-----------|-------------|-------|--------|------|
+| 1 | **PER+Reanalyze** | **256w×5b** | **200** | **-1.361** | **9.6%** |
+| 2 | PER | 128w×3b | 200 | -1.558 | 7.8% |
+| 3 | PER+Reanalyze | 256w×5b | 50 | -1.573 | 7.0% |
+| 4 | Baseline | 128w×3b | 200 | -1.746 | 4.6% |
+| 5 | PER | 128w×3b | 50 | -1.759 | 4.8% |
+| 6 | Baseline | 128w×3b | 50 | -1.841 | 3.5% |
+| 7 | Bearoff rollouts | 128w×3b | 50 | -1.993 | 2.1% |
+| 8 | Reanalyze | 128w×3b | 50 | -2.054 | 2.3% |
 
-**Note**: Pre-v0.3.2 results used asymmetric initial positions and are NOT comparable.
+**All models are genuinely weak** — best is 9.6% wins vs GnuBG 0-ply (weakest setting).
+
+**Note**: Pre-v0.3.2 results used asymmetric initial positions and are NOT comparable. Pre-2026-02-14 GnuBG results used buggy board encoding and are INVALID.
 
 ### Key Training Parameters
 - **Optimizer**: AdamW (lr=0.001, weight_decay=1e-4) — decoupled weight decay prevents loss explosion
@@ -129,44 +133,48 @@ Sessions saved to `sessions/distributed_YYYYMMDD_HHMMSS/` containing:
 - `tb/` - TensorBoard logs
 - `final_eval_results.txt` - Final evaluation results
 
-### Active Sessions
-- `distributed_20260209_215824_per` - **Best overall** (200 iter PER, +1.21 vs GnuBG 1-ply)
-- `distributed_20260206_223524` - 200 iter baseline (+1.05 vs GnuBG 1-ply)
-- `distributed_20260207_061713_bearoff` - Best 50-iter (bear-off rollouts, +0.83 vs GnuBG 1-ply)
-- `distributed_20260207_030412_per` - PER 50-iter experiment (+0.79 vs GnuBG 1-ply)
-- `distributed_20260207_043500_reanalyze` - Reanalyze experiment (+0.69 vs GnuBG 1-ply)
-- `distributed_20260206_204548` - Original 50-iter baseline (+0.55 vs GnuBG 1-ply)
+### Active Sessions (corrected equity vs GnuBG 0-ply)
+- `distributed_20260213_031243_per_reanalyze` - **Best overall** (256w×5b, 200 iter PER+Reanalyze, -1.361 equity, 9.6% wins)
+- `distributed_20260209_215824_per` - Best 128w (200 iter PER, -1.558 equity, 7.8% wins)
+- `distributed_20260213_010615_per_reanalyze` - 256w×5b 50-iter (-1.573 equity, 7.0% wins)
+- `distributed_20260206_223524` - 200 iter baseline (-1.746 equity, 4.6% wins)
+- `distributed_20260207_030412_per` - PER 50-iter (-1.759 equity, 4.8% wins)
+- `distributed_20260206_204548` - Original 50-iter baseline (-1.841 equity, 3.5% wins)
 
 ## Key Lessons
 
+### Critical Bug (2026-02-14)
+0. **ALWAYS verify board encoding against external reference** -- `_to_gnubg_board` had 3 bugs (off-by-one, bar position, opponent perspective) that made GnuBG evaluate wrong positions. All pre-fix results showed 65-92% win rates when reality was 3-10%. Self-consistency checks are NOT sufficient; verify against gnubg's known position IDs.
+
 ### Training Dynamics
-1. **PER 200-iter is the new best** -- +1.21 vs GnuBG 1-ply (82% wins), +15% equity over baseline 200-iter (+1.05)
-2. **PER benefit compounds with training length** -- at 50 iter: +58% equity over baseline; at 200 iter: +15% equity. PER is consistently better.
-3. **Loss plateau ≠ strength plateau** -- loss plateaus at ~3.95 by iter 50, but GnuBG strength improves steadily through iter 200
+1. **PER is the only reliable improvement** -- +0.082 equity at 50 iter, +0.188 at 200 iter over baseline. The only technique consistently validated post-fix.
+2. **Bearoff rollouts and reanalyze HURT** -- both showed regressions vs baseline in corrected eval (-0.152 and -0.213 respectively). Previous apparent gains were artifacts of the encoding bug.
+3. **Loss plateau != strength plateau** -- loss plateaus at ~3.95 by iter 50, but GnuBG strength improves steadily through iter 200
 4. **AdamW + lr=0.001 is best optimizer config** -- decoupled weight decay prevents loss explosion
-5. **inference_batch_size << mcts_iters** -- batch=50 with iters=400 → depth ~8 (batch=400 → depth-1 → divergence)
-6. **Buffer must hold 3-5 iterations** -- too small = buffer churn → divergence
+5. **inference_batch_size << mcts_iters** -- batch=50 with iters=400 -> depth ~8 (batch=400 -> depth-1 -> divergence)
+6. **Buffer must hold 3-5 iterations** -- too small = buffer churn -> divergence
 
 ### Technique Insights
-7. **PER is the single best improvement** -- raises loss but strengthens play. IS weights focus on hard positions → better decisions.
-8. **Bear-off rollouts = best 50-iter endgame improvement** -- +51% equity gain at 50 iter, actually faster (better endgame targets)
-9. **Reanalyze gives moderate gains** -- +25% equity gain, refreshes stale value targets, slight overhead
-10. **Bear-off table has signal mismatch** -- table values are pre-dice, game states are post-dice. See `notes/bearoff_chance_node_issue.md`
+7. **256w×5b >> 128w×3b** -- larger model at 200 iter beats best 128w by +0.197 equity
+8. **All models are genuinely weak** -- best gets 9.6% wins vs GnuBG 0-ply. Self-play training alone is not producing competitive play.
+9. **Bear-off table has signal mismatch** -- table values are pre-dice, game states are post-dice. See `notes/bearoff_chance_node_issue.md`
 
 ### Evaluation
 10. **Random baseline is misleading** -- always evaluate vs GnuBG
-11. **MINIMAL features generalize best** -- simpler obs beats larger feature sets against GnuBG
+11. **MINIMAL features generalize best** -- simpler obs beats larger feature sets against GnuBG (relative ranking still valid post-fix)
 12. **2000+ eval games** for reliable comparisons (500-game matchups × 4 = 2000 total, both sides)
 
 ## Next Steps
 
 ### Priority (next experiments)
-1. **Fix bear-off table usage** -- compute post-dice values (move enumeration) or use explicit chance nodes. See `notes/bearoff_chance_node_issue.md`
-2. **PER + bear-off (200 iter)** -- combine top 2 techniques with fixed bear-off integration
-3. **Larger model (256w×10b)** -- loss plateau at ~3.95 suggests 128w×3b (283K) may be capacity-limited
+1. **Diagnose weak self-play** -- best model gets 9.6% wins vs GnuBG 0-ply. Need fundamental training improvements.
+2. **Scale up model + training** -- 256w×5b at 200 iter is best; try 256w×10b or 500+ iterations
+3. **PER is the key technique** -- only reliable improvement. Focus on PER + longer training.
+4. **CPUCT tuning** -- try 1.0, 1.5, 3.0 (default 2.0, never tuned with correct eval)
+5. **Fix GnubgPlayerFast move conversion** -- would enable 16x faster gnubg eval
 
 ### Future
-4. Web-based workers (WASM + WebGPU) via sibling project `/home/sile/github/tavlatalk/`
-5. Cloud remote workers for distributed self-play
-6. Match equity table (MET) for proper match play scoring
-7. Exam eval (known tricky positions from GnuBG analysis)
+6. Web-based workers (WASM + WebGPU) via sibling project `/home/sile/github/tavlatalk/`
+7. Cloud remote workers for distributed self-play
+8. Match equity table (MET) for proper match play scoring
+9. Exam eval (known tricky positions from GnuBG analysis)

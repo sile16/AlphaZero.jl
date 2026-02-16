@@ -1,4 +1,6 @@
-# Hyperparameter Sweep Results (2026-02-02)
+# ~~Hyperparameter Sweep Results (2026-02-02)~~
+
+> **GnuBG RESULTS INVALIDATED (2026-02-14)**: All GnuBG evaluation numbers in this file are invalid due to a critical board encoding bug in `_to_gnubg_board` (fixed in commit e164a85). The "vs Random" results and general training dynamics (throughput, loss, timing) are still valid. The GnuBG sections (including the "Rankings reverse!" finding and 100-iteration GnuBG results) used the buggy encoding. See `notes/corrected_eval_results_20260214.md` for corrected results. The lesson "random baseline is misleading" remains true, just for different reasons — our models are actually much weaker than they appeared.
 
 ## Objective
 Find optimal network architecture and MCTS settings before long training run.

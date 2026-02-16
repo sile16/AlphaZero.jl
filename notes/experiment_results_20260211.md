@@ -1,4 +1,6 @@
-# Experiment Results — Stochastic Wrapper (2026-02-11)
+# ~~Experiment Results — Stochastic Wrapper (2026-02-11)~~
+
+> **INVALIDATED (2026-02-14)**: All GnuBG evaluation numbers in sections before "CRITICAL: GnuBG Board Encoding Bug" are invalid due to a board encoding bug in `_to_gnubg_board` (fixed in commit e164a85). Win rates of 65-92% reported here were actually ~3-10% in reality. See `notes/corrected_eval_results_20260214.md` for corrected results. The bug explanation section at the end of this file is valid. Non-GnuBG observations (training dynamics, stochastic wrapper bugs, throughput) are still valid. Relative technique comparisons may partially hold but several conclusions changed: bearoff rollouts and reanalyze were found to HURT performance in corrected eval.
 
 ## Baseline
 - **Locked-in config**: PER + Reanalyze, stochastic wrapper, AdamW lr=0.001

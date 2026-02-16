@@ -273,13 +273,14 @@ Instead of using game rules for MCTS simulation, MuZero learns:
 
 ### Key Metrics
 
-| Metric | Target |
-|--------|--------|
-| vs Random | >90% win rate |
-| vs GnuBG 0-ply | >70% win rate |
-| vs GnuBG 2-ply | >50% win rate |
-| Training samples/sec | Monitor for regressions |
-| GPU utilization | Aim for >50% |
+| Metric | Current Best | Target |
+|--------|-------------|--------|
+| vs Random | ~95% win rate | >95% win rate |
+| vs GnuBG 0-ply | 9.6% win rate | >30% win rate |
+| vs GnuBG 1-ply | ~5% win rate (est.) | >20% win rate |
+| Training samples/sec | Monitor for regressions | — |
+
+**Note**: Previous targets (>70% vs 0-ply, >50% vs 2-ply) were based on invalid GnuBG eval results (board encoding bug, fixed 2026-02-14). The model is genuinely weak — best is 9.6% wins vs GnuBG 0-ply. See `notes/corrected_eval_results_20260214.md`.
 
 ### A/B Testing Framework
 

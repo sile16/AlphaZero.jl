@@ -1,4 +1,6 @@
-# GnuBG Evaluation Results
+# ~~GnuBG Evaluation Results~~
+
+> **ENTIRELY INVALIDATED (2026-02-14)**: All GnuBG evaluation numbers in this file are invalid due to a critical board encoding bug in `_to_gnubg_board` (fixed in commit e164a85). The bug caused GnuBG to evaluate wrong positions and play terribly. Win rates of 55-70% reported here were actually ~3-10% in reality. The color asymmetry analysis is also suspect — it may have been an artifact of the encoding bug rather than a real training issue. See `notes/corrected_eval_results_20260214.md` for corrected results. The game state cloning bug fix (section at end) is still valid. The general lesson "random baseline is misleading" remains true.
 
 ## Summary
 

@@ -1,4 +1,6 @@
-# Experiment Results — 2026-02-07
+# ~~Experiment Results — 2026-02-07~~
+
+> **INVALIDATED (2026-02-14)**: All GnuBG evaluation numbers in this file are invalid due to a critical board encoding bug in `_to_gnubg_board` (fixed in commit e164a85). The bug caused GnuBG to evaluate wrong positions and play terribly, inflating win rates from ~3-10% (reality) to 65-92% (reported here). See `notes/corrected_eval_results_20260214.md` for corrected results. Training dynamics observations (loss, throughput) and bear-off table bug analysis are still valid. Relative technique comparisons may hold but absolute GnuBG numbers are meaningless. Notably, corrected eval shows bearoff rollouts and reanalyze HURT performance (opposite of what was concluded here).
 
 ## Overview
 
