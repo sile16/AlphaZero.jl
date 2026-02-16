@@ -157,20 +157,21 @@ function _gnubg_moves_to_action(moves, d1, d2, current_player::Int)
         return BackgammonNet.encode_action(25, 25)  # Pass
     end
 
-    # Convert gnubg point to BackgammonNet point
-    # gnubg: 25=bar, 1-24=points, 0=bearoff
-    # BackgammonNet: 0=bar, 1-24=points
-    # Player 0: BackgammonNet_pt = 26 - gnubg_pt (points are flipped)
-    # Player 1: BackgammonNet_pt = gnubg_pt (same direction)
+    # Convert gnubg move point to BackgammonNet source point
+    # gnubg moves: 25=bar, 1-24=points (1-indexed, own perspective), 0=bearoff
+    # BackgammonNet: 0=bar, 1-24=points (absolute), 25=pass
+    # Mapping: gnubg move point N → gnubg board idx (N-1) → BNet point
+    #   P0: BNet = 24 - (N-1) = 25 - N  (P0's ace=gnubg1 → BNet24)
+    #   P1: BNet = (N-1) + 1 = N        (P1's ace=gnubg1 → BNet1)
     function convert_point(gnubg_pt)
         if gnubg_pt == 25
             return 0  # bar -> 0
         elseif gnubg_pt == 0
             return 0  # bear off -> 0 (as destination)
         elseif current_player == 0
-            return 26 - gnubg_pt  # Player 0: flip (gnubg 22 -> BG 4)
+            return 25 - gnubg_pt  # Player 0: gnubg 1 → BNet 24 (ace point)
         else
-            return gnubg_pt  # Player 1: same points
+            return gnubg_pt  # Player 1: gnubg N → BNet N
         end
     end
 
