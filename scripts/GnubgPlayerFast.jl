@@ -1,5 +1,13 @@
-# GnubgPlayerFast.jl - Optimized GnuBG player using native best_move
+# GnubgPlayerFast.jl - BROKEN — DO NOT USE
 #
+# WARNING: The move conversion in _gnubg_moves_to_action is fundamentally broken.
+# Verified 2026-02-16: 48% illegal actions, 13% wrong moves, only 39% correct.
+# Issues: P1 point conversion wrong, die ordering mismatch, combo encoding mismatch.
+# See scripts/verify_gnubgfast.jl for the verification script.
+#
+# Use GnubgPlayer.jl instead (evaluates all legal actions, guaranteed correct).
+#
+# Original description:
 # Uses gnubg's native best_move function for ~40x speedup over iterating legal moves.
 # Performance: ~25K moves/sec (vs ~2K with old method)
 #
