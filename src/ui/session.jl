@@ -2,7 +2,7 @@
 ##### Session management
 #####
 
-const DEFAULT_SESSIONS_DIR = "sessions"
+const DEFAULT_SESSIONS_DIR = "/homeshare/projects/AlphaZero.jl/sessions"
 
 """
     SessionReport

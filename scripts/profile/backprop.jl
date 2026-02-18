@@ -23,7 +23,7 @@ function profile_backprop(
 
   exp = @set exp.params.learning.batch_size = batch_size
   exp = @set exp.netparams.num_filters = num_filters
-  session = Session(exp, autosave=false, dir="sessions/profile-backprop-$(exp.name)")
+  session = Session(exp, autosave=false, dir="/homeshare/projects/AlphaZero.jl/sessions/profile-backprop-$(exp.name)")
   env = session.env
   for i in 1:num_games
     trace = play_game(exp.gspec, RandomPlayer())

@@ -6,7 +6,7 @@
 #   julia --threads 16 --project scripts/eval_vs_bgblitz.jl <checkpoint> [obs_type] [num_games] [width] [blocks] [num_workers] [mcts_iters]
 #
 # Example:
-#   julia --threads 16 --project scripts/eval_vs_bgblitz.jl sessions/.../checkpoints/latest.data minimal 200 128 3 8 100
+#   julia --threads 16 --project scripts/eval_vs_bgblitz.jl /homeshare/projects/AlphaZero.jl/sessions/.../checkpoints/latest.data minimal 200 128 3 8 100
 
 using Printf
 using Statistics

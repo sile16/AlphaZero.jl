@@ -14,7 +14,7 @@ gspec = BackgammonDeterministic.GameSpec()
 
 # Load our distributed network
 println("Loading distributed training network...")
-nn_path = joinpath(@__DIR__, "..", "sessions/single_server_20260125_222323/checkpoints/latest.data")
+nn_path = joinpath("/homeshare/projects/AlphaZero.jl", "sessions/single_server_20260125_222323/checkpoints/latest.data")
 nn_bytes = read(nn_path)
 weights = FluxLib.deserialize_weights(nn_bytes)
 

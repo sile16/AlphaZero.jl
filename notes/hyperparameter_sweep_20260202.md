@@ -11,7 +11,7 @@ All experiments: 30 iterations, seed=42, 6 workers, 50 games/iteration, 200-game
 
 ### Experiment A: Baseline
 - **Config**: 128w × 3b (281,641 params), 100 MCTS
-- **Session**: `sessions/cluster_20260202_103525`
+- **Session**: `/homeshare/projects/AlphaZero.jl/sessions/cluster_20260202_103525`
 - **Time**: 49.6 minutes
 - **Throughput**: ~62 games/min
 - **Periodic evals**: iter10=1.52, iter20=1.80, iter30=1.82
@@ -19,7 +19,7 @@ All experiments: 30 iterations, seed=42, 6 workers, 50 games/iteration, 200-game
 
 ### Experiment B: Wider Network
 - **Config**: 256w × 3b (857,513 params), 100 MCTS
-- **Session**: `sessions/cluster_20260202_112558`
+- **Session**: `/homeshare/projects/AlphaZero.jl/sessions/cluster_20260202_112558`
 - **Time**: 95.12 minutes (1.9x slower)
 - **Throughput**: ~20 games/min (3x slower)
 - **Periodic evals**: iter10=1.86, iter20=2.06, iter30=1.64
@@ -28,7 +28,7 @@ All experiments: 30 iterations, seed=42, 6 workers, 50 games/iteration, 200-game
 
 ### Experiment C: Deeper Network
 - **Config**: 128w × 6b (382,249 params), 100 MCTS
-- **Session**: `sessions/cluster_20260202_130346`
+- **Session**: `/homeshare/projects/AlphaZero.jl/sessions/cluster_20260202_130346`
 - **Time**: 65.81 minutes (1.3x slower)
 - **Throughput**: ~47 games/min
 - **Periodic evals**: iter10=1.58, iter20=1.78, iter30=1.78
@@ -37,7 +37,7 @@ All experiments: 30 iterations, seed=42, 6 workers, 50 games/iteration, 200-game
 
 ### Experiment D: More MCTS Iterations
 - **Config**: 128w × 3b (281,641 params), 200 MCTS
-- **Session**: `sessions/cluster_20260202_141047`
+- **Session**: `/homeshare/projects/AlphaZero.jl/sessions/cluster_20260202_141047`
 - **Time**: 71.42 minutes (1.4x slower)
 - **Throughput**: ~32 games/min (2x slower per game)
 - **Periodic evals**: iter10=1.66, iter20=2.22, iter30=1.82
@@ -145,7 +145,7 @@ All models struggle as white but dominate as black - suggests defensive/reactive
 Extended training to validate sweep findings with longer runs.
 
 ### Baseline (128w×3b, 100 MCTS) - 100 iterations
-- **Session**: `sessions/cluster_20260202_233010`
+- **Session**: `/homeshare/projects/AlphaZero.jl/sessions/cluster_20260202_233010`
 - **vs Random**: +1.29
 - **vs GnuBG 0-ply**: +0.425 (63.5% wins)
 - **vs GnuBG 1-ply**: **+0.215 (56.2% wins)**
@@ -153,7 +153,7 @@ Extended training to validate sweep findings with longer runs.
   - As black: +0.760 (75.0% wins)
 
 ### Deeper (128w×6b, 100 MCTS) - 100 iterations
-- **Session**: `sessions/cluster_20260202_233013`
+- **Session**: `/homeshare/projects/AlphaZero.jl/sessions/cluster_20260202_233013`
 - **vs Random**: +1.04
 - **vs GnuBG 0-ply**: +0.415 (65.5% wins)
 - **vs GnuBG 1-ply**: +0.095 (50.0% wins)

@@ -360,7 +360,7 @@ Test if larger neural network improves performance, given GPU is underutilized.
 | End time | 2026-01-24 15:37:00 |
 | Total runtime | 4hr 47min |
 | Log file | results/largenn_4hr_20260124_104941.log |
-| Session dir | sessions/largenn-4hr-20260124-104946/ |
+| Session dir | /homeshare/projects/AlphaZero.jl/sessions/largenn-4hr-20260124-104946/ |
 
 ### Results: Large Network Run (FCResNet 256×8)
 
@@ -696,9 +696,9 @@ Evaluate the three models from Experiment 5 against GnuBG (GNU Backgammon) at 0-
 
 | Model | Checkpoint | Features | Network Params |
 |-------|------------|----------|----------------|
-| MINIMAL | sessions/cluster_20260126_231628/checkpoints/latest.data | 780 | 339,241 |
-| FULL | sessions/cluster_20260127_001636/checkpoints/latest.data | 1612 | 445,737 |
-| BIASED | sessions/cluster_20260127_012254/checkpoints/latest.data | 3172 | 645,417 |
+| MINIMAL | /homeshare/projects/AlphaZero.jl/sessions/cluster_20260126_231628/checkpoints/latest.data | 780 | 339,241 |
+| FULL | /homeshare/projects/AlphaZero.jl/sessions/cluster_20260127_001636/checkpoints/latest.data | 1612 | 445,737 |
+| BIASED | /homeshare/projects/AlphaZero.jl/sessions/cluster_20260127_012254/checkpoints/latest.data | 3172 | 645,417 |
 
 ### Results vs GnuBG 0-ply (Neural Network Only)
 

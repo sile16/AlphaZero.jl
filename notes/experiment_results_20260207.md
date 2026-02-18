@@ -106,14 +106,14 @@ The k=6 two-sided bear-off table (`BackgammonNet.jl/src/bearoff_k6.jl`) had **tw
 6. **Next experiment**: Run 200 iter with PER + bear-off rollouts to see if improvements compound.
 
 ## Session Directories
-- Baseline 200 iter: `sessions/distributed_20260206_223524/`
-- PER 50 iter: `sessions/distributed_20260207_030412_per/`
-- Reanalyze 50 iter: `sessions/distributed_20260207_043500_reanalyze/`
-- Bear-off rollouts 50 iter: `sessions/distributed_20260207_061713_bearoff/`
-- ~~Bear-off table targets 50 iter: `sessions/distributed_20260207_162443_bearoff/`~~ (BROKEN TABLE)
-- ~~Bear-off table+TD 50 iter: `sessions/distributed_20260207_103614_bearoff/`~~ (BROKEN TABLE)
-- ~~Bear-off table+TD+resample 50 iter: `sessions/distributed_20260207_145102_bearoff/`~~ (BROKEN TABLE)
-- **Bear-off table (FIXED) 50 iter: `sessions/distributed_20260207_215103_bearoff/`**
+- Baseline 200 iter: `/homeshare/projects/AlphaZero.jl/sessions/distributed_20260206_223524/`
+- PER 50 iter: `/homeshare/projects/AlphaZero.jl/sessions/distributed_20260207_030412_per/`
+- Reanalyze 50 iter: `/homeshare/projects/AlphaZero.jl/sessions/distributed_20260207_043500_reanalyze/`
+- Bear-off rollouts 50 iter: `/homeshare/projects/AlphaZero.jl/sessions/distributed_20260207_061713_bearoff/`
+- ~~Bear-off table targets 50 iter: `/homeshare/projects/AlphaZero.jl/sessions/distributed_20260207_162443_bearoff/`~~ (BROKEN TABLE)
+- ~~Bear-off table+TD 50 iter: `/homeshare/projects/AlphaZero.jl/sessions/distributed_20260207_103614_bearoff/`~~ (BROKEN TABLE)
+- ~~Bear-off table+TD+resample 50 iter: `/homeshare/projects/AlphaZero.jl/sessions/distributed_20260207_145102_bearoff/`~~ (BROKEN TABLE)
+- **Bear-off table (FIXED) 50 iter: `/homeshare/projects/AlphaZero.jl/sessions/distributed_20260207_215103_bearoff/`**
 
 ## Observations & Lessons Learned
 

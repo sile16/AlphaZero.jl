@@ -11,6 +11,10 @@ Manifest.toml
 /docs/site/
 
 sessions
+logs
+results
+wandb
+*.log
 archive
 
 TODO.md

@@ -5,12 +5,12 @@
 ### SimpleNet Baseline (128 iterations, 4 hours)
 - **Architecture**: SimpleNet width=128, depth=6 (~233K params)
 - **Performance**: AZ_first: 0.64, Random_first: 1.67
-- **Session**: `sessions/bg-det-parallel-20260124_190437`
+- **Session**: `/homeshare/projects/AlphaZero.jl/sessions/bg-det-parallel-20260124_190437`
 
 ### FCResNet Baseline (30 iterations, ~4 hours)
 - **Architecture**: FCResNet width=256, 10 blocks (~1.79M params)
 - **Performance**: AZ_first: 0.34, Random_first: 1.58
-- **Session**: `sessions/bg-det-fcresnet-20260124_232040`
+- **Session**: `/homeshare/projects/AlphaZero.jl/sessions/bg-det-fcresnet-20260124_232040`
 - **Notes**: Training slower due to larger network, but learning trajectory looks good
 
 ---
@@ -353,7 +353,7 @@ For each change:
 ### Configuration
 - **Architecture**: FCResNetMultiHead (width=128, 3 blocks, 216K params)
 - **Training**: 69 iterations in 4h 36min
-- **Session**: `sessions/bg-multihead-baseline-20260125_121007`
+- **Session**: `/homeshare/projects/AlphaZero.jl/sessions/bg-multihead-baseline-20260125_121007`
 
 ### Performance vs Random (100 games)
 
@@ -424,7 +424,7 @@ E = P(win) * (1 + P(g|w) + P(bg|w)) - P(loss) * (1 + P(g|l) + P(bg|l))
 - **Architecture**: FCResNetMultiHead (width=128, 3 blocks, 250K params)
 - **Training**: 70 iterations in 57 minutes
 - **Workers**: 6 threads for parallel self-play
-- **Session**: `sessions/cluster_20260126_122223`
+- **Session**: `/homeshare/projects/AlphaZero.jl/sessions/cluster_20260126_122223`
 - **WandB**: https://wandb.ai/sile16-self/alphazero-jl/runs/m98fgq4s
 
 ### Performance Summary

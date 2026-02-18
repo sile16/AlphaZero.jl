@@ -32,7 +32,7 @@ function profile_self_play(
   exp = @set exp.params.self_play.sim.batch_size = batch_size
   exp = @set exp.params.self_play.sim.num_games = num_games
 
-  session = Session(exp, autosave=false, dir="sessions/profile-backprop-$(exp.name)")
+  session = Session(exp, autosave=false, dir="/homeshare/projects/AlphaZero.jl/sessions/profile-backprop-$(exp.name)")
   env = session.env
   UI.Log.section(session.logger, 1, "Profiling data generation")
   CUDA.@time AlphaZero.self_play_step!(env, session)

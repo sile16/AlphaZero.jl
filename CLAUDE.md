@@ -56,7 +56,7 @@ julia --threads 16 --project scripts/train_distributed.jl \
 # GnuBG evaluation (RECOMMENDED — use 8 workers for ~12 min runtime)
 julia --threads 16 --project scripts/eval_vs_gnubg.jl <checkpoint> [obs_type] [num_games] [width] [blocks] [num_workers] [mcts_iters]
 # Example:
-julia --threads 16 --project scripts/eval_vs_gnubg.jl sessions/distributed_20260206_204548/checkpoints/latest.data minimal 500 128 3 8 100
+julia --threads 16 --project scripts/eval_vs_gnubg.jl /homeshare/projects/AlphaZero.jl/sessions/distributed_20260206_204548/checkpoints/latest.data minimal 500 128 3 8 100
 
 # Quick eval vs random
 julia --project scripts/quick_eval.jl
@@ -117,7 +117,7 @@ Corrected results below (vs GnuBG 0-ply, 1000 games, 100 MCTS iters, 8 workers):
 ### Archived
 - `scripts/archive/` - Archived scripts including train_cluster.jl
 - `src/archive/distributed/` - Old ZMQ-based distributed module (unused)
-- `sessions/archive/` - Pre-v0.3.2 and experimental sessions
+- `/homeshare/projects/AlphaZero.jl/sessions/archive/` - Pre-v0.3.2 and experimental sessions
 
 ## Testing
 
@@ -127,13 +127,20 @@ julia --project -e 'using Pkg; Pkg.test()'
 
 ## Session Directories
 
-Sessions saved to `sessions/distributed_YYYYMMDD_HHMMSS/` containing:
+All training artifacts (sessions, logs, results, wandb) are stored on the NFS-shared directory
+`/homeshare/projects/AlphaZero.jl/` so they are accessible from all machines. Symlinks exist
+in the git repo for backward compatibility.
+
+Sessions saved to `/homeshare/projects/AlphaZero.jl/sessions/distributed_YYYYMMDD_HHMMSS/` containing:
 - `checkpoints/latest.data` - Latest network weights
 - `checkpoints/iter_N.data` - Checkpoint at iteration N
 - `tb/` - TensorBoard logs
 - `final_eval_results.txt` - Final evaluation results
 
+**TensorBoard**: `tensorboard --logdir /homeshare/projects/AlphaZero.jl/sessions`
+
 ### Active Sessions (corrected equity vs GnuBG 0-ply)
+All under `/homeshare/projects/AlphaZero.jl/sessions/`:
 - `distributed_20260213_031243_per_reanalyze` - **Best overall** (256w×5b, 200 iter PER+Reanalyze, -1.361 equity, 9.6% wins)
 - `distributed_20260209_215824_per` - Best 128w (200 iter PER, -1.558 equity, 7.8% wins)
 - `distributed_20260213_010615_per_reanalyze` - 256w×5b 50-iter (-1.573 equity, 7.0% wins)

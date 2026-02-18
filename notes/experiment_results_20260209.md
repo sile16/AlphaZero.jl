@@ -51,7 +51,7 @@ PER: α=0.6, β=0.4→1.0 (linear annealing over 200 iterations).
 - vs 1-ply: +1.207 (81.9%), white +1.216/black +1.198
 
 ## Session Directory
-- `sessions/distributed_20260209_215824_per/`
+- `/homeshare/projects/AlphaZero.jl/sessions/distributed_20260209_215824_per/`
 - Checkpoints at every 10 iterations (iter_10.data through iter_200.data)
 
 ## Lessons Learned

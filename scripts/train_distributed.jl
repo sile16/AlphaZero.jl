@@ -219,7 +219,7 @@ elseif isempty(ARGS["session_dir"])
     TEMP_MOVE_CUTOFF > 0 && push!(suffixes, "temp$(TEMP_MOVE_CUTOFF)")
     TEMP_ITER_DECAY && push!(suffixes, "iterdecay")
     suffix = isempty(suffixes) ? "" : "_" * join(suffixes, "_")
-    joinpath("sessions", "distributed_$(timestamp)$(suffix)")
+    joinpath("/homeshare/projects/AlphaZero.jl", "sessions", "distributed_$(timestamp)$(suffix)")
 else
     ARGS["session_dir"]
 end
