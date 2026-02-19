@@ -105,7 +105,7 @@ Corrected results below (vs GnuBG 0-ply, 1000 games, 100 MCTS iters, 8 workers):
 ### Training & Evaluation Scripts
 - `scripts/train_distributed.jl` - **Primary training script** (threaded, CPU inference)
 - `scripts/eval_vs_gnubg.jl` - GnuBG evaluation (parallel, multi-process)
-- `scripts/GnubgPlayer.jl` / `GnubgPlayerFast.jl` - GnuBG integration
+- `scripts/GnubgPlayer.jl` - GnuBG integration (uses BackgammonNet's GnubgInterface)
 - `scripts/diagnose_loss.jl` - Per-component loss analysis across checkpoints
 
 ### PER + Reanalyze + Bear-off (implemented in train_distributed.jl)
@@ -178,7 +178,7 @@ All under `/homeshare/projects/AlphaZero.jl/sessions/`:
 2. **Scale up model + training** -- 256w×5b at 200 iter is best; try 256w×10b or 500+ iterations
 3. **PER is the key technique** -- only reliable improvement. Focus on PER + longer training.
 4. **CPUCT tuning** -- try 1.0, 1.5, 3.0 (default 2.0, never tuned with correct eval)
-5. **Fix GnubgPlayerFast move conversion** -- would enable 16x faster gnubg eval
+5. **Faster gnubg eval** -- current approach evaluates all legal actions; could use gnubg's native best_move with correct move conversion
 
 ### Future
 6. Web-based workers (WASM + WebGPU) via sibling project `/home/sile/github/tavlatalk/`
