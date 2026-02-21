@@ -84,17 +84,17 @@ function parse_args()
             arg_type = Float64
             default = 0.0001
         "--eval-interval"
-            help = "Evaluation interval"
+            help = "Evaluation interval (every N iterations, vs GnuBG 0-ply)"
             arg_type = Int
-            default = 10
+            default = 1
         "--eval-games"
-            help = "Games per evaluation"
+            help = "Games per evaluation (split equally white/black)"
             arg_type = Int
-            default = 50
+            default = 100
         "--final-eval-games"
             help = "Games for final evaluation (0 to disable)"
             arg_type = Int
-            default = 1000
+            default = 0
         "--checkpoint-interval"
             help = "Checkpoint save interval"
             arg_type = Int
@@ -344,6 +344,128 @@ end
 # Create network
 const gspec = GameSpec()
 const NUM_ACTIONS = GI.num_actions(gspec)
+
+# Subprocess-based GnuBG evaluation (thread-safe: separate Python process, no PyCall)
+using JSON
+
+const GNUBG_LOCK = ReentrantLock()
+const GNUBG_SERVER_SCRIPT = joinpath(@__DIR__, "gnubg_eval_server.py")
+
+mutable struct GnubgProcess
+    proc::Base.Process
+    stdin::IO
+    stdout::IO
+end
+
+const GNUBG_PROC = Ref{GnubgProcess}()
+
+"""Convert BackgammonGame to gnubg board format: [[25 ints], [25 ints]]."""
+function _to_gnubg_board(g::BackgammonNet.BackgammonGame)
+    board = zeros(Int, 2, 25)
+    cp = Int(g.current_player)
+    p0, p1 = g.p0, g.p1
+    IDX_P0_BAR = 26
+    IDX_P1_BAR = 27
+
+    if cp == 0
+        for pt in 1:24
+            idx = 25 - pt
+            board[2, pt + 1] = Int((p0 >> (idx << 2)) & 0xF)
+            board[1, pt + 1] = Int((p1 >> (idx << 2)) & 0xF)
+        end
+        board[2, 1] = Int((p0 >> (IDX_P0_BAR << 2)) & 0xF)
+        board[1, 1] = Int((p1 >> (IDX_P1_BAR << 2)) & 0xF)
+    else
+        for pt in 1:24
+            board[2, pt + 1] = Int((p1 >> (pt << 2)) & 0xF)
+            board[1, pt + 1] = Int((p0 >> (pt << 2)) & 0xF)
+        end
+        board[2, 1] = Int((p1 >> (IDX_P1_BAR << 2)) & 0xF)
+        board[1, 1] = Int((p0 >> (IDX_P0_BAR << 2)) & 0xF)
+    end
+
+    return [board[1, :], board[2, :]]
+end
+
+"""Evaluate batch of boards via GnuBG subprocess. Returns vector of (win, wg, wbg, lg, lbg) tuples."""
+function gnubg_evaluate_batch(boards::Vector, ply::Int=0)
+    lock(GNUBG_LOCK) do
+        proc = GNUBG_PROC[]
+        req = JSON.json(Dict("boards" => boards, "ply" => ply))
+        println(proc.stdin, req)
+        flush(proc.stdin)
+        line = readline(proc.stdout)
+        resp = JSON.parse(line)
+        return resp["probs"]
+    end
+end
+
+"""Get best action for opponent via GnuBG 0-ply evaluation."""
+function gnubg_best_action(env)
+    g = env.game
+    actions = BackgammonNet.legal_actions(g)
+
+    if isempty(actions)
+        return BackgammonNet.encode_action(25, 25)
+    end
+    if length(actions) == 1
+        return actions[1]
+    end
+
+    # Evaluate all resulting positions in one batch
+    boards = Vector{Vector{Vector{Int}}}(undef, length(actions))
+    clones = Vector{BackgammonNet.BackgammonGame}(undef, length(actions))
+    for (i, action) in enumerate(actions)
+        g2 = BackgammonNet.clone(g)
+        BackgammonNet.apply_action!(g2, action)
+        clones[i] = g2
+        boards[i] = _to_gnubg_board(g2)
+    end
+
+    probs_batch = gnubg_evaluate_batch(boards, 0)
+
+    best_action = actions[1]
+    best_equity = -Inf
+    for (i, action) in enumerate(actions)
+        probs = probs_batch[i]
+        win, win_g, win_bg, lose_g, lose_bg = probs[1], probs[2], probs[3], probs[4], probs[5]
+        equity = (win - (1.0 - win)) + (win_g - lose_g) + 2.0 * (win_bg - lose_bg)
+        # Negate if player switched
+        if clones[i].current_player != g.current_player
+            equity = -equity
+        end
+        if equity > best_equity
+            best_equity = equity
+            best_action = action
+        end
+    end
+
+    return best_action
+end
+
+function start_gnubg_server!()
+    proc = open(`python3 $GNUBG_SERVER_SCRIPT`, "r+")
+    GNUBG_PROC[] = GnubgProcess(proc, proc.in, proc.out)
+    # Warm up with a test evaluation
+    test_board = [[0,0,0,0,0,0,0,0,0,0,0,0,0,5,0,0,0,3,0,5,0,0,0,0,2],
+                   [0,0,0,0,0,0,0,0,0,0,0,0,0,5,0,0,0,3,0,5,0,0,0,0,2]]
+    gnubg_evaluate_batch([test_board], 0)
+    return nothing
+end
+
+function stop_gnubg_server!(_=nothing)
+    proc = GNUBG_PROC[]
+    try
+        println(proc.stdin, JSON.json(Dict("cmd" => "quit")))
+        flush(proc.stdin)
+        close(proc.stdin)
+    catch
+    end
+end
+
+print("Starting GnuBG subprocess... "); flush(stdout)
+start_gnubg_server!()
+println("done"); flush(stdout)
 
 network = FluxLib.FCResNetMultiHead(
     gspec, FluxLib.FCResNetMultiHeadHP(width=NET_WIDTH, num_blocks=NET_BLOCKS))
@@ -1798,6 +1920,7 @@ function worker_play_games(worker_id::Int, games_claimed::Threads.Atomic{Int}, t
     return all_samples
 end
 
+
 """Core eval game loop for a single green thread."""
 function _eval_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
                           play_as_white::Bool,
@@ -1859,7 +1982,7 @@ function _eval_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
                     actions, policy = BatchedMCTS.think(eval_player, env)
                     GI.play!(env, actions[argmax(policy)])
                 else
-                    GI.play!(env, rand(rng, avail))
+                    GI.play!(env, gnubg_best_action(env))
                 end
             end
         end
@@ -2517,7 +2640,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     # Evaluation
     if ARGS["eval_interval"] > 0 && iter % ARGS["eval_interval"] == 0
         eval_games = ARGS["eval_games"]
-        @info "Running threaded evaluation ($eval_games games)..."
+        @info "Running GnuBG 0-ply evaluation ($eval_games games)..."
         flush(stdout)
 
         eval_server = start_inference_server!()
@@ -2526,7 +2649,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         eval_time = time() - eval_start
         stop_inference_server!(eval_server)
 
-        @info "Eval results: white=$(round(eval_results.white_avg, digits=3)), " *
+        @info "Eval vs GnuBG 0-ply: white=$(round(eval_results.white_avg, digits=3)), " *
               "black=$(round(eval_results.black_avg, digits=3)), " *
               "combined=$(round(eval_results.combined, digits=3)) " *
               "($(eval_results.actual_games) games in $(round(eval_time, digits=1))s)"
@@ -2534,9 +2657,9 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         # TensorBoard eval metrics
         with_logger(TB_LOGGER) do
             set_step!(TB_LOGGER, iter)
-            @info "eval/vs_random_combined" value=eval_results.combined log_step_increment=0
-            @info "eval/vs_random_white" value=eval_results.white_avg log_step_increment=0
-            @info "eval/vs_random_black" value=eval_results.black_avg log_step_increment=0
+            @info "eval/vs_gnubg0_combined" value=eval_results.combined log_step_increment=0
+            @info "eval/vs_gnubg0_white" value=eval_results.white_avg log_step_increment=0
+            @info "eval/vs_gnubg0_black" value=eval_results.black_avg log_step_increment=0
         end
     end
 
@@ -2560,7 +2683,7 @@ end
 final_eval_games = ARGS["final_eval_games"]
 if final_eval_games > 0
     println("\n" * "=" ^ 60)
-    println("Running Final Evaluation")
+    println("Running Final Evaluation (vs GnuBG 0-ply)")
     println("=" ^ 60)
     println("Games: $final_eval_games")
     println("Workers: $NUM_WORKERS threads")
@@ -2585,7 +2708,8 @@ if final_eval_games > 0
     flush(stdout)
 
     open(joinpath(SESSION_DIR, "final_eval_results.txt"), "w") do f
-        println(f, "# Final Evaluation Results")
+        println(f, "# Final Evaluation Results (vs GnuBG 0-ply)")
+        println(f, "opponent: gnubg_0ply")
         println(f, "timestamp: $(Dates.format(now(), "yyyymmdd_HHMMSS"))")
         println(f, "games: $(final_results.actual_games)")
         println(f, "white_avg: $(final_results.white_avg)")
@@ -2614,3 +2738,6 @@ println("Total time: $(round(elapsed/60, digits=1)) minutes")
 println("Session: $SESSION_DIR")
 println("TensorBoard logs: $TB_DIR")
 println("=" ^ 60)
+
+# Cleanup
+stop_gnubg_server!()

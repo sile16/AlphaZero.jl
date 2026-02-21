@@ -211,17 +211,17 @@ flush(stdout)
 results = Dict{String, Any}()
 total_start = time()
 
-r = evaluate_matchup(1, true, NUM_GAMES, base_seed=3000)
-results["az_vs_gnubg1_white"] = r
+EVAL_PLIES = [0]  # Only 0-ply until we start beating it
+base_seeds = Dict(0 => 1000, 1 => 3000, 2 => 5000)
 
-r = evaluate_matchup(1, false, NUM_GAMES, base_seed=4000)
-results["az_vs_gnubg1_black"] = r
+for ply in EVAL_PLIES
+    bs = base_seeds[ply]
+    r = evaluate_matchup(ply, true, NUM_GAMES, base_seed=bs)
+    results["az_vs_gnubg$(ply)_white"] = r
 
-r = evaluate_matchup(2, true, NUM_GAMES, base_seed=5000)
-results["az_vs_gnubg2_white"] = r
-
-r = evaluate_matchup(2, false, NUM_GAMES, base_seed=6000)
-results["az_vs_gnubg2_black"] = r
+    r = evaluate_matchup(ply, false, NUM_GAMES, base_seed=bs+1000)
+    results["az_vs_gnubg$(ply)_black"] = r
+end
 
 total_time = time() - total_start
 
@@ -235,7 +235,7 @@ println("Workers: $NUM_WORKERS, MCTS iters: $MCTS_ITERS_LOCAL")
 println("Total time: $(round(total_time, digits=1))s ($(round(total_time/60, digits=1)) min)")
 println()
 
-for ply in [1, 2]
+for ply in EVAL_PLIES
     key_w = "az_vs_gnubg$(ply)_white"
     key_b = "az_vs_gnubg$(ply)_black"
     combined = (results[key_w].avg + results[key_b].avg) / 2

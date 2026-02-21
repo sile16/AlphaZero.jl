@@ -80,7 +80,8 @@ const mcts_params = MctsParams(
     cpuct=2.0,
     temperature=ConstSchedule(0.0),
     dirichlet_noise_ϵ=0.0,
-    dirichlet_noise_α=1.0
+    dirichlet_noise_α=1.0,
+    chance_mode=:passthrough
 )
 
 struct EvalWorker
@@ -100,24 +101,61 @@ end
 println("All workers ready\n")
 flush(stdout)
 
+# ─── Chance outcome sampling ─────────────────────────────────────────────
+
+function _sample_chance(rng, outcomes)
+    r = rand(rng)
+    acc = 0.0
+    @inbounds for i in eachindex(outcomes)
+        acc += outcomes[i][2]
+        if r <= acc
+            return i
+        end
+    end
+    return length(outcomes)
+end
+
 # ─── Game function ──────────────────────────────────────────────────────
 
 function play_game(worker::EvalWorker, az_is_white::Bool, seed::Int)::Float64
     env = GI.init(gspec)
-    env.rng = MersenneTwister(seed)
+    rng = MersenneTwister(seed)
+    env.rng = rng
+    turn = 0
+    game_t0 = time()
 
     while !GI.game_terminated(env)
+        # Handle chance nodes (dice rolls)
+        if GI.is_chance_node(env)
+            outcomes = GI.chance_outcomes(env)
+            idx = _sample_chance(rng, outcomes)
+            GI.apply_chance!(env, outcomes[idx][1])
+            continue
+        end
+
+        # Auto-play forced single-option states
+        actions = GI.available_actions(env)
+        if length(actions) == 1
+            GI.play!(env, actions[1])
+            continue
+        end
+
         is_white = GI.white_playing(env)
         use_az = (is_white && az_is_white) || (!is_white && !az_is_white)
 
         if use_az
-            actions, π = AlphaZero.think(worker.az_player, env)
-            action = actions[argmax(π)]
+            AlphaZero.reset_player!(worker.az_player)
+            actions_az, π = AlphaZero.think(worker.az_player, env)
+            action = actions_az[argmax(π)]
         else
             action = BgblitzPlayer.best_move(worker.bgblitz_conn, env)
         end
         GI.play!(env, action)
     end
+
+    game_dt = time() - game_t0
+    @printf("    game done: %d turns, %.1fs, r=%.1f\n", turn, game_dt, GI.white_reward(env))
+    flush(stdout)
 
     AlphaZero.reset_player!(worker.az_player)
     reward = GI.white_reward(env)
@@ -135,20 +173,18 @@ function run_matchup(az_is_white::Bool, n_games::Int, base_seed::Int)
     completed = Threads.Atomic{Int}(0)
     t0 = time()
 
-    @sync for i in 1:n_games
-        Threads.@spawn begin
-            w = take!(worker_pool)
-            try
-                results[i] = play_game(w, az_is_white, base_seed + i * 104729)
-            finally
-                put!(worker_pool, w)
-            end
-            n = Threads.atomic_add!(completed, 1)
-            if (n + 1) % 25 == 0
-                elapsed = time() - t0
-                @printf("    %d/%d (%.1f games/sec)\n", n + 1, n_games, (n + 1) / elapsed)
-                flush(stdout)
-            end
+    for i in 1:n_games
+        w = take!(worker_pool)
+        try
+            results[i] = play_game(w, az_is_white, base_seed + i * 104729)
+        finally
+            put!(worker_pool, w)
+        end
+        n = Threads.atomic_add!(completed, 1)
+        if (n + 1) % 10 == 0
+            elapsed = time() - t0
+            @printf("    %d/%d (%.1f games/sec)\n", n + 1, n_games, (n + 1) / elapsed)
+            flush(stdout)
         end
     end
 
