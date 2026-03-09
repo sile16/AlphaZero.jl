@@ -43,12 +43,20 @@ function parse_args()
             help = "Network type"
             arg_type = String
             default = "fcresnet-multihead"
-        "--network-width"
-            help = "Network width"
+        "--contact-width"
+            help = "Contact model network width"
+            arg_type = Int
+            default = 256
+        "--contact-blocks"
+            help = "Contact model residual blocks"
+            arg_type = Int
+            default = 10
+        "--race-width"
+            help = "Race model network width"
             arg_type = Int
             default = 128
-        "--network-blocks"
-            help = "Number of residual blocks"
+        "--race-blocks"
+            help = "Race model residual blocks"
             arg_type = Int
             default = 3
         "--num-workers"
@@ -182,8 +190,10 @@ const ARGS = parse_args()
 
 # Constants
 const GAME_NAME = ARGS["game"]
-const NET_WIDTH = ARGS["network_width"]
-const NET_BLOCKS = ARGS["network_blocks"]
+const CONTACT_WIDTH = ARGS["contact_width"]
+const CONTACT_BLOCKS = ARGS["contact_blocks"]
+const RACE_WIDTH = ARGS["race_width"]
+const RACE_BLOCKS = ARGS["race_blocks"]
 const NUM_WORKERS = ARGS["num_workers"]
 const MCTS_ITERS = ARGS["mcts_iters"]
 const INFERENCE_BATCH_SIZE = ARGS["inference_batch_size"]
@@ -206,7 +216,7 @@ const SESSION_DIR = if RESUMING
 elseif isempty(ARGS["session_dir"])
     timestamp = Dates.format(now(), "yyyymmdd_HHMMSS")
     # Build descriptive suffix
-    suffixes = String[]
+    suffixes = String["dual"]
     ARGS["use_per"] && push!(suffixes, "per")
     ARGS["use_reanalyze"] && push!(suffixes, "reanalyze")
     if ARGS["use_bearoff"]
@@ -294,7 +304,8 @@ println(RESUMING ? "Threaded AlphaZero Training (RESUMING)" : "Threaded AlphaZer
 println("=" ^ 60)
 println("Session: $SESSION_DIR")
 println("Game: $GAME_NAME")
-println("Network: $(ARGS["network_type"]) ($(NET_WIDTH)x$(NET_BLOCKS))")
+println("Contact model: $(ARGS["network_type"]) ($(CONTACT_WIDTH)w×$(CONTACT_BLOCKS)b)")
+println("Race model: $(ARGS["network_type"]) ($(RACE_WIDTH)w×$(RACE_BLOCKS)b)")
 println("Workers: $NUM_WORKERS threads ($(Threads.nthreads()) Julia threads)")
 println("Iterations: $(ARGS["total_iterations"])")
 println("Games/iteration: $(ARGS["games_per_iteration"])")
@@ -341,14 +352,13 @@ else
     error("Unknown game: $GAME_NAME")
 end
 
-# Create network
+# Create dual networks (contact + race)
 const gspec = GameSpec()
 const NUM_ACTIONS = GI.num_actions(gspec)
 
-# Subprocess-based GnuBG evaluation (thread-safe: separate Python process, no PyCall)
+# Subprocess-based GnuBG evaluation (thread-safe: per-worker processes, no locks needed)
 using JSON
 
-const GNUBG_LOCK = ReentrantLock()
 const GNUBG_SERVER_SCRIPT = joinpath(@__DIR__, "gnubg_eval_server.py")
 
 mutable struct GnubgProcess
@@ -357,7 +367,9 @@ mutable struct GnubgProcess
     stdout::IO
 end
 
-const GNUBG_PROC = Ref{GnubgProcess}()
+# Pool of GnuBG subprocesses: one per eval worker (no lock contention)
+const GNUBG_POOL = Vector{GnubgProcess}()
+const GNUBG_POOL_LOCK = ReentrantLock()  # Only for pool management, not eval calls
 
 """Convert BackgammonGame to gnubg board format: [[25 ints], [25 ints]]."""
 function _to_gnubg_board(g::BackgammonNet.BackgammonGame)
@@ -367,18 +379,21 @@ function _to_gnubg_board(g::BackgammonNet.BackgammonGame)
     IDX_P0_BAR = 26
     IDX_P1_BAR = 27
 
-    if cp == 0
+    # gnubg format: anBoard[0] = opponent's checkers from OPPONENT's perspective
+    #               anBoard[1] = on-roll's checkers from ON-ROLL's perspective
+    # P0 internal: point 1 = far (standard 24-pt), reversed numbering → use (25-pt)
+    # P1 internal: point 1 = near (standard 1-pt), standard numbering → use pt
+    if cp == 0  # P0 on roll
         for pt in 1:24
-            idx = 25 - pt
-            board[2, pt + 1] = Int((p0 >> (idx << 2)) & 0xF)
-            board[1, pt + 1] = Int((p1 >> (idx << 2)) & 0xF)
+            board[2, pt + 1] = Int((p0 >> ((25 - pt) << 2)) & 0xF)  # P0 on-roll: reversed
+            board[1, pt + 1] = Int((p1 >> (pt << 2)) & 0xF)          # P1 opponent: standard
         end
         board[2, 1] = Int((p0 >> (IDX_P0_BAR << 2)) & 0xF)
         board[1, 1] = Int((p1 >> (IDX_P1_BAR << 2)) & 0xF)
-    else
+    else  # P1 on roll
         for pt in 1:24
-            board[2, pt + 1] = Int((p1 >> (pt << 2)) & 0xF)
-            board[1, pt + 1] = Int((p0 >> (pt << 2)) & 0xF)
+            board[2, pt + 1] = Int((p1 >> (pt << 2)) & 0xF)          # P1 on-roll: standard
+            board[1, pt + 1] = Int((p0 >> ((25 - pt) << 2)) & 0xF)  # P0 opponent: reversed
         end
         board[2, 1] = Int((p1 >> (IDX_P1_BAR << 2)) & 0xF)
         board[1, 1] = Int((p0 >> (IDX_P0_BAR << 2)) & 0xF)
@@ -387,21 +402,23 @@ function _to_gnubg_board(g::BackgammonNet.BackgammonGame)
     return [board[1, :], board[2, :]]
 end
 
-"""Evaluate batch of boards via GnuBG subprocess. Returns vector of (win, wg, wbg, lg, lbg) tuples."""
-function gnubg_evaluate_batch(boards::Vector, ply::Int=0)
-    lock(GNUBG_LOCK) do
-        proc = GNUBG_PROC[]
-        req = JSON.json(Dict("boards" => boards, "ply" => ply))
-        println(proc.stdin, req)
-        flush(proc.stdin)
-        line = readline(proc.stdout)
-        resp = JSON.parse(line)
-        return resp["probs"]
-    end
+"""Evaluate batch of boards via a specific GnuBG subprocess. No lock needed (per-worker process)."""
+function gnubg_evaluate_batch(proc::GnubgProcess, boards::Vector, ply::Int=0)
+    req = JSON.json(Dict("boards" => boards, "ply" => ply))
+    println(proc.stdin, req)
+    flush(proc.stdin)
+    line = readline(proc.stdout)
+    resp = JSON.parse(line)
+    return resp["probs"]
 end
 
-"""Get best action for opponent via GnuBG 0-ply evaluation."""
-function gnubg_best_action(env)
+# Convenience: use first pool process (for startup warmup)
+function gnubg_evaluate_batch(boards::Vector, ply::Int=0)
+    gnubg_evaluate_batch(GNUBG_POOL[1], boards, ply)
+end
+
+"""Get best action for opponent via GnuBG 0-ply evaluation. Uses per-worker gnubg process."""
+function gnubg_best_action(env; gnubg_proc::Union{GnubgProcess,Nothing}=nothing)
     g = env.game
     actions = BackgammonNet.legal_actions(g)
 
@@ -411,6 +428,8 @@ function gnubg_best_action(env)
     if length(actions) == 1
         return actions[1]
     end
+
+    proc = gnubg_proc !== nothing ? gnubg_proc : GNUBG_POOL[1]
 
     # Evaluate all resulting positions in one batch
     boards = Vector{Vector{Vector{Int}}}(undef, length(actions))
@@ -422,7 +441,7 @@ function gnubg_best_action(env)
         boards[i] = _to_gnubg_board(g2)
     end
 
-    probs_batch = gnubg_evaluate_batch(boards, 0)
+    probs_batch = gnubg_evaluate_batch(proc, boards, 0)
 
     best_action = actions[1]
     best_equity = -Inf
@@ -443,46 +462,105 @@ function gnubg_best_action(env)
     return best_action
 end
 
-function start_gnubg_server!()
-    proc = open(`python3 $GNUBG_SERVER_SCRIPT`, "r+")
-    GNUBG_PROC[] = GnubgProcess(proc, proc.in, proc.out)
-    # Warm up with a test evaluation
+"""Detect gnubg command: standalone python3 or gnubg -p fallback."""
+function _gnubg_cmd()
+    try
+        run(pipeline(`python3 -c "import gnubg"`, devnull, devnull))
+        return `python3 $GNUBG_SERVER_SCRIPT`
+    catch
+        gnubg_bin = something(
+            Sys.which("gnubg"),
+            isfile(joinpath(homedir(), "gnubg-install", "bin", "gnubg")) ?
+                joinpath(homedir(), "gnubg-install", "bin", "gnubg") : nothing,
+            "gnubg")
+        return `$gnubg_bin -t -q -p $GNUBG_SERVER_SCRIPT`
+    end
+end
+
+"""Spawn one GnuBG subprocess, wait for ready marker, warm up."""
+function _spawn_gnubg_process()
+    cmd = _gnubg_cmd()
+    proc = open(cmd, "r+")
+    gp = GnubgProcess(proc, proc.in, proc.out)
+    # Wait for ready marker (skips gnubg banner lines when using gnubg -p)
+    while true
+        line = readline(proc.out)
+        if startswith(line, "GNUBG_EVAL_SERVER_READY")
+            break
+        end
+    end
+    # Warm up
     test_board = [[0,0,0,0,0,0,0,0,0,0,0,0,0,5,0,0,0,3,0,5,0,0,0,0,2],
                    [0,0,0,0,0,0,0,0,0,0,0,0,0,5,0,0,0,3,0,5,0,0,0,0,2]]
-    gnubg_evaluate_batch([test_board], 0)
+    gnubg_evaluate_batch(gp, [test_board], 0)
+    return gp
+end
+
+"""Start pool of GnuBG subprocesses (one per eval worker for parallel eval)."""
+function start_gnubg_server!(; num_procs::Int=NUM_WORKERS)
+    empty!(GNUBG_POOL)
+    # Spawn first to validate, then rest in parallel
+    push!(GNUBG_POOL, _spawn_gnubg_process())
+    if num_procs > 1
+        tasks = [Threads.@spawn _spawn_gnubg_process() for _ in 2:num_procs]
+        for t in tasks
+            push!(GNUBG_POOL, fetch(t))
+        end
+    end
     return nothing
 end
 
 function stop_gnubg_server!(_=nothing)
-    proc = GNUBG_PROC[]
-    try
-        println(proc.stdin, JSON.json(Dict("cmd" => "quit")))
-        flush(proc.stdin)
-        close(proc.stdin)
-    catch
+    for proc in GNUBG_POOL
+        try
+            println(proc.stdin, JSON.json(Dict("cmd" => "quit")))
+            flush(proc.stdin)
+            close(proc.stdin)
+        catch
+        end
     end
+    empty!(GNUBG_POOL)
 end
 
+const GNUBG_AVAILABLE = Ref(false)
 print("Starting GnuBG subprocess... "); flush(stdout)
-start_gnubg_server!()
-println("done"); flush(stdout)
+try
+    start_gnubg_server!()
+    GNUBG_AVAILABLE[] = true
+    println("done"); flush(stdout)
+catch e
+    println("FAILED (GnuBG not available, eval will be skipped)"); flush(stdout)
+    @warn "GnuBG not available: $e"
+end
 
-network = FluxLib.FCResNetMultiHead(
-    gspec, FluxLib.FCResNetMultiHeadHP(width=NET_WIDTH, num_blocks=NET_BLOCKS))
+# Dual model: contact (large) + race (small)
+contact_network = FluxLib.FCResNetMultiHead(
+    gspec, FluxLib.FCResNetMultiHeadHP(width=CONTACT_WIDTH, num_blocks=CONTACT_BLOCKS))
+race_network = FluxLib.FCResNetMultiHead(
+    gspec, FluxLib.FCResNetMultiHeadHP(width=RACE_WIDTH, num_blocks=RACE_BLOCKS))
 if USE_GPU
-    network = Network.to_gpu(network)
+    contact_network = Network.to_gpu(contact_network)
+    race_network = Network.to_gpu(race_network)
 end
 
 # Resume: load weights from checkpoint
 START_ITER = 0
 if RESUMING
-    ckpt_path = joinpath(RESUME_DIR, "checkpoints", "latest.data")
+    contact_ckpt = joinpath(RESUME_DIR, "checkpoints", "contact_latest.data")
+    race_ckpt = joinpath(RESUME_DIR, "checkpoints", "race_latest.data")
     iter_path = joinpath(RESUME_DIR, "checkpoints", "iter.txt")
-    if isfile(ckpt_path)
-        FluxLib.load_weights(ckpt_path, network)
-        println("Resumed weights from: $ckpt_path")
+    # Also try legacy single-model checkpoint
+    legacy_ckpt = joinpath(RESUME_DIR, "checkpoints", "latest.data")
+    if isfile(contact_ckpt) && isfile(race_ckpt)
+        FluxLib.load_weights(contact_ckpt, contact_network)
+        FluxLib.load_weights(race_ckpt, race_network)
+        println("Resumed dual-model weights from: $contact_ckpt, $race_ckpt")
+    elseif isfile(legacy_ckpt)
+        @warn "Found legacy single-model checkpoint, loading into contact model only"
+        FluxLib.load_weights(legacy_ckpt, contact_network)
+        println("Resumed contact weights from legacy: $legacy_ckpt")
     else
-        error("Resume checkpoint not found: $ckpt_path")
+        error("Resume checkpoints not found: $contact_ckpt / $race_ckpt")
     end
     if isfile(iter_path)
         START_ITER = parse(Int, strip(read(iter_path, String)))
@@ -492,10 +570,12 @@ if RESUMING
     end
 end
 
-println("Network parameters: $(sum(length, Flux.params(network)))")
+println("Contact model parameters: $(sum(length, Flux.params(contact_network)))")
+println("Race model parameters: $(sum(length, Flux.params(race_network)))")
 
-# CPU copy for local inference during self-play (avoids channel/queue overhead)
-const cpu_network = Flux.cpu(deepcopy(network))
+# CPU copies for local inference during self-play (avoids channel/queue overhead)
+const cpu_contact_network = Flux.cpu(deepcopy(contact_network))
+const cpu_race_network = Flux.cpu(deepcopy(race_network))
 import LinearAlgebra; LinearAlgebra.BLAS.set_num_threads(1)  # Prevent BLAS thread contention
 println("CPU inference: BLAS threads=1, lightweight clones, shared RNG")
 flush(stdout)
@@ -726,26 +806,35 @@ function layernorm_relu!(out::AbstractMatrix, x::AbstractMatrix, scale::Vector, 
     end
 end
 
-"""In-place Dense + bias: out = W * x .+ b (uses BLAS gemm!)"""
-function dense!(out::AbstractMatrix, W::Matrix, x::AbstractMatrix, b::Vector, n::Int)
-    d_out = size(W, 1)
-    # out = W * x
-    @views mul!(out[1:d_out, 1:n], W, x[1:size(W, 2), 1:n])
-    # out .+= b
+"""Thread-safe matmul: C = A * B[:, 1:n] + bias, no BLAS (avoids OpenBLAS global lock)."""
+function _gemm_bias!(C::AbstractMatrix{Float32}, A::Matrix{Float32},
+                     B::AbstractMatrix{Float32}, bias::Vector{Float32}, n::Int)
+    m, k = size(A)
     @inbounds for j in 1:n
-        @simd for i in 1:d_out
-            out[i, j] += b[i]
+        for i in 1:m
+            C[i, j] = bias[i]
+        end
+        for p in 1:k
+            bp = B[p, j]
+            @simd for i in 1:m
+                C[i, j] += A[i, p] * bp
+            end
         end
     end
 end
 
+"""In-place Dense + bias: out = W * x .+ b (pure Julia, thread-safe)"""
+function dense!(out::AbstractMatrix, W::Matrix{Float32}, x::AbstractMatrix, b::Vector{Float32}, n::Int)
+    _gemm_bias!(out, W, x, b, n)
+end
+
 """In-place Dense + bias + relu fused: out = max(0, W * x .+ b)"""
-function dense_relu!(out::AbstractMatrix, W::Matrix, x::AbstractMatrix, b::Vector, n::Int)
+function dense_relu!(out::AbstractMatrix, W::Matrix{Float32}, x::AbstractMatrix, b::Vector{Float32}, n::Int)
     d_out = size(W, 1)
-    @views mul!(out[1:d_out, 1:n], W, x[1:size(W, 2), 1:n])
+    _gemm_bias!(out, W, x, b, n)
     @inbounds for j in 1:n
         @simd for i in 1:d_out
-            out[i, j] = max(0.0f0, out[i, j] + b[i])
+            out[i, j] = max(0.0f0, out[i, j])
         end
     end
 end
@@ -855,52 +944,59 @@ function fast_forward_normalized!(fw::FastWeights, fb::FastBuffers,
     return fb.p, V_equity, n  # Policy matrix, value vector, batch size
 end
 
-# Extract weights from CPU network and create per-worker buffers
-const FAST_WEIGHTS = FastWeights(cpu_network)
+# Extract weights from CPU networks and create per-worker buffers
+const CONTACT_FAST_WEIGHTS = FastWeights(cpu_contact_network)
+const RACE_FAST_WEIGHTS = FastWeights(cpu_race_network)
 const USE_FAST_FORWARD = get(ENV, "FAST_FORWARD", "1") == "1"
 if USE_FAST_FORWARD
-    println("Fast forward: allocation-free ($(FAST_WEIGHTS.num_blocks) res blocks, $(FAST_WEIGHTS.num_policy_layers) policy layers)")
+    println("Fast forward (contact): allocation-free ($(CONTACT_FAST_WEIGHTS.num_blocks) res blocks, $(CONTACT_FAST_WEIGHTS.num_policy_layers) policy layers)")
+    println("Fast forward (race): allocation-free ($(RACE_FAST_WEIGHTS.num_blocks) res blocks, $(RACE_FAST_WEIGHTS.num_policy_layers) policy layers)")
 else
     println("Fast forward: disabled (using Flux forward_normalized)")
 end
 flush(stdout)
 
-"""Refresh FastWeights from current cpu_network (after weight sync)."""
-function refresh_fast_weights!()
-    fw_new = FastWeights(cpu_network)
-    # Copy all weight data in-place
-    copyto!(FAST_WEIGHTS.W_in, fw_new.W_in)
-    copyto!(FAST_WEIGHTS.b_in, fw_new.b_in)
-    copyto!(FAST_WEIGHTS.ln_in_s, fw_new.ln_in_s)
-    copyto!(FAST_WEIGHTS.ln_in_b, fw_new.ln_in_b)
-    for i in 1:FAST_WEIGHTS.num_blocks
-        copyto!(FAST_WEIGHTS.res_W1[i], fw_new.res_W1[i])
-        copyto!(FAST_WEIGHTS.res_b1[i], fw_new.res_b1[i])
-        copyto!(FAST_WEIGHTS.res_ln1_s[i], fw_new.res_ln1_s[i])
-        copyto!(FAST_WEIGHTS.res_ln1_b[i], fw_new.res_ln1_b[i])
-        copyto!(FAST_WEIGHTS.res_W2[i], fw_new.res_W2[i])
-        copyto!(FAST_WEIGHTS.res_b2[i], fw_new.res_b2[i])
-        copyto!(FAST_WEIGHTS.res_ln2_s[i], fw_new.res_ln2_s[i])
-        copyto!(FAST_WEIGHTS.res_ln2_b[i], fw_new.res_ln2_b[i])
+"""Refresh FastWeights in-place from a cpu network."""
+function _refresh_fast_weights!(fw::FastWeights, cpu_nn)
+    fw_new = FastWeights(cpu_nn)
+    copyto!(fw.W_in, fw_new.W_in)
+    copyto!(fw.b_in, fw_new.b_in)
+    copyto!(fw.ln_in_s, fw_new.ln_in_s)
+    copyto!(fw.ln_in_b, fw_new.ln_in_b)
+    for i in 1:fw.num_blocks
+        copyto!(fw.res_W1[i], fw_new.res_W1[i])
+        copyto!(fw.res_b1[i], fw_new.res_b1[i])
+        copyto!(fw.res_ln1_s[i], fw_new.res_ln1_s[i])
+        copyto!(fw.res_ln1_b[i], fw_new.res_ln1_b[i])
+        copyto!(fw.res_W2[i], fw_new.res_W2[i])
+        copyto!(fw.res_b2[i], fw_new.res_b2[i])
+        copyto!(fw.res_ln2_s[i], fw_new.res_ln2_s[i])
+        copyto!(fw.res_ln2_b[i], fw_new.res_ln2_b[i])
     end
-    copyto!(FAST_WEIGHTS.ln_post_s, fw_new.ln_post_s)
-    copyto!(FAST_WEIGHTS.ln_post_b, fw_new.ln_post_b)
-    copyto!(FAST_WEIGHTS.W_vt, fw_new.W_vt)
-    copyto!(FAST_WEIGHTS.b_vt, fw_new.b_vt)
-    copyto!(FAST_WEIGHTS.ln_vt_s, fw_new.ln_vt_s)
-    copyto!(FAST_WEIGHTS.ln_vt_b, fw_new.ln_vt_b)
+    copyto!(fw.ln_post_s, fw_new.ln_post_s)
+    copyto!(fw.ln_post_b, fw_new.ln_post_b)
+    copyto!(fw.W_vt, fw_new.W_vt)
+    copyto!(fw.b_vt, fw_new.b_vt)
+    copyto!(fw.ln_vt_s, fw_new.ln_vt_s)
+    copyto!(fw.ln_vt_b, fw_new.ln_vt_b)
     for i in 1:5
-        copyto!(FAST_WEIGHTS.W_vh[i], fw_new.W_vh[i])
+        copyto!(fw.W_vh[i], fw_new.W_vh[i])
     end
-    copyto!(FAST_WEIGHTS.b_vh, fw_new.b_vh)
-    for i in 1:FAST_WEIGHTS.num_policy_layers
-        copyto!(FAST_WEIGHTS.W_p[i], fw_new.W_p[i])
-        copyto!(FAST_WEIGHTS.b_p[i], fw_new.b_p[i])
-        copyto!(FAST_WEIGHTS.ln_p_s[i], fw_new.ln_p_s[i])
-        copyto!(FAST_WEIGHTS.ln_p_b[i], fw_new.ln_p_b[i])
+    copyto!(fw.b_vh, fw_new.b_vh)
+    for i in 1:fw.num_policy_layers
+        copyto!(fw.W_p[i], fw_new.W_p[i])
+        copyto!(fw.b_p[i], fw_new.b_p[i])
+        copyto!(fw.ln_p_s[i], fw_new.ln_p_s[i])
+        copyto!(fw.ln_p_b[i], fw_new.ln_p_b[i])
     end
-    copyto!(FAST_WEIGHTS.W_pout, fw_new.W_pout)
-    copyto!(FAST_WEIGHTS.b_pout, fw_new.b_pout)
+    copyto!(fw.W_pout, fw_new.W_pout)
+    copyto!(fw.b_pout, fw_new.b_pout)
+end
+
+"""Refresh both contact and race FastWeights after weight sync."""
+function refresh_fast_weights!()
+    _refresh_fast_weights!(CONTACT_FAST_WEIGHTS, cpu_contact_network)
+    _refresh_fast_weights!(RACE_FAST_WEIGHTS, cpu_race_network)
 end
 
 #####
@@ -1361,6 +1457,13 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
             end
         end
 
+        # Classify contact vs race for dual-model training
+        is_contact = if state isa BackgammonNet.BackgammonGame
+            BackgammonNet.is_contact_position(state)
+        else
+            true  # default to contact for unknown state types
+        end
+
         push!(samples, (
             state=state_vec,
             policy=full_policy,
@@ -1370,6 +1473,7 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
             is_chance=is_ch,
             bearoff_probs=sample_probs,
             wp=wp,
+            is_contact=is_contact,
         ))
     end
 
@@ -1415,10 +1519,10 @@ function inference_server_loop!()
         X_all = hcat([r.X for r in pending]...)
         A_all = hcat([r.A for r in pending]...)
 
-        # Single GPU forward pass for ALL workers' requests
-        Xnet, Anet = Network.convert_input_tuple(network, (X_all, A_all))
+        # Single GPU forward pass for ALL workers' requests (uses contact model for GPU path)
+        Xnet, Anet = Network.convert_input_tuple(contact_network, (X_all, A_all))
         P_raw, V, _ = Network.convert_output_tuple(
-            network, Network.forward_normalized(network, Xnet, Anet))
+            contact_network, Network.forward_normalized(contact_network, Xnet, Anet))
 
         # Distribute results to each worker's response channel
         offset = 0
@@ -1649,11 +1753,17 @@ end
 function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
                           req_chan::Channel, resp_chan::Channel, rng::MersenneTwister;
                           mb_slot::Union{InferenceSlot, Nothing}=nothing,
-                          fast_bufs::Union{FastBuffers, Nothing}=nothing)
+                          contact_fast_bufs::Union{FastBuffers, Nothing}=nothing,
+                          race_fast_bufs::Union{FastBuffers, Nothing}=nothing)
     # Use mailbox slot buffers for GPU inference, else allocate local
     max_batch = INFERENCE_BATCH_SIZE + 1
     X_buf = mb_slot !== nothing ? mb_slot.X : zeros(Float32, _state_dim, max_batch)
     A_buf = mb_slot !== nothing ? mb_slot.A : zeros(Float32, NUM_ACTIONS, max_batch)
+    # Per-model sub-batch buffers for split-classify-merge
+    contact_X_buf = zeros(Float32, _state_dim, max_batch)
+    contact_A_buf = zeros(Float32, NUM_ACTIONS, max_batch)
+    race_X_buf = zeros(Float32, _state_dim, max_batch)
+    race_A_buf = zeros(Float32, NUM_ACTIONS, max_batch)
 
     # Timing accumulators
     t_vectorize = 0.0
@@ -1667,13 +1777,16 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         n == 0 && return Tuple{Vector{Float32}, Float32}[]
         t0 = time_ns()
 
-        # Vectorize all states for NN inference (self-play always uses NN, no bear-off table)
-        nn_count = 0
+        # Classify each state as contact or race, vectorize into buffers
+        is_contact_mask = Vector{Bool}(undef, n)
         for (i, s) in enumerate(states)
-            nn_count += 1
-            slot = nn_count
-            vectorize_state_into!(@view(X_buf[:, slot]), gspec, s)
-            a_col = @view(A_buf[:, slot])
+            is_contact_mask[i] = if s isa BackgammonNet.BackgammonGame
+                BackgammonNet.is_contact_position(s)
+            else
+                true
+            end
+            vectorize_state_into!(@view(X_buf[:, i]), gspec, s)
+            a_col = @view(A_buf[:, i])
             fill!(a_col, 0.0f0)
             if !BackgammonNet.game_terminated(s)
                 legal = BackgammonNet.legal_actions(s)
@@ -1686,55 +1799,82 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         end
         t1 = time_ns()
 
-        # NN inference for non-bearoff states
-        local nn_results
-        if nn_count == 0
-            nn_results = Tuple{Vector{Float32}, Float32}[]
-        elseif fast_bufs !== nothing
-            # Allocation-free CPU inference + result pooling
-            P_buf, V_buf, _ = fast_forward_normalized!(FAST_WEIGHTS, fast_bufs, X_buf, A_buf, nn_count)
-            nn_results = Vector{Tuple{Vector{Float32}, Float32}}(undef, nn_count)
-            @inbounds for i in 1:nn_count
-                pv = fast_bufs.result_vecs[i]
-                k = 0
-                for a in 1:NUM_ACTIONS
-                    if A_buf[a, i] > 0.0f0
-                        k += 1
-                        pv[k] = P_buf[a, i]
-                    end
+        # Split into contact/race sub-batches and forward through respective models
+        results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
+
+        if contact_fast_bufs !== nothing && race_fast_bufs !== nothing
+            # Fast forward path: split-classify-merge
+            contact_idxs = Int[]
+            race_idxs = Int[]
+            for i in 1:n
+                if is_contact_mask[i]
+                    push!(contact_idxs, i)
+                else
+                    push!(race_idxs, i)
                 end
-                resize!(pv, k)
-                nn_results[i] = (pv, V_buf[i])
             end
-        elseif mb_slot !== nothing
-            # GPU mailbox inference
-            mb_slot.n[] = nn_count
-            mb_slot.status[] = 1
-            while mb_slot.status[] != 2; yield(); end
-            nn_results = Vector{Tuple{Vector{Float32}, Float32}}(undef, nn_count)
-            for i in 1:nn_count
-                legal = @view(A_buf[:, i]) .> 0
-                nn_results[i] = (mb_slot.P_out[legal, i], mb_slot.V_out[i])
+
+            # Forward contact sub-batch
+            n_contact = length(contact_idxs)
+            if n_contact > 0
+                # Pack contact states into contiguous buffer
+                for (j, idx) in enumerate(contact_idxs)
+                    contact_X_buf[:, j] .= @view(X_buf[:, idx])
+                    contact_A_buf[:, j] .= @view(A_buf[:, idx])
+                end
+                P_c, V_c, _ = fast_forward_normalized!(CONTACT_FAST_WEIGHTS, contact_fast_bufs, contact_X_buf, contact_A_buf, n_contact)
+                @inbounds for (j, idx) in enumerate(contact_idxs)
+                    pv = contact_fast_bufs.result_vecs[j]
+                    k = 0
+                    for a in 1:NUM_ACTIONS
+                        if contact_A_buf[a, j] > 0.0f0
+                            k += 1
+                            pv[k] = P_c[a, j]
+                        end
+                    end
+                    resize!(pv, k)
+                    results[idx] = (pv, V_c[j])
+                end
             end
-            mb_slot.status[] = 0
-        elseif USE_GPU_INFERENCE
-            put!(req_chan, (wid=vworker_id, X=@view(X_buf[:, 1:nn_count]), A=@view(A_buf[:, 1:nn_count])))
-            nn_results = take!(resp_chan)
+
+            # Forward race sub-batch
+            n_race = length(race_idxs)
+            if n_race > 0
+                for (j, idx) in enumerate(race_idxs)
+                    race_X_buf[:, j] .= @view(X_buf[:, idx])
+                    race_A_buf[:, j] .= @view(A_buf[:, idx])
+                end
+                P_r, V_r, _ = fast_forward_normalized!(RACE_FAST_WEIGHTS, race_fast_bufs, race_X_buf, race_A_buf, n_race)
+                @inbounds for (j, idx) in enumerate(race_idxs)
+                    pv = race_fast_bufs.result_vecs[j]
+                    k = 0
+                    for a in 1:NUM_ACTIONS
+                        if race_A_buf[a, j] > 0.0f0
+                            k += 1
+                            pv[k] = P_r[a, j]
+                        end
+                    end
+                    resize!(pv, k)
+                    results[idx] = (pv, V_r[j])
+                end
+            end
         else
-            # Local CPU inference (Flux)
-            X = @view(X_buf[:, 1:nn_count])
-            A = @view(A_buf[:, 1:nn_count])
-            P_raw, V, _ = Network.convert_output_tuple(
-                cpu_network, Network.forward_normalized(cpu_network, X, A))
-            nn_results = Vector{Tuple{Vector{Float32}, Float32}}(undef, nn_count)
-            for i in 1:nn_count
-                legal = @view(A[:, i]) .> 0
-                nn_results[i] = (P_raw[legal, i], V[1, i])
+            # Fallback: channel/GPU inference (uses contact model only for now)
+            if USE_GPU_INFERENCE
+                put!(req_chan, (wid=vworker_id, X=@view(X_buf[:, 1:n]), A=@view(A_buf[:, 1:n])))
+                results = take!(resp_chan)
+            else
+                X = @view(X_buf[:, 1:n])
+                A = @view(A_buf[:, 1:n])
+                P_raw, V, _ = Network.convert_output_tuple(
+                    cpu_contact_network, Network.forward_normalized(cpu_contact_network, X, A))
+                for i in 1:n
+                    legal = @view(A[:, i]) .> 0
+                    results[i] = (P_raw[legal, i], V[1, i])
+                end
             end
         end
         t2 = time_ns()
-
-        results = nn_results
 
         t_vectorize += (t1 - t0)
         t_gpu_wait += (t2 - t1)
@@ -1889,10 +2029,11 @@ function worker_play_games(worker_id::Int, games_claimed::Threads.Atomic{Int}, t
             ch = Channel{Any}(4)  # Local only (CPU inference doesn't use channels)
         end
         sub_rng = MersenneTwister(rand(rng, UInt))
-        # Create per-green-thread fast forward buffers (avoids cross-thread sharing)
-        fb = USE_FAST_FORWARD ? FastBuffers(NET_WIDTH, NUM_ACTIONS, INFERENCE_BATCH_SIZE + 1) : nothing
+        # Create per-green-thread fast forward buffers for both models (avoids cross-thread sharing)
+        contact_fb = USE_FAST_FORWARD ? FastBuffers(CONTACT_WIDTH, NUM_ACTIONS, INFERENCE_BATCH_SIZE + 1) : nothing
+        race_fb = USE_FAST_FORWARD ? FastBuffers(RACE_WIDTH, NUM_ACTIONS, INFERENCE_BATCH_SIZE + 1) : nothing
         t = @async _play_games_loop(vid, games_claimed, total_games, req_chan, ch, sub_rng;
-                                     mb_slot=mb_slot, fast_bufs=fb)
+                                     mb_slot=mb_slot, contact_fast_bufs=contact_fb, race_fast_bufs=race_fb)
         push!(sub_tasks, t)
     end
 
@@ -1924,7 +2065,8 @@ end
 """Core eval game loop for a single green thread."""
 function _eval_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
                           play_as_white::Bool,
-                          req_chan::Channel, resp_chan::Channel, rng::MersenneTwister)
+                          req_chan::Channel, resp_chan::Channel, rng::MersenneTwister;
+                          gnubg_proc::Union{GnubgProcess,Nothing}=nothing)
     max_batch = INFERENCE_BATCH_SIZE + 1
     X_buf = zeros(Float32, _state_dim, max_batch)
     A_buf = zeros(Float32, NUM_ACTIONS, max_batch)
@@ -1982,7 +2124,7 @@ function _eval_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
                     actions, policy = BatchedMCTS.think(eval_player, env)
                     GI.play!(env, actions[argmax(policy)])
                 else
-                    GI.play!(env, gnubg_best_action(env))
+                    GI.play!(env, gnubg_best_action(env; gnubg_proc=gnubg_proc))
                 end
             end
         end
@@ -2002,12 +2144,15 @@ end
 RESP_CHANS entries must be pre-created before calling this (thread safety)."""
 function worker_eval_games(worker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
                            play_as_white::Bool, req_chan::Channel, rng::MersenneTwister)
+    # Each worker gets its own GnuBG process from the pool (no lock contention)
+    gp = (GNUBG_AVAILABLE[] && worker_id <= length(GNUBG_POOL)) ? GNUBG_POOL[worker_id] : nothing
     sub_tasks = Task[]
     for k in 1:ASYNC_GAMES_PER_THREAD
         vid = (worker_id - 1) * ASYNC_GAMES_PER_THREAD + k + 1000  # offset to avoid self-play IDs
         ch = RESP_CHANS[vid]  # Pre-created by parallel_eval
         sub_rng = MersenneTwister(rand(rng, UInt))
-        t = @async _eval_games_loop(vid, games_claimed, total_games, play_as_white, req_chan, ch, sub_rng)
+        t = @async _eval_games_loop(vid, games_claimed, total_games, play_as_white, req_chan, ch, sub_rng;
+                                     gnubg_proc=gp)
         push!(sub_tasks, t)
     end
     all_rewards = Float64[]
@@ -2029,7 +2174,7 @@ function parallel_self_play(num_games::Int)
     # Start inference server (CPU centralized or GPU mailbox/channel)
     local server_task
     if MAILBOX !== nothing
-        server_net = USE_CPU_SERVER ? cpu_network : network
+        server_net = USE_CPU_SERVER ? cpu_contact_network : contact_network  # Mailbox uses contact model
         # CPU server: moderate wait (BLAS time scales linearly, batching doesn't help throughput)
         # GPU server: aggressive wait (GPU kernel overhead is fixed, larger batches amortize it)
         mr = USE_CPU_SERVER ? max(1, NUM_WORKERS ÷ 2) : max(1, NUM_WORKERS - 1)
@@ -2120,8 +2265,10 @@ end
 
 # AdamW: decoupled weight decay (L2 through optimizer, not loss gradient)
 # This prevents weight norm explosion that occurs with L2 reg + Adam
-opt = Flux.AdamW(LEARNING_RATE, (0.9f0, 0.999f0), L2_REG)
-opt_state = Flux.setup(opt, network)
+contact_opt = Flux.AdamW(LEARNING_RATE, (0.9f0, 0.999f0), L2_REG)
+contact_opt_state = Flux.setup(contact_opt, contact_network)
+race_opt = Flux.AdamW(LEARNING_RATE, (0.9f0, 0.999f0), L2_REG)
+race_opt_state = Flux.setup(race_opt, race_network)
 
 const LEARNING_PARAMS = LearningParams(
     use_gpu=USE_GPU,
@@ -2242,39 +2389,46 @@ function per_anneal_beta!(buf::PERBuffer)
     buf.beta = buf.beta_init + (1.0f0 - buf.beta_init) * frac
 end
 
-"""Sample from PER buffer. Returns (indices, samples, importance_weights)."""
+"""Sample from PER buffer. Returns (indices, samples, importance_weights).
+Uses precomputed cumulative sum + binary search for O(batch_size * log(n)) sampling."""
 function per_sample(buf::PERBuffer, batch_size::Int, alpha::Float32, epsilon::Float32)
     n = length(buf.samples)
     n < batch_size && error("Buffer too small")
 
-    # Compute priorities^alpha
-    pα = similar(buf.priorities)
-    @inbounds for i in 1:n
-        pα[i] = (buf.priorities[i] + epsilon) ^ alpha
+    # Compute priorities^alpha and cumulative sum
+    cumsum_pα = Vector{Float32}(undef, n)
+    @inbounds begin
+        cumsum_pα[1] = (buf.priorities[1] + epsilon) ^ alpha
+        for i in 2:n
+            cumsum_pα[i] = cumsum_pα[i-1] + (buf.priorities[i] + epsilon) ^ alpha
+        end
     end
-    total = sum(pα)
+    total = cumsum_pα[n]
 
-    # Proportional sampling
-    probs = pα ./ total
+    # Proportional sampling via binary search on cumsum
     indices = Vector{Int}(undef, batch_size)
     for j in 1:batch_size
         r = rand(Float32) * total
-        cumsum = 0.0f0
-        idx = n  # fallback
-        @inbounds for i in 1:n
-            cumsum += pα[i]
-            if cumsum >= r
-                idx = i
-                break
+        # Binary search: find smallest i where cumsum_pα[i] >= r
+        lo, hi = 1, n
+        while lo < hi
+            mid = (lo + hi) >>> 1
+            if cumsum_pα[mid] < r
+                lo = mid + 1
+            else
+                hi = mid
             end
         end
-        indices[j] = idx
+        indices[j] = lo
     end
 
     # Importance sampling weights: w_i = (N * P(i))^(-beta) / max(w)
+    inv_total = 1.0f0 / total
     weights = Vector{Float32}(undef, batch_size)
     @inbounds for j in 1:batch_size
-        weights[j] = (Float32(n) * probs[indices[j]]) ^ (-buf.beta)
+        idx = indices[j]
+        pα_i = idx == 1 ? cumsum_pα[1] : cumsum_pα[idx] - cumsum_pα[idx-1]
+        weights[j] = (Float32(n) * pα_i * inv_total) ^ (-buf.beta)
     end
     max_w = maximum(weights)
     weights ./= max_w  # Normalize so max weight = 1.0
@@ -2307,7 +2461,8 @@ open(joinpath(SESSION_DIR, "run_info.txt"), "w") do f
     println(f, "num_workers: $NUM_WORKERS")
     println(f, "julia_threads: $(Threads.nthreads())")
     println(f, "game: $GAME_NAME")
-    println(f, "network: $(ARGS["network_type"]) $(NET_WIDTH)x$(NET_BLOCKS)")
+    println(f, "contact_model: $(ARGS["network_type"]) $(CONTACT_WIDTH)w×$(CONTACT_BLOCKS)b")
+    println(f, "race_model: $(ARGS["network_type"]) $(RACE_WIDTH)w×$(RACE_BLOCKS)b")
     println(f, "mcts_iters: $MCTS_ITERS")
     println(f, "inference_batch_size: $INFERENCE_BATCH_SIZE")
     println(f, "seed: $(isnothing(MAIN_SEED) ? "none" : MAIN_SEED)")
@@ -2322,22 +2477,32 @@ flush(stdout)
 start_utilization_monitor(interval_s=5.0)
 
 # Pre-compile training path (prevents ~70s JIT penalty on iteration 2)
-print("Pre-compiling training path...")
+print("Pre-compiling training path (dual model)...")
 flush(stdout)
 let
-    warmup_net = deepcopy(network)
-    warmup_opt = Flux.setup(Flux.AdamW(LEARNING_RATE, (0.9f0, 0.999f0), L2_REG), warmup_net)
     dummy_state = zeros(Float32, _state_dim)
     dummy_policy = zeros(Float32, NUM_ACTIONS); dummy_policy[1] = 1.0f0
     dummy_sample = (state=dummy_state, policy=dummy_policy, value=0.0f0,
                     equity=zeros(Float32, 5), has_equity=false, is_chance=false,
-                    bearoff_probs=nothing, wp=true)
+                    bearoff_probs=nothing, wp=true, is_contact=true)
     dummy_buffer = fill(dummy_sample, BATCH_SIZE)
-    bd = prepare_batch(dummy_buffer, NUM_ACTIONS, USE_GPU, warmup_net)
     Wmean = 1.0f0; Hp = 0.0f0
+
+    # Warmup contact model
+    warmup_c = deepcopy(contact_network)
+    warmup_c_opt = Flux.setup(Flux.AdamW(LEARNING_RATE, (0.9f0, 0.999f0), L2_REG), warmup_c)
+    bd = prepare_batch(dummy_buffer, NUM_ACTIONS, USE_GPU, warmup_c)
     loss, grads = Flux.withgradient(
-        nn -> losses(nn, LEARNING_PARAMS, Wmean, Hp, bd)[1], warmup_net)
-    Flux.update!(warmup_opt, warmup_net, grads[1])
+        nn -> losses(nn, LEARNING_PARAMS, Wmean, Hp, bd)[1], warmup_c)
+    Flux.update!(warmup_c_opt, warmup_c, grads[1])
+
+    # Warmup race model
+    warmup_r = deepcopy(race_network)
+    warmup_r_opt = Flux.setup(Flux.AdamW(LEARNING_RATE, (0.9f0, 0.999f0), L2_REG), warmup_r)
+    bd = prepare_batch(dummy_buffer, NUM_ACTIONS, USE_GPU, warmup_r)
+    loss, grads = Flux.withgradient(
+        nn -> losses(nn, LEARNING_PARAMS, Wmean, Hp, bd)[1], warmup_r)
+    Flux.update!(warmup_r_opt, warmup_r, grads[1])
 end
 GC.gc()  # Clean up warmup allocations
 println(" done.")
@@ -2351,39 +2516,33 @@ flush(stdout)
 buf_length(buf::PERBuffer) = length(buf.samples)
 buf_length(buf::Vector) = length(buf)
 
-"""Train on replay buffer (GPU). Returns avg loss.
-Caps training at min(buffer_size, games_per_iter * avg_moves) / batch_size batches
-to prevent training from exceeding self-play time at large buffer sizes."""
-function train_on_buffer!(replay_buffer, network, opt_state)
-    n_buf = buf_length(replay_buffer)
-    n_buf < BATCH_SIZE && return (avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0)
-    # Cap at ~1 epoch of new data (avg ~200 samples/game × games_per_iter)
+"""Train one model on a subset of samples. Returns (avg_loss, avg_Lp, avg_Lv, avg_Linv, num_batches)."""
+function _train_model_on_samples!(samples_subset, indices_subset, network, opt_state, replay_buffer)
+    n = length(samples_subset)
+    n < BATCH_SIZE && return (avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0, num_batches=0)
+
     max_batches = max(1, ARGS["games_per_iteration"] * 200 ÷ BATCH_SIZE)
-    num_batches = min(max(1, n_buf ÷ BATCH_SIZE), max_batches)
+    num_batches = min(max(1, n ÷ BATCH_SIZE), max_batches)
     total_loss = 0.0
     total_Lp = 0.0
     total_Lv = 0.0
     total_Linv = 0.0
 
-    if USE_PER && replay_buffer isa PERBuffer
-        per_anneal_beta!(replay_buffer)
-    end
-
     for _ in 1:num_batches
-        local indices, batch, is_weights
-
-        if USE_PER && replay_buffer isa PERBuffer
-            indices, batch, is_weights = per_sample(replay_buffer, BATCH_SIZE, PER_ALPHA, PER_EPSILON)
-        else
-            indices = rand(1:n_buf, BATCH_SIZE)
-            batch = USE_PER ? [replay_buffer.samples[i] for i in indices] : [replay_buffer[i] for i in indices]
-            is_weights = ones(Float32, BATCH_SIZE)
-        end
+        batch_idx = rand(1:n, BATCH_SIZE)
+        batch = [samples_subset[i] for i in batch_idx]
+        # Map back to buffer indices for PER priority updates
+        buf_indices = [indices_subset[i] for i in batch_idx]
+        is_weights = ones(Float32, BATCH_SIZE)
 
         batch_data = prepare_batch(batch, NUM_ACTIONS, USE_GPU, network)
 
-        # Apply importance sampling weights to sample weights
-        if USE_PER
+        # Apply importance sampling weights (from PER, if applicable)
+        if USE_PER && replay_buffer isa PERBuffer
+            # Recompute IS weights for the sub-sampled batch
+            for (j, bi) in enumerate(batch_idx)
+                is_weights[j] = replay_buffer.priorities[indices_subset[bi]] > 0 ? 1.0f0 : 1.0f0
+            end
             W_is = reshape(Float32.(is_weights), 1, BATCH_SIZE)
             if USE_GPU
                 W_is = Network.convert_input_tuple(network, (; W=W_is)).W
@@ -2406,16 +2565,51 @@ function train_on_buffer!(replay_buffer, network, opt_state)
         total_Lv += Float64(Lv)
         total_Linv += Float64(Linv)
 
-        # Update PER priorities with TD-errors
+        # Update PER priorities
         if USE_PER && replay_buffer isa PERBuffer
-            # Compute per-sample value prediction vs target for TD-error
             td_errors = compute_td_errors(network, batch_data)
-            per_update_priorities!(replay_buffer, indices, td_errors)
+            per_update_priorities!(replay_buffer, buf_indices, td_errors)
         end
     end
 
     return (avg_loss=total_loss / num_batches, avg_Lp=total_Lp / num_batches,
-            avg_Lv=total_Lv / num_batches, avg_Linv=total_Linv / num_batches)
+            avg_Lv=total_Lv / num_batches, avg_Linv=total_Linv / num_batches,
+            num_batches=num_batches)
+end
+
+"""Train on replay buffer with dual models. Returns per-model loss stats.
+Contact and race samples are split by is_contact tag and trained on respective models."""
+function train_on_buffer!(replay_buffer, contact_network, contact_opt_state, race_network, race_opt_state)
+    n_buf = buf_length(replay_buffer)
+    n_buf < BATCH_SIZE && return (contact=(avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0),
+                                   race=(avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0))
+
+    if USE_PER && replay_buffer isa PERBuffer
+        per_anneal_beta!(replay_buffer)
+    end
+
+    # Split buffer into contact and race samples
+    all_samples = replay_buffer isa PERBuffer ? replay_buffer.samples : replay_buffer
+    contact_samples = []
+    contact_indices = Int[]
+    race_samples = []
+    race_indices = Int[]
+    for i in 1:length(all_samples)
+        s = all_samples[i]
+        if s.is_contact
+            push!(contact_samples, s)
+            push!(contact_indices, i)
+        else
+            push!(race_samples, s)
+            push!(race_indices, i)
+        end
+    end
+
+    # Train each model on its subset
+    contact_result = _train_model_on_samples!(contact_samples, contact_indices, contact_network, contact_opt_state, replay_buffer)
+    race_result = _train_model_on_samples!(race_samples, race_indices, race_network, race_opt_state, replay_buffer)
+
+    return (contact=contact_result, race=race_result)
 end
 
 """Compute per-sample TD-errors for PER priority updates."""
@@ -2445,16 +2639,15 @@ end
 const USE_REANALYZE = ARGS["use_reanalyze"]
 const REANALYZE_FRACTION = ARGS["reanalyze_fraction"]
 
-"""Reanalyze a fraction of buffer positions with the latest network.
+"""Reanalyze a fraction of buffer positions with the appropriate model (contact or race).
 Updates value targets with blended old/new values (EMA with α=0.5).
 If PER is enabled, also updates priorities."""
-function reanalyze_buffer!(replay_buffer, network)
+function reanalyze_buffer!(replay_buffer, contact_network, race_network)
     samples = replay_buffer isa PERBuffer ? replay_buffer.samples : replay_buffer
     n = length(samples)
     n == 0 && return 0
 
     num_to_reanalyze = max(1, round(Int, n * REANALYZE_FRACTION))
-    # Random subset across entire buffer
     reanalyze_indices = randperm(n)[1:min(num_to_reanalyze, n)]
 
     batch_size = min(4096, length(reanalyze_indices))
@@ -2465,55 +2658,52 @@ function reanalyze_buffer!(replay_buffer, network)
         batch_indices = reanalyze_indices[batch_start:batch_end]
         batch = [samples[i] for i in batch_indices]
 
-        batch_data = prepare_batch(batch, NUM_ACTIONS, USE_GPU, network)
+        # Split batch by contact/race
+        for (is_contact_flag, net) in [(true, contact_network), (false, race_network)]
+            sub_batch_map = [(j, bi) for (j, (bi, s)) in enumerate(zip(batch_indices, batch)) if s.is_contact == is_contact_flag]
+            isempty(sub_batch_map) && continue
 
-        # Get current network's value predictions
-        is_multihead = network isa FluxLib.FCResNetMultiHead
-        if is_multihead
+            sub_batch = [batch[j] for (j, _) in sub_batch_map]
+            sub_batch_data = prepare_batch(sub_batch, NUM_ACTIONS, USE_GPU, net)
+
             _, V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl, _ =
-                FluxLib.forward_normalized_multihead(network, batch_data.X, batch_data.A)
+                FluxLib.forward_normalized_multihead(net, sub_batch_data.X, sub_batch_data.A)
             equity = FluxLib.compute_equity(V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl)
             new_values = Float32.(vec(Flux.cpu(equity ./ 3f0)))
 
-            # Also update equity targets with EMA blend
             new_eq_win = Float32.(vec(Flux.cpu(V̂_win)))
             new_eq_gw = Float32.(vec(Flux.cpu(V̂_gw)))
             new_eq_bgw = Float32.(vec(Flux.cpu(V̂_bgw)))
             new_eq_gl = Float32.(vec(Flux.cpu(V̂_gl)))
             new_eq_bgl = Float32.(vec(Flux.cpu(V̂_bgl)))
-        else
-            _, V̂, _ = Network.forward_normalized(network, batch_data.X, batch_data.A)
-            new_values = Float32.(vec(Flux.cpu(V̂)))
-        end
 
-        # Update each sample with blended value (EMA α=0.5)
-        α_blend = 0.5f0
-        for (j, buf_idx) in enumerate(batch_indices)
-            old = samples[buf_idx]
-            old_val = old.value
-            blended_val = (1f0 - α_blend) * old_val + α_blend * new_values[j]
+            α_blend = 0.5f0
+            for (k, (_, buf_idx)) in enumerate(sub_batch_map)
+                old = samples[buf_idx]
+                old_val = old.value
+                blended_val = (1f0 - α_blend) * old_val + α_blend * new_values[k]
 
-            if is_multihead && old.has_equity
-                old_eq = old.equity
-                new_eq = Float32[
-                    (1f0 - α_blend) * old_eq[1] + α_blend * new_eq_win[j],
-                    (1f0 - α_blend) * old_eq[2] + α_blend * new_eq_gw[j],
-                    (1f0 - α_blend) * old_eq[3] + α_blend * new_eq_bgw[j],
-                    (1f0 - α_blend) * old_eq[4] + α_blend * new_eq_gl[j],
-                    (1f0 - α_blend) * old_eq[5] + α_blend * new_eq_bgl[j],
-                ]
-                samples[buf_idx] = merge(old, (value=blended_val, equity=new_eq))
-            else
-                samples[buf_idx] = merge(old, (value=blended_val,))
+                if old.has_equity
+                    old_eq = old.equity
+                    new_eq = Float32[
+                        (1f0 - α_blend) * old_eq[1] + α_blend * new_eq_win[k],
+                        (1f0 - α_blend) * old_eq[2] + α_blend * new_eq_gw[k],
+                        (1f0 - α_blend) * old_eq[3] + α_blend * new_eq_bgw[k],
+                        (1f0 - α_blend) * old_eq[4] + α_blend * new_eq_gl[k],
+                        (1f0 - α_blend) * old_eq[5] + α_blend * new_eq_bgl[k],
+                    ]
+                    samples[buf_idx] = merge(old, (value=blended_val, equity=new_eq))
+                else
+                    samples[buf_idx] = merge(old, (value=blended_val,))
+                end
+
+                if replay_buffer isa PERBuffer
+                    td_error = abs(new_values[k] - old_val)
+                    replay_buffer.priorities[buf_idx] = td_error
+                end
+
+                total_updated += 1
             end
-
-            # Update PER priorities
-            if replay_buffer isa PERBuffer
-                td_error = abs(new_values[j] - old_val)
-                replay_buffer.priorities[buf_idx] = td_error
-            end
-
-            total_updated += 1
         end
     end
 
@@ -2535,19 +2725,19 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         t_sp = time() - t0
         # 2. Train on buffer (GPU training)
         t0 = time()
-        train_result = train_on_buffer!(replay_buffer, network, opt_state)
+        train_result = train_on_buffer!(replay_buffer, contact_network, contact_opt_state, race_network, race_opt_state)
         t_train = time() - t0
-        avg_loss = train_result.avg_loss
+        avg_loss = (train_result.contact.avg_loss + train_result.race.avg_loss) / 2
     else
         # Overlapped: self-play (CPU) runs concurrently with training (GPU)
-        # Self-play uses cpu_network (read-only), training uses network (GPU, write)
+        # Self-play uses cpu_*_network (read-only), training uses *_network (GPU, write)
         t0 = time()
         sp_task = Threads.@spawn parallel_self_play(ARGS["games_per_iteration"])
 
         # Train on existing buffer while self-play runs (iter 1: buffer empty, no-op)
-        train_result = train_on_buffer!(replay_buffer, network, opt_state)
+        train_result = train_on_buffer!(replay_buffer, contact_network, contact_opt_state, race_network, race_opt_state)
         t_train = time() - t0
-        avg_loss = train_result.avg_loss
+        avg_loss = (train_result.contact.avg_loss + train_result.race.avg_loss) / 2
 
         # Wait for self-play to complete
         new_samples, games_this_iter = fetch(sp_task)
@@ -2555,7 +2745,8 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
 
         # Sync GPU→CPU weights AFTER self-play done (safe: no concurrent reads)
         if avg_loss > 0
-            Flux.loadmodel!(cpu_network, Flux.cpu(network))
+            Flux.loadmodel!(cpu_contact_network, Flux.cpu(contact_network))
+            Flux.loadmodel!(cpu_race_network, Flux.cpu(race_network))
             if USE_FAST_FORWARD
                 refresh_fast_weights!()
             end
@@ -2578,7 +2769,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     reanalyzed_count = 0
     t0 = time()
     if USE_REANALYZE && buf_length(replay_buffer) >= BATCH_SIZE
-        reanalyzed_count = reanalyze_buffer!(replay_buffer, network)
+        reanalyzed_count = reanalyze_buffer!(replay_buffer, contact_network, race_network)
     end
     t_reanalyze = time() - t0
 
@@ -2587,7 +2778,9 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     elapsed = time() - start_time
     games_per_min = total_games / (elapsed / 60)
 
-    @info "Iteration $iter" avg_loss buffer_size=cur_buf_size total_games games_per_min iter_time t_sp t_train t_reanalyze
+    contact_loss = train_result.contact.avg_loss
+    race_loss = train_result.race.avg_loss
+    @info "Iteration $iter" avg_loss contact_loss race_loss buffer_size=cur_buf_size total_games games_per_min iter_time t_sp t_train t_reanalyze
     flush(stdout)
     flush(stderr)
 
@@ -2597,11 +2790,29 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         # Only log loss metrics when actual training happened (skip iter 1 with empty buffer)
         if avg_loss > 0
             @info "train/loss" value=avg_loss log_step_increment=0
-            @info "train/loss_policy" value=train_result.avg_Lp log_step_increment=0
-            @info "train/loss_value" value=train_result.avg_Lv log_step_increment=0
-            @info "train/loss_invalid" value=train_result.avg_Linv log_step_increment=0
+            # Contact model losses
+            cr = train_result.contact
+            if cr.avg_loss > 0
+                @info "train/contact_loss" value=cr.avg_loss log_step_increment=0
+                @info "train/contact_loss_policy" value=cr.avg_Lp log_step_increment=0
+                @info "train/contact_loss_value" value=cr.avg_Lv log_step_increment=0
+                @info "train/contact_loss_invalid" value=cr.avg_Linv log_step_increment=0
+            end
+            # Race model losses
+            rr = train_result.race
+            if rr.avg_loss > 0
+                @info "train/race_loss" value=rr.avg_loss log_step_increment=0
+                @info "train/race_loss_policy" value=rr.avg_Lp log_step_increment=0
+                @info "train/race_loss_value" value=rr.avg_Lv log_step_increment=0
+                @info "train/race_loss_invalid" value=rr.avg_Linv log_step_increment=0
+            end
         end
         @info "train/buffer_size" value=cur_buf_size log_step_increment=0
+        # Log contact/race split
+        n_contact_samples = count(s -> s.is_contact, new_samples)
+        n_race_samples = length(new_samples) - n_contact_samples
+        @info "train/contact_samples" value=n_contact_samples log_step_increment=0
+        @info "train/race_samples" value=n_race_samples log_step_increment=0
         @info "perf/games_per_min" value=games_per_min log_step_increment=0
         @info "perf/iter_time_s" value=iter_time log_step_increment=0
         @info "perf/selfplay_s" value=t_sp log_step_increment=0
@@ -2619,7 +2830,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         # Bear-off accuracy benchmark (fast, runs every iteration)
         if USE_BEAROFF
             bo_t0 = time()
-            bo_result = eval_bearoff_accuracy(network)
+            bo_result = eval_bearoff_accuracy(race_network)
             bo_time = time() - bo_t0
             if bo_result !== nothing
                 @info "bearoff/mae_equity" value=bo_result.mae_value log_step_increment=0
@@ -2638,7 +2849,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     end
 
     # Evaluation
-    if ARGS["eval_interval"] > 0 && iter % ARGS["eval_interval"] == 0
+    if GNUBG_AVAILABLE[] && ARGS["eval_interval"] > 0 && iter % ARGS["eval_interval"] == 0
         eval_games = ARGS["eval_games"]
         @info "Running GnuBG 0-ply evaluation ($eval_games games)..."
         flush(stdout)
@@ -2665,23 +2876,24 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
 
     # Checkpoint
     if iter % ARGS["checkpoint_interval"] == 0
-        checkpoint_path = joinpath(SESSION_DIR, "checkpoints", "iter_$iter.data")
-        FluxLib.save_weights(checkpoint_path, network)
-
-        latest_path = joinpath(SESSION_DIR, "checkpoints", "latest.data")
-        FluxLib.save_weights(latest_path, network)
+        # Save contact model checkpoints
+        FluxLib.save_weights(joinpath(SESSION_DIR, "checkpoints", "contact_iter_$iter.data"), contact_network)
+        FluxLib.save_weights(joinpath(SESSION_DIR, "checkpoints", "contact_latest.data"), contact_network)
+        # Save race model checkpoints
+        FluxLib.save_weights(joinpath(SESSION_DIR, "checkpoints", "race_iter_$iter.data"), race_network)
+        FluxLib.save_weights(joinpath(SESSION_DIR, "checkpoints", "race_latest.data"), race_network)
 
         open(joinpath(SESSION_DIR, "checkpoints", "iter.txt"), "w") do f
             println(f, iter)
         end
 
-        @info "Saved checkpoint at iteration $iter"
+        @info "Saved dual-model checkpoint at iteration $iter"
     end
 end
 
 # Final evaluation
 final_eval_games = ARGS["final_eval_games"]
-if final_eval_games > 0
+if final_eval_games > 0 && GNUBG_AVAILABLE[]
     println("\n" * "=" ^ 60)
     println("Running Final Evaluation (vs GnuBG 0-ply)")
     println("=" ^ 60)
@@ -2740,4 +2952,4 @@ println("TensorBoard logs: $TB_DIR")
 println("=" ^ 60)
 
 # Cleanup
-stop_gnubg_server!()
+GNUBG_AVAILABLE[] && stop_gnubg_server!()
