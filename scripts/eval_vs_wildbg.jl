@@ -88,8 +88,6 @@ using Dates
 
 # BackgammonNet provides game + wildbg backend
 using BackgammonNet
-using BackgammonNet: WildbgBackend, BackendAgent, wildbg_set_lib_path!,
-                     play_game, play_match, AbstractAgent, RandomAgent
 
 # Set up game
 ENV["BACKGAMMON_OBS_TYPE"] = ARGS["obs_type"]
@@ -120,7 +118,7 @@ end
 AlphaZero MCTS agent that uses a loaded network for evaluation.
 Wraps the network in a batch oracle compatible with BackgammonNet's play_game.
 """
-struct AlphaZeroAgent <: AbstractAgent
+struct AlphaZeroAgent <: BackgammonNet.AbstractAgent
     network::Any
     mcts_params::MctsParams
     batch_size::Int
@@ -188,7 +186,7 @@ function BackgammonNet.agent_move(agent::AlphaZeroAgent, g::BackgammonGame)
 end
 
 """Play a single eval game: AZ agent vs wildbg opponent."""
-function eval_game(az_agent::AlphaZeroAgent, wildbg_agent::BackendAgent,
+function eval_game(az_agent::AlphaZeroAgent, wildbg_agent::BackgammonNet.BackendAgent,
                    az_is_white::Bool; seed::Int=1)
     rng = MersenneTwister(seed)
     g = BackgammonNet.initial_state()
@@ -234,10 +232,10 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
     az_agent = AlphaZeroAgent(network, mcts_params, batch_size, gspec)
 
     # Initialize wildbg
-    wildbg_set_lib_path!(wildbg_lib)
-    wb = WildbgBackend()
+    BackgammonNet.wildbg_set_lib_path!(wildbg_lib)
+    wb = BackgammonNet.WildbgBackend()
     BackgammonNet.open!(wb)
-    wildbg_agent = BackendAgent(wb)
+    wildbg_agent = BackgammonNet.BackendAgent(wb)
 
     games_per_side = num_games
 
