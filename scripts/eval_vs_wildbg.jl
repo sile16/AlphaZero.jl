@@ -231,11 +231,13 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
 
     az_agent = AlphaZeroAgent(network, mcts_params, batch_size, gspec)
 
-    # Initialize wildbg
+    # Initialize per-thread wildbg backends (WildbgBackend has mutable cached state for doubles)
     BackgammonNet.wildbg_set_lib_path!(wildbg_lib)
-    wb = BackgammonNet.WildbgBackend()
-    BackgammonNet.open!(wb)
-    wildbg_agent = BackgammonNet.BackendAgent(wb)
+    wildbg_agents = [begin
+        wb = BackgammonNet.WildbgBackend()
+        BackgammonNet.open!(wb)
+        BackgammonNet.BackendAgent(wb)
+    end for _ in 1:num_workers]
 
     games_per_side = num_games
 
@@ -244,11 +246,12 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
     flush(stdout)
     white_rewards = Vector{Float64}(undef, games_per_side)
     white_claimed = Threads.Atomic{Int}(0)
-    Threads.@threads for _ in 1:num_workers
+    Threads.@threads for tid in 1:num_workers
+        wa = wildbg_agents[tid]
         while true
             i = Threads.atomic_add!(white_claimed, 1) + 1
             i > games_per_side && break
-            white_rewards[i] = eval_game(az_agent, wildbg_agent, true; seed=i)
+            white_rewards[i] = eval_game(az_agent, wa, true; seed=i)
         end
     end
 
@@ -257,15 +260,18 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
     flush(stdout)
     black_rewards = Vector{Float64}(undef, games_per_side)
     black_claimed = Threads.Atomic{Int}(0)
-    Threads.@threads for _ in 1:num_workers
+    Threads.@threads for tid in 1:num_workers
+        wa = wildbg_agents[tid]
         while true
             i = Threads.atomic_add!(black_claimed, 1) + 1
             i > games_per_side && break
-            black_rewards[i] = eval_game(az_agent, wildbg_agent, false; seed=i + games_per_side)
+            black_rewards[i] = eval_game(az_agent, wa, false; seed=i + games_per_side)
         end
     end
 
-    BackgammonNet.close(wb)
+    for wa in wildbg_agents
+        BackgammonNet.close(wa.backend)
+    end
 
     white_avg = mean(white_rewards)
     black_avg = mean(black_rewards)
@@ -362,12 +368,19 @@ function main()
             flush(stdout)
 
             t0 = time()
-            result = evaluate_checkpoint(ckpt_path, wildbg_lib;
-                width=arch.width, blocks=arch.blocks,
-                num_games=ARGS["num_games"],
-                num_workers=ARGS["num_workers"],
-                mcts_iters=ARGS["mcts_iters"],
-                batch_size=ARGS["inference_batch_size"])
+            local result
+            try
+                result = evaluate_checkpoint(ckpt_path, wildbg_lib;
+                    width=arch.width, blocks=arch.blocks,
+                    num_games=ARGS["num_games"],
+                    num_workers=ARGS["num_workers"],
+                    mcts_iters=ARGS["mcts_iters"],
+                    batch_size=ARGS["inference_batch_size"])
+            catch e
+                println("  ERROR: $e")
+                flush(stdout)
+                continue
+            end
             eval_time = time() - t0
 
             println("  White:    $(round(result.white_avg, digits=3))")
