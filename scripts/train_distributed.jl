@@ -1760,10 +1760,15 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
     X_buf = mb_slot !== nothing ? mb_slot.X : zeros(Float32, _state_dim, max_batch)
     A_buf = mb_slot !== nothing ? mb_slot.A : zeros(Float32, NUM_ACTIONS, max_batch)
     # Per-model sub-batch buffers for split-classify-merge
+    # Vectorize directly into contact/race buffers to avoid double copy
     contact_X_buf = zeros(Float32, _state_dim, max_batch)
     contact_A_buf = zeros(Float32, NUM_ACTIONS, max_batch)
     race_X_buf = zeros(Float32, _state_dim, max_batch)
     race_A_buf = zeros(Float32, NUM_ACTIONS, max_batch)
+    # Pre-allocated index/result arrays (avoid per-call allocation)
+    _contact_idxs = Vector{Int}(undef, max_batch)
+    _race_idxs = Vector{Int}(undef, max_batch)
+    _results = Vector{Tuple{Vector{Float32}, Float32}}(undef, max_batch)
 
     # Timing accumulators
     t_vectorize = 0.0
@@ -1777,53 +1782,51 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         n == 0 && return Tuple{Vector{Float32}, Float32}[]
         t0 = time_ns()
 
-        # Classify each state as contact or race, vectorize into buffers
-        is_contact_mask = Vector{Bool}(undef, n)
+        # Classify each state and vectorize directly into contact/race buffers
+        n_contact = 0
+        n_race = 0
         for (i, s) in enumerate(states)
-            is_contact_mask[i] = if s isa BackgammonNet.BackgammonGame
-                BackgammonNet.is_contact_position(s)
+            is_contact = s isa BackgammonNet.BackgammonGame ? BackgammonNet.is_contact_position(s) : true
+            if is_contact
+                n_contact += 1
+                _contact_idxs[n_contact] = i
+                vectorize_state_into!(@view(contact_X_buf[:, n_contact]), gspec, s)
+                a_col = @view(contact_A_buf[:, n_contact])
+                fill!(a_col, 0.0f0)
+                if !BackgammonNet.game_terminated(s)
+                    legal = BackgammonNet.legal_actions(s)
+                    @inbounds for action in legal
+                        if 1 <= action <= NUM_ACTIONS
+                            a_col[action] = 1.0f0
+                        end
+                    end
+                end
             else
-                true
-            end
-            vectorize_state_into!(@view(X_buf[:, i]), gspec, s)
-            a_col = @view(A_buf[:, i])
-            fill!(a_col, 0.0f0)
-            if !BackgammonNet.game_terminated(s)
-                legal = BackgammonNet.legal_actions(s)
-                @inbounds for action in legal
-                    if 1 <= action <= NUM_ACTIONS
-                        a_col[action] = 1.0f0
+                n_race += 1
+                _race_idxs[n_race] = i
+                vectorize_state_into!(@view(race_X_buf[:, n_race]), gspec, s)
+                a_col = @view(race_A_buf[:, n_race])
+                fill!(a_col, 0.0f0)
+                if !BackgammonNet.game_terminated(s)
+                    legal = BackgammonNet.legal_actions(s)
+                    @inbounds for action in legal
+                        if 1 <= action <= NUM_ACTIONS
+                            a_col[action] = 1.0f0
+                        end
                     end
                 end
             end
         end
         t1 = time_ns()
 
-        # Split into contact/race sub-batches and forward through respective models
-        results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
-
         if contact_fast_bufs !== nothing && race_fast_bufs !== nothing
-            # Fast forward path: split-classify-merge
-            contact_idxs = Int[]
-            race_idxs = Int[]
-            for i in 1:n
-                if is_contact_mask[i]
-                    push!(contact_idxs, i)
-                else
-                    push!(race_idxs, i)
-                end
-            end
+            # Fast forward path: already split into contact/race buffers
 
             # Forward contact sub-batch
-            n_contact = length(contact_idxs)
             if n_contact > 0
-                # Pack contact states into contiguous buffer
-                for (j, idx) in enumerate(contact_idxs)
-                    contact_X_buf[:, j] .= @view(X_buf[:, idx])
-                    contact_A_buf[:, j] .= @view(A_buf[:, idx])
-                end
                 P_c, V_c, _ = fast_forward_normalized!(CONTACT_FAST_WEIGHTS, contact_fast_bufs, contact_X_buf, contact_A_buf, n_contact)
-                @inbounds for (j, idx) in enumerate(contact_idxs)
+                @inbounds for j in 1:n_contact
+                    idx = _contact_idxs[j]
                     pv = contact_fast_bufs.result_vecs[j]
                     k = 0
                     for a in 1:NUM_ACTIONS
@@ -1833,19 +1836,15 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
                         end
                     end
                     resize!(pv, k)
-                    results[idx] = (pv, V_c[j])
+                    _results[idx] = (pv, V_c[j])
                 end
             end
 
             # Forward race sub-batch
-            n_race = length(race_idxs)
             if n_race > 0
-                for (j, idx) in enumerate(race_idxs)
-                    race_X_buf[:, j] .= @view(X_buf[:, idx])
-                    race_A_buf[:, j] .= @view(A_buf[:, idx])
-                end
                 P_r, V_r, _ = fast_forward_normalized!(RACE_FAST_WEIGHTS, race_fast_bufs, race_X_buf, race_A_buf, n_race)
-                @inbounds for (j, idx) in enumerate(race_idxs)
+                @inbounds for j in 1:n_race
+                    idx = _race_idxs[j]
                     pv = race_fast_bufs.result_vecs[j]
                     k = 0
                     for a in 1:NUM_ACTIONS
@@ -1855,14 +1854,31 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
                         end
                     end
                     resize!(pv, k)
-                    results[idx] = (pv, V_r[j])
+                    _results[idx] = (pv, V_r[j])
                 end
             end
         else
             # Fallback: channel/GPU inference (uses contact model only for now)
+            # Need to vectorize into X_buf/A_buf since fast path skipped it
+            for (i, s) in enumerate(states)
+                vectorize_state_into!(@view(X_buf[:, i]), gspec, s)
+                a_col = @view(A_buf[:, i])
+                fill!(a_col, 0.0f0)
+                if !BackgammonNet.game_terminated(s)
+                    legal = BackgammonNet.legal_actions(s)
+                    @inbounds for action in legal
+                        if 1 <= action <= NUM_ACTIONS
+                            a_col[action] = 1.0f0
+                        end
+                    end
+                end
+            end
             if USE_GPU_INFERENCE
                 put!(req_chan, (wid=vworker_id, X=@view(X_buf[:, 1:n]), A=@view(A_buf[:, 1:n])))
-                results = take!(resp_chan)
+                fallback_results = take!(resp_chan)
+                for i in 1:n
+                    _results[i] = fallback_results[i]
+                end
             else
                 X = @view(X_buf[:, 1:n])
                 A = @view(A_buf[:, 1:n])
@@ -1870,7 +1886,7 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
                     cpu_contact_network, Network.forward_normalized(cpu_contact_network, X, A))
                 for i in 1:n
                     legal = @view(A[:, i]) .> 0
-                    results[i] = (P_raw[legal, i], V[1, i])
+                    _results[i] = (P_raw[legal, i], V[1, i])
                 end
             end
         end
@@ -1879,7 +1895,7 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         t_vectorize += (t1 - t0)
         t_gpu_wait += (t2 - t1)
         n_oracle_calls += 1
-        return results
+        return @view(_results[1:n])
     end
     single_oracle(state) = batch_oracle([state])[1]
 
