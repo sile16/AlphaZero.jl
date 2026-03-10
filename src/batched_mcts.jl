@@ -190,6 +190,18 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
         # Single Dict lookup (was: haskey + env.tree[state] = 2 lookups)
         info = get(env.tree, state, nothing)
         if info === nothing
+            # Bear-off table: return exact value at decision nodes too (skip NN inference)
+            if benv.bearoff_evaluator !== nothing
+                val = benv.bearoff_evaluator(game)
+                if val !== nothing
+                    sim.leaf_state = state
+                    sim.leaf_actions = Int[]
+                    sim.is_new_node = false
+                    sim.terminal_value = val
+                    return sim
+                end
+            end
+
             leaf_actions = GI.available_actions(game)
 
             # Single-option states (e.g., forced PASS): create trivial tree entry
