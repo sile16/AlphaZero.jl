@@ -122,6 +122,27 @@ function parse_args()
             arg_type = Float64
             default = 0.25
 
+        # Temperature scheduling (served to clients)
+        "--temp-move-cutoff"
+            arg_type = Int
+            default = 20
+        "--temp-final"
+            arg_type = Float64
+            default = 0.1
+        "--temp-iter-decay"
+            action = :store_true
+        "--temp-iter-final"
+            arg_type = Float64
+            default = 0.3
+
+        # Bear-off (clients load locally)
+        "--use-bearoff"
+            action = :store_true
+        "--bearoff-hard-targets"
+            action = :store_true
+        "--bearoff-truncation"
+            action = :store_true
+
         # Eval
         "--eval-interval"
             help = "Run eval every N iterations (0 = disabled)"
@@ -541,6 +562,14 @@ const SERVER_CONFIG = Dict{String, Any}(
     "state_dim" => _state_dim,
     "num_actions" => NUM_ACTIONS,
     "game" => GAME_NAME,
+    "temp_move_cutoff" => ARGS["temp_move_cutoff"],
+    "temp_final" => ARGS["temp_final"],
+    "temp_iter_decay" => ARGS["temp_iter_decay"],
+    "temp_iter_final" => ARGS["temp_iter_final"],
+    "total_iterations" => ARGS["total_iterations"],
+    "use_bearoff" => ARGS["use_bearoff"],
+    "bearoff_hard_targets" => ARGS["bearoff_hard_targets"],
+    "bearoff_truncation" => ARGS["bearoff_truncation"],
 )
 
 # Initialize server state
