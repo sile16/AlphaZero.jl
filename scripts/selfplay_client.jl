@@ -988,68 +988,73 @@ println("=" ^ 60)
 flush(stdout)
 
 const UPLOAD_INTERVAL = ARGS["upload_interval"]
-games_played = 0
-last_weight_check = time()
-batch_num = 0
 
-while true
-    batch_num += 1
-    t_batch_start = time()
+function main_loop()
+    games_played = 0
+    last_weight_check = time()
+    batch_num = 0
 
-    # Play a batch of games
-    samples = parallel_self_play(UPLOAD_INTERVAL)
-    games_played += UPLOAD_INTERVAL
-    n_samples = length(samples)
+    while true
+        batch_num += 1
+        t_batch_start = time()
 
-    t_play = time() - t_batch_start
-    gps = UPLOAD_INTERVAL / t_play
-    println("Batch $batch_num: $UPLOAD_INTERVAL games, $n_samples samples, $(round(gps, digits=1)) games/sec")
+        # Play a batch of games
+        samples = parallel_self_play(UPLOAD_INTERVAL)
+        games_played += UPLOAD_INTERVAL
+        n_samples = length(samples)
 
-    # Convert samples to SampleBatch and upload
-    t_upload_start = time()
-    batch = samples_to_batch(samples)
-    bytes = pack_samples(batch)
-    headers = vcat(auth_headers(client),
-                   ["Content-Type" => "application/msgpack"])
-    try
-        resp = HTTP.post("$(client.server_url)/api/samples",
-                         headers, bytes; status_exception=false)
-        if resp.status == 200
-            result = JSON.parse(String(resp.body))
-            t_upload = time() - t_upload_start
-            println("  Uploaded $(result["accepted"]) samples ($(round(length(bytes)/1024, digits=1)) KB, $(round(t_upload, digits=2))s), buffer=$(result["buffer_size"])")
-        else
-            println("  Upload failed: $(resp.status)")
+        t_play = time() - t_batch_start
+        gps = UPLOAD_INTERVAL / t_play
+        println("Batch $batch_num: $UPLOAD_INTERVAL games, $n_samples samples, $(round(gps, digits=1)) games/sec")
+
+        # Convert samples to SampleBatch and upload
+        t_upload_start = time()
+        batch = samples_to_batch(samples)
+        bytes = pack_samples(batch)
+        headers = vcat(auth_headers(client),
+                       ["Content-Type" => "application/msgpack"])
+        try
+            resp = HTTP.post("$(client.server_url)/api/samples",
+                             headers, bytes; status_exception=false)
+            if resp.status == 200
+                result = JSON.parse(String(resp.body))
+                t_upload = time() - t_upload_start
+                println("  Uploaded $(result["accepted"]) samples ($(round(length(bytes)/1024, digits=1)) KB, $(round(t_upload, digits=2))s), buffer=$(result["buffer_size"])")
+            else
+                println("  Upload failed: $(resp.status)")
+            end
+        catch e
+            println("  Upload error: $e")
         end
-    catch e
-        println("  Upload error: $e")
-    end
-    flush(stdout)
+        flush(stdout)
 
-    # Check for weight updates periodically
-    if time() - last_weight_check > ARGS["weight_sync_interval"]
-        updated = sync_weights!(client, contact_network, race_network)
-        if updated
-            # Refresh FastWeights from updated networks
-            refresh_fast_weights!()
-            println("  Weights updated! contact=$(client.contact_version), race=$(client.race_version)")
+        # Check for weight updates periodically
+        if time() - last_weight_check > ARGS["weight_sync_interval"]
+            updated = sync_weights!(client, contact_network, race_network)
+            if updated
+                # Refresh FastWeights from updated networks
+                refresh_fast_weights!()
+                println("  Weights updated! contact=$(client.contact_version), race=$(client.race_version)")
 
-            # Update iteration counter from server
-            version = check_weight_version(client)
-            if version !== nothing
-                CURRENT_ITERATION[] = get(version, "iteration", CURRENT_ITERATION[])
+                # Update iteration counter from server
+                version = check_weight_version(client)
+                if version !== nothing
+                    CURRENT_ITERATION[] = get(version, "iteration", CURRENT_ITERATION[])
+                end
+            end
+            last_weight_check = time()
+        end
+
+        # Periodic status
+        if batch_num % 5 == 0
+            status = server_status(client)
+            if status !== nothing
+                println("  Server: iter=$(status["iteration"]), buffer=$(status["buffer_size"]), " *
+                        "games=$(status["total_games"]), clients=$(status["total_clients"])")
             end
         end
-        last_weight_check = time()
+        flush(stdout)
     end
-
-    # Periodic status
-    if batch_num % 5 == 0
-        status = server_status(client)
-        if status !== nothing
-            println("  Server: iter=$(status["iteration"]), buffer=$(status["buffer_size"]), " *
-                    "games=$(status["total_games"]), clients=$(status["total_clients"])")
-        end
-    end
-    flush(stdout)
 end
+
+main_loop()
