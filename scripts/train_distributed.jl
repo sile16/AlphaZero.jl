@@ -479,11 +479,20 @@ end
 
 """Spawn one GnuBG subprocess, wait for ready marker, warm up."""
 function _spawn_gnubg_process()
+    # Check that the eval server script exists before spawning
+    if !isfile(GNUBG_SERVER_SCRIPT)
+        error("Python file ($GNUBG_SERVER_SCRIPT) not found")
+    end
     cmd = _gnubg_cmd()
     proc = open(cmd, "r+")
     gp = GnubgProcess(proc, proc.in, proc.out)
-    # Wait for ready marker (skips gnubg banner lines when using gnubg -p)
+    # Wait for ready marker with timeout (skips gnubg banner lines when using gnubg -p)
+    deadline = time() + 30.0  # 30 second timeout
     while true
+        if time() > deadline
+            try; kill(proc); catch; end
+            error("GnuBG subprocess timed out waiting for GNUBG_EVAL_SERVER_READY")
+        end
         line = readline(proc.out)
         if startswith(line, "GNUBG_EVAL_SERVER_READY")
             break
@@ -806,7 +815,6 @@ function layernorm_relu!(out::AbstractMatrix, x::AbstractMatrix, scale::Vector, 
     end
 end
 
-"""Thread-safe matmul: C = A * B[:, 1:n] + bias, no BLAS (avoids OpenBLAS global lock)."""
 """
 Pure Julia GEMM with bias: C = A * B .+ bias (thread-safe, no BLAS contention).
 
