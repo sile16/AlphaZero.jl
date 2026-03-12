@@ -174,7 +174,7 @@ flush(stdout)
 using AlphaZero
 using AlphaZero: GI, MCTS, Network, FluxLib, MctsParams, LearningParams, Adam
 using AlphaZero: CONSTANT_WEIGHT, losses, ConstSchedule
-using AlphaZero.NetLib
+# Note: NetLib not needed - using FluxLib directly for network creation
 import Flux
 import CUDA
 
@@ -195,11 +195,15 @@ include(joinpath(@__DIR__, "..", "src", "distributed", "server.jl"))
 
 # Game setup
 const GAME_NAME = "backgammon-deterministic"
-push!(LOAD_PATH, joinpath(@__DIR__, "..", "games"))
-include(joinpath(@__DIR__, "..", "games", GAME_NAME, "main.jl"))
-const gspec = Training.GameSpec()
-const _state_dim = GI.state_dim(gspec)
+if GAME_NAME == "backgammon-deterministic"
+    ENV["BACKGAMMON_OBS_TYPE"] = "minimal"
+    include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
+else
+    error("Unknown game: $GAME_NAME")
+end
+const gspec = GameSpec()
 const NUM_ACTIONS = GI.num_actions(gspec)
+const _state_dim = let env = GI.init(gspec); length(vec(GI.vectorize_state(gspec, GI.current_state(env)))); end
 
 # Network setup
 const CONTACT_WIDTH = ARGS["contact_width"]
@@ -219,12 +223,10 @@ const REANALYZE_FRACTION = ARGS["reanalyze_fraction"]
 
 # Create networks
 println("\nCreating networks...")
-contact_network = NetLib.FCResNetMultiHead(gspec;
-    width=CONTACT_WIDTH, num_blocks=CONTACT_BLOCKS,
-    depth_phead=2, depth_vhead=2, share_value_trunk=true)
-race_network = NetLib.FCResNetMultiHead(gspec;
-    width=RACE_WIDTH, num_blocks=RACE_BLOCKS,
-    depth_phead=2, depth_vhead=2, share_value_trunk=true)
+contact_network = FluxLib.FCResNetMultiHead(
+    gspec, FluxLib.FCResNetMultiHeadHP(width=CONTACT_WIDTH, num_blocks=CONTACT_BLOCKS))
+race_network = FluxLib.FCResNetMultiHead(
+    gspec, FluxLib.FCResNetMultiHeadHP(width=RACE_WIDTH, num_blocks=RACE_BLOCKS))
 
 println("Contact model parameters: $(sum(length(p) for p in Flux.params(contact_network)))")
 println("Race model parameters: $(sum(length(p) for p in Flux.params(race_network)))")
@@ -503,7 +505,7 @@ function reanalyze_buffer!()
 end
 
 # TensorBoard logger
-const TB_LOGGER = TBLogger(TB_DIR, tb_append)
+const TB_LOGGER = TBLogger(TB_DIR, tb_overwrite)
 
 # Log config
 with_logger(TB_LOGGER) do
