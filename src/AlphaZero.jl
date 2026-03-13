@@ -59,6 +59,11 @@ module AlphaZero
   using .GumbelMCTS
   export GumbelMCTS
 
+  # Eval MCTS with full chance expansion (expectimax, GPU-batched)
+  include("eval_mcts.jl")
+  using .EvalMCTS
+  export EvalMCTS
+
   # A generic network interface
   include("networks/network.jl")
   using .Network

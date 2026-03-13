@@ -84,7 +84,8 @@ end
 function check_weight_version(client::SelfPlayClient)
     resp = HTTP.get("$(client.server_url)/api/weights/version",
                     auth_headers(client);
-                    status_exception=false)
+                    status_exception=false,
+                    connect_timeout=10, readtimeout=30)
     if resp.status != 200
         @warn "Weight version check failed" status=resp.status
         return nothing
@@ -97,7 +98,8 @@ function download_weights(client::SelfPlayClient, model::Symbol)
     endpoint = model == :contact ? "contact" : "race"
     resp = HTTP.get("$(client.server_url)/api/weights/$endpoint",
                     auth_headers(client);
-                    status_exception=false)
+                    status_exception=false,
+                    connect_timeout=10, readtimeout=120)
     if resp.status != 200
         @warn "Weight download failed" model status=resp.status
         return nothing
@@ -175,7 +177,8 @@ end
 """Get server status."""
 function server_status(client::SelfPlayClient)
     resp = HTTP.get("$(client.server_url)/api/status";
-                    status_exception=false)
+                    status_exception=false,
+                    connect_timeout=10, readtimeout=30)
     if resp.status != 200
         return nothing
     end

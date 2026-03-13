@@ -587,6 +587,73 @@ println("\nServer listening on port $(ARGS["port"])")
 println("Waiting for self-play samples...")
 flush(stdout)
 
+"""Collect server-side performance stats (GPU + CPU)."""
+function collect_server_stats()
+    stats = Dict{String, Float64}(
+        "gpu_percent" => 0.0,
+        "gpu_memory_used_gb" => 0.0,
+        "gpu_memory_total_gb" => 0.0,
+        "cpu_percent" => 0.0,
+    )
+
+    # GPU stats via nvidia-smi (Linux with NVIDIA GPU)
+    if USE_GPU
+        try
+            gpu_util = strip(read(`nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits`, String))
+            stats["gpu_percent"] = parse(Float64, gpu_util)
+        catch e
+            @debug "Failed to read GPU utilization" exception=e
+        end
+
+        try
+            gpu_mem = strip(read(`nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits`, String))
+            parts = split(gpu_mem, ",")
+            if length(parts) >= 2
+                stats["gpu_memory_used_gb"] = round(parse(Float64, strip(parts[1])) / 1024, digits=2)
+                stats["gpu_memory_total_gb"] = round(parse(Float64, strip(parts[2])) / 1024, digits=2)
+            end
+        catch e
+            @debug "Failed to read GPU memory" exception=e
+        end
+    end
+
+    # CPU stats via /proc/stat (Linux)
+    if Sys.islinux()
+        try
+            lines1 = readlines("/proc/stat")
+            cpu1 = parse.(Int, split(lines1[1])[2:end])
+            sleep(0.1)
+            lines2 = readlines("/proc/stat")
+            cpu2 = parse.(Int, split(lines2[1])[2:end])
+            idle1 = cpu1[4]; idle2 = cpu2[4]
+            total1 = sum(cpu1); total2 = sum(cpu2)
+            dt = total2 - total1
+            if dt > 0
+                stats["cpu_percent"] = round(100.0 * (1.0 - (idle2 - idle1) / dt), digits=1)
+            end
+        catch e
+            @debug "Failed to read CPU stats" exception=e
+        end
+    elseif Sys.isapple()
+        try
+            cpu_output = strip(read(`ps -A -o %cpu`, String))
+            lines = split(cpu_output, '\n')
+            total_cpu = 0.0
+            for line in lines[2:end]
+                s = strip(line)
+                isempty(s) && continue
+                total_cpu += parse(Float64, s)
+            end
+            ncpu = parse(Int, strip(read(`sysctl -n hw.ncpu`, String)))
+            stats["cpu_percent"] = round(total_cpu / ncpu, digits=1)
+        catch e
+            @debug "Failed to read CPU stats" exception=e
+        end
+    end
+
+    return stats
+end
+
 # Samples threshold for one iteration
 const SAMPLES_PER_ITERATION = ARGS["games_per_iteration"] * 200  # ~200 samples per game
 
@@ -635,6 +702,10 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     # Log to console
     @info "Iteration $iter" avg_loss contact_loss race_loss buffer_size=buf_length(replay_buffer) total_samples=server_state.total_samples[] n_clients=length(server_state.clients) iter_time t_train t_reanalyze n_reanalyzed
 
+    # Collect server and cluster stats
+    server_stats = collect_server_stats()
+    cluster_stats = get_cluster_stats(server_state)
+
     # Log to TensorBoard
     with_logger(TB_LOGGER) do
         @info "loss/avg" value=avg_loss log_step_increment=0
@@ -644,7 +715,23 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         @info "perf/reanalyze_s" value=t_reanalyze log_step_increment=0
         @info "perf/iter_time" value=iter_time log_step_increment=0
         @info "buffer/size" value=buf_length(replay_buffer) log_step_increment=0
-        @info "buffer/total_samples" value=server_state.total_samples[] log_step_increment=1
+        @info "buffer/total_samples" value=server_state.total_samples[] log_step_increment=0
+
+        # Cluster performance
+        @info "cluster/total_games_per_sec" value=cluster_stats.total_games_per_sec log_step_increment=0
+        @info "cluster/total_samples_per_sec" value=cluster_stats.total_samples_per_sec log_step_increment=0
+        @info "cluster/total_clients" value=cluster_stats.total_clients log_step_increment=0
+
+        # Per-client stats
+        for (cid, cstats) in cluster_stats.per_client
+            @info "client/$(cid)/games_per_sec" value=cstats["games_per_sec"] log_step_increment=0
+            @info "client/$(cid)/cpu_percent" value=cstats["cpu_percent"] log_step_increment=0
+        end
+
+        # Server stats
+        @info "server/gpu_percent" value=server_stats["gpu_percent"] log_step_increment=0
+        @info "server/gpu_memory_gb" value=server_stats["gpu_memory_used_gb"] log_step_increment=0
+        @info "server/cpu_percent" value=server_stats["cpu_percent"] log_step_increment=1
     end
 
     # Save client stats

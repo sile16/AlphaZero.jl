@@ -57,6 +57,10 @@ function parse_args()
         "--seed"
             arg_type = Int
             default = 0
+        "--gpu-workers"
+            help = "Number of GPU workers (Metal, Mac only). Runs alongside CPU workers."
+            arg_type = Int
+            default = 0
     end
 
     return ArgParse.parse_args(s)
@@ -66,6 +70,8 @@ const ARGS = parse_args()
 const SERVER_URL = ARGS["server"]
 const NUM_WORKERS = ARGS["num_workers"]
 const MAIN_SEED = ARGS["seed"] > 0 ? ARGS["seed"] : nothing
+const GPU_WORKERS = ARGS["gpu_workers"]
+const USE_GPU = GPU_WORKERS > 0
 
 # Set seed (0 = random)
 if ARGS["seed"] > 0
@@ -76,7 +82,8 @@ println("=" ^ 60)
 println("AlphaZero Self-Play Client")
 println("=" ^ 60)
 println("Server: $SERVER_URL")
-println("Workers: $NUM_WORKERS")
+println("Workers: $NUM_WORKERS CPU" * (GPU_WORKERS > 0 ? " + $GPU_WORKERS GPU" : ""))
+println("GPU: $(GPU_WORKERS > 0 ? "Metal ($GPU_WORKERS workers)" : "disabled")")
 println("=" ^ 60)
 flush(stdout)
 
@@ -161,9 +168,23 @@ if !sync_weights!(client, contact_network, race_network)
 end
 flush(stdout)
 
-# Set up BLAS for single-threaded per-worker inference
+# Set up BLAS for single-threaded per-worker CPU inference (always needed)
 import LinearAlgebra; LinearAlgebra.BLAS.set_num_threads(1)
 println("CPU inference: BLAS threads=1, per-worker fast forward")
+
+# GPU setup (Metal.jl for Mac) — runs alongside CPU workers
+if USE_GPU
+    @eval using Metal
+    println("Metal GPU: $(Metal.current_device())")
+
+    # Move networks to GPU
+    const contact_network_gpu = Flux.gpu(contact_network)
+    const race_network_gpu = Flux.gpu(race_network)
+    println("Networks moved to GPU ($GPU_WORKERS workers)")
+
+    # Global GPU lock — Metal is NOT thread-safe
+    const GPU_LOCK = ReentrantLock()
+end
 
 #####
 ##### Bear-off table (loaded locally — too large to serve over HTTP)
@@ -533,7 +554,7 @@ function fast_forward_normalized!(fw::FastWeights, fb::FastBuffers,
     return fb.p, V_equity, n
 end
 
-# Extract weights from networks
+# Extract weights from networks (always — CPU workers always use fast forward)
 const CONTACT_FAST_WEIGHTS = FastWeights(contact_network)
 const RACE_FAST_WEIGHTS = FastWeights(race_network)
 println("Fast forward (contact): $(CONTACT_FAST_WEIGHTS.num_blocks) res blocks, $(CONTACT_FAST_WEIGHTS.num_policy_layers) policy layers")
@@ -577,8 +598,17 @@ function _refresh_fast_weights!(fw::FastWeights, cpu_nn)
 end
 
 function refresh_fast_weights!()
+    # Always update CPU fast weights
     _refresh_fast_weights!(CONTACT_FAST_WEIGHTS, contact_network)
     _refresh_fast_weights!(RACE_FAST_WEIGHTS, race_network)
+
+    # Also update GPU networks if enabled
+    if USE_GPU
+        lock(GPU_LOCK) do
+            Flux.loadmodel!(contact_network_gpu, Flux.gpu(contact_network))
+            Flux.loadmodel!(race_network_gpu, Flux.gpu(race_network))
+        end
+    end
 end
 
 #####
@@ -950,7 +980,7 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
             n_bearoff_truncated=n_bearoff_truncated)
 end
 
-"""Play games on a worker thread with per-worker fast forward buffers."""
+"""Play games on a worker thread with per-worker fast forward buffers (CPU mode)."""
 function worker_play_games(worker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
                            rng::MersenneTwister)
     contact_fb = FastBuffers(CONTACT_WIDTH, NUM_ACTIONS, INFERENCE_BATCH_SIZE + 1)
@@ -962,7 +992,257 @@ function worker_play_games(worker_id::Int, games_claimed::Threads.Atomic{Int}, t
     return result.samples
 end
 
-"""Spawn worker threads for self-play with work-stealing."""
+"""Play games on a worker thread with GPU inference (Metal, serialized via lock)."""
+function worker_play_games_gpu(worker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
+                                rng::MersenneTwister)
+    sub_rng = MersenneTwister(rand(rng, UInt))
+    gpu_array_fn = x -> Metal.MtlArray(x)
+
+    max_batch = INFERENCE_BATCH_SIZE + 1
+    X_buf = zeros(Float32, _state_dim, max_batch)
+    A_buf = zeros(Float32, NUM_ACTIONS, max_batch)
+    _contact_idxs = Vector{Int}(undef, max_batch)
+    _race_idxs = Vector{Int}(undef, max_batch)
+    _results = Vector{Tuple{Vector{Float32}, Float32}}(undef, max_batch)
+
+    n_oracle_calls = 0
+    n_bearoff_truncated = 0
+
+    function batch_oracle(states::Vector)
+        n = length(states)
+        n == 0 && return Tuple{Vector{Float32}, Float32}[]
+
+        # Split into contact/race
+        n_contact = 0
+        n_race = 0
+        for (i, s) in enumerate(states)
+            is_contact = s isa BackgammonNet.BackgammonGame ? BackgammonNet.is_contact_position(s) : true
+            if is_contact
+                n_contact += 1
+                _contact_idxs[n_contact] = i
+            else
+                n_race += 1
+                _race_idxs[n_race] = i
+            end
+        end
+
+        # Build feature matrices for each model
+        if n_contact > 0
+            X_c = zeros(Float32, _state_dim, n_contact)
+            A_c = zeros(Float32, NUM_ACTIONS, n_contact)
+            for j in 1:n_contact
+                s = states[_contact_idxs[j]]
+                v = GI.vectorize_state(gspec, s)
+                X_c[:, j] .= vec(v)
+                if !BackgammonNet.game_terminated(s)
+                    for a in BackgammonNet.legal_actions(s)
+                        1 <= a <= NUM_ACTIONS && (A_c[a, j] = 1f0)
+                    end
+                end
+            end
+
+            local Pr_c, V_c
+            lock(GPU_LOCK) do
+                X_g = gpu_array_fn(X_c)
+                A_g = gpu_array_fn(A_c)
+                result = Network.forward_normalized(contact_network_gpu, X_g, A_g)
+                Metal.synchronize()
+                Pr_c = Array(result[1])
+                V_c = Array(result[2])
+            end
+
+            A_bool = A_c .> 0
+            for j in 1:n_contact
+                idx = _contact_idxs[j]
+                _results[idx] = (Pr_c[@view(A_bool[:, j]), j], V_c[1, j])
+            end
+        end
+
+        if n_race > 0
+            X_r = zeros(Float32, _state_dim, n_race)
+            A_r = zeros(Float32, NUM_ACTIONS, n_race)
+            for j in 1:n_race
+                s = states[_race_idxs[j]]
+                v = GI.vectorize_state(gspec, s)
+                X_r[:, j] .= vec(v)
+                if !BackgammonNet.game_terminated(s)
+                    for a in BackgammonNet.legal_actions(s)
+                        1 <= a <= NUM_ACTIONS && (A_r[a, j] = 1f0)
+                    end
+                end
+            end
+
+            local Pr_r, V_r
+            lock(GPU_LOCK) do
+                X_g = gpu_array_fn(X_r)
+                A_g = gpu_array_fn(A_r)
+                result = Network.forward_normalized(race_network_gpu, X_g, A_g)
+                Metal.synchronize()
+                Pr_r = Array(result[1])
+                V_r = Array(result[2])
+            end
+
+            A_bool = A_r .> 0
+            for j in 1:n_race
+                idx = _race_idxs[j]
+                _results[idx] = (Pr_r[@view(A_bool[:, j]), j], V_r[1, j])
+            end
+        end
+
+        n_oracle_calls += 1
+        return @view(_results[1:n])
+    end
+    single_oracle(state) = batch_oracle([state])[1]
+
+    mcts_params = MctsParams(
+        num_iters_per_turn=MCTS_ITERS,
+        cpuct=Float64(config["cpuct"]),
+        temperature=ConstSchedule(1.0),
+        dirichlet_noise_ϵ=Float64(config["dirichlet_epsilon"]),
+        dirichlet_noise_α=Float64(config["dirichlet_alpha"]))
+    player = BatchedMCTS.BatchedMctsPlayer(
+        gspec, single_oracle, mcts_params;
+        batch_size=INFERENCE_BATCH_SIZE, batch_oracle=batch_oracle,
+        bearoff_evaluator=BEAROFF_EVALUATOR)
+
+    all_samples = []
+    while Threads.atomic_add!(games_claimed, 1) < total_games
+        env = GI.init(gspec)
+        if hasproperty(env, :rng)
+            env.rng = sub_rng
+        end
+
+        trace_states = []
+        trace_policies = []
+        trace_actions = Vector{Int}[]
+        trace_rewards = Float32[]
+        trace_is_chance = Bool[]
+        bearoff_truncated = false
+        bearoff_bo = nothing
+        bearoff_wp_at_trunc = true
+        first_bearoff_bo = nothing
+        decision_move_num = 0
+        first_bearoff_wp = true
+
+        while !GI.game_terminated(env)
+            if GI.is_chance_node(env)
+                if USE_BEAROFF
+                    bg = env.game
+                    if BearoffK6.is_bearoff_position(bg.p0, bg.p1)
+                        if first_bearoff_bo === nothing
+                            first_bearoff_bo = bearoff_table_equity(bg)
+                            first_bearoff_wp = (bg.current_player == 0)
+                        end
+                        if BEAROFF_TRUNCATION
+                            bearoff_truncated = true
+                            bearoff_bo = first_bearoff_bo
+                            bearoff_wp_at_trunc = first_bearoff_wp
+                            break
+                        end
+                    end
+                end
+                outcomes = GI.chance_outcomes(env)
+                idx = _sample_chance(sub_rng, outcomes)
+                GI.apply_chance!(env, outcomes[idx][1])
+                continue
+            end
+
+            avail = GI.available_actions(env)
+            if length(avail) == 1
+                GI.play!(env, avail[1])
+                continue
+            end
+
+            state = GI.current_state(env)
+            push!(trace_states, state)
+            actions, policy = BatchedMCTS.think(player, env)
+            push!(trace_policies, Float32.(policy))
+            push!(trace_actions, actions)
+            push!(trace_is_chance, false)
+
+            decision_move_num += 1
+            τ = get_temperature(decision_move_num)
+            if isone(τ)
+                action = actions[sample_from_policy(policy, sub_rng)]
+            elseif iszero(τ)
+                action = actions[argmax(policy)]
+            else
+                temp_policy = Util.apply_temperature(policy, τ)
+                action = actions[sample_from_policy(temp_policy, sub_rng)]
+            end
+            GI.play!(env, action)
+            push!(trace_rewards, 0.0f0)
+        end
+
+        BatchedMCTS.reset_player!(player)
+        if bearoff_truncated
+            n_bearoff_truncated += 1
+            final_reward = Float32(bearoff_wp_at_trunc ? bearoff_bo.value : -bearoff_bo.value)
+            samples = convert_trace_to_samples(
+                gspec, trace_states, trace_policies, trace_actions, trace_rewards, trace_is_chance,
+                final_reward, nothing; rng=sub_rng,
+                bearoff_equity=bearoff_bo.equity, bearoff_wp=bearoff_wp_at_trunc)
+        elseif first_bearoff_bo !== nothing
+            final_reward = Float32(first_bearoff_wp ? first_bearoff_bo.value : -first_bearoff_bo.value)
+            outcome = GI.game_outcome(env)
+            samples = convert_trace_to_samples(
+                gspec, trace_states, trace_policies, trace_actions, trace_rewards, trace_is_chance,
+                final_reward, outcome; rng=sub_rng,
+                first_bearoff_equity=first_bearoff_bo.equity, first_bearoff_wp=first_bearoff_wp)
+        else
+            final_reward = Float32(GI.white_reward(env))
+            outcome = GI.game_outcome(env)
+            samples = convert_trace_to_samples(
+                gspec, trace_states, trace_policies, trace_actions, trace_rewards, trace_is_chance,
+                final_reward, outcome; rng=sub_rng)
+        end
+        append!(all_samples, samples)
+    end
+
+    return all_samples
+end
+
+# GPU background workers — run continuously, push samples into shared channel
+const GPU_SAMPLE_CHANNEL = Channel{Any}(1000)  # buffered channel for GPU-produced samples
+const GPU_GAMES_COUNT = Threads.Atomic{Int}(0)
+
+if USE_GPU
+    for w in 1:GPU_WORKERS
+        wid = NUM_WORKERS + w
+        rng = MersenneTwister(isnothing(MAIN_SEED) ? rand(UInt) : MAIN_SEED + wid * 104729)
+        Threads.@spawn begin
+            # Infinite game loop — GPU workers never stop
+            games_claimed_inf = Threads.Atomic{Int}(0)
+            while true
+                try
+                    samples = worker_play_games_gpu(wid, games_claimed_inf, 1, rng)
+                    for s in samples
+                        put!(GPU_SAMPLE_CHANNEL, s)
+                    end
+                    Threads.atomic_add!(GPU_GAMES_COUNT, 1)
+                    # Reset counter for next game
+                    Threads.atomic_xchg!(games_claimed_inf, 0)
+                catch e
+                    println("GPU worker $wid error: $e")
+                    sleep(1)
+                end
+            end
+        end
+    end
+    println("Started $GPU_WORKERS GPU background workers")
+end
+
+"""Drain all available GPU samples from the channel (non-blocking)."""
+function drain_gpu_samples!()
+    samples = []
+    while isready(GPU_SAMPLE_CHANNEL)
+        push!(samples, take!(GPU_SAMPLE_CHANNEL))
+    end
+    return samples
+end
+
+"""Spawn CPU worker threads for self-play with work-stealing.
+GPU workers run in background and contribute via channel."""
 function parallel_self_play(num_games::Int)
     games_claimed = Threads.Atomic{Int}(0)
 
@@ -974,12 +1254,124 @@ function parallel_self_play(num_games::Int)
     end
 
     all_samples = reduce(vcat, [fetch(t) for t in tasks])
+
+    # Also collect any GPU samples that have accumulated
+    gpu_samples = drain_gpu_samples!()
+    if !isempty(gpu_samples)
+        append!(all_samples, gpu_samples)
+    end
+
     return all_samples
 end
 
 #####
 ##### Main self-play loop
 #####
+
+#####
+##### System stats collection
+#####
+
+"""Collect system-wide CPU and memory stats. Returns a Dict with metrics."""
+function collect_system_stats(; games_per_sec::Float64=0.0, samples_per_sec::Float64=0.0)
+    stats = Dict{String, Any}(
+        "cpu_percent" => 0.0,
+        "memory_used_gb" => 0.0,
+        "memory_total_gb" => 0.0,
+        "games_per_sec" => games_per_sec,
+        "samples_per_sec" => samples_per_sec,
+    )
+
+    try
+        if Sys.isapple()
+            # macOS: sum per-process CPU% and divide by number of cores
+            cpu_output = strip(read(`ps -A -o %cpu`, String))
+            lines = split(cpu_output, '\n')
+            total_cpu = 0.0
+            for line in lines[2:end]  # skip header
+                s = strip(line)
+                isempty(s) && continue
+                total_cpu += parse(Float64, s)
+            end
+            ncpu = parse(Int, strip(read(`sysctl -n hw.ncpu`, String)))
+            stats["cpu_percent"] = round(total_cpu / ncpu, digits=1)
+
+            # Memory: use vm_stat
+            vm_output = read(`vm_stat`, String)
+            page_size = 16384  # default on Apple Silicon
+            m = match(r"page size of (\d+) bytes", vm_output)
+            if m !== nothing
+                page_size = parse(Int, m.captures[1])
+            end
+            # Parse pages
+            free = 0; active = 0; inactive = 0; speculative = 0; wired = 0; compressed = 0
+            for line in split(vm_output, '\n')
+                m = match(r"Pages free:\s+(\d+)", line)
+                m !== nothing && (free = parse(Int, m.captures[1]))
+                m = match(r"Pages active:\s+(\d+)", line)
+                m !== nothing && (active = parse(Int, m.captures[1]))
+                m = match(r"Pages inactive:\s+(\d+)", line)
+                m !== nothing && (inactive = parse(Int, m.captures[1]))
+                m = match(r"Pages speculative:\s+(\d+)", line)
+                m !== nothing && (speculative = parse(Int, m.captures[1]))
+                m = match(r"Pages wired down:\s+(\d+)", line)
+                m !== nothing && (wired = parse(Int, m.captures[1]))
+                m = match(r"Pages occupied by compressor:\s+(\d+)", line)
+                m !== nothing && (compressed = parse(Int, m.captures[1]))
+            end
+            total_pages = free + active + inactive + speculative + wired + compressed
+            used_pages = active + wired + compressed
+            stats["memory_total_gb"] = round(total_pages * page_size / 1e9, digits=2)
+            stats["memory_used_gb"] = round(used_pages * page_size / 1e9, digits=2)
+        elseif Sys.islinux()
+            # Linux: /proc/stat for CPU
+            lines1 = readlines("/proc/stat")
+            cpu1 = parse.(Int, split(lines1[1])[2:end])
+            sleep(0.1)
+            lines2 = readlines("/proc/stat")
+            cpu2 = parse.(Int, split(lines2[1])[2:end])
+            idle1 = cpu1[4]; idle2 = cpu2[4]
+            total1 = sum(cpu1); total2 = sum(cpu2)
+            dt = total2 - total1
+            if dt > 0
+                stats["cpu_percent"] = round(100.0 * (1.0 - (idle2 - idle1) / dt), digits=1)
+            end
+
+            # Memory: /proc/meminfo
+            meminfo = read("/proc/meminfo", String)
+            total_kb = 0; avail_kb = 0
+            for line in split(meminfo, '\n')
+                m = match(r"MemTotal:\s+(\d+)", line)
+                m !== nothing && (total_kb = parse(Int, m.captures[1]))
+                m = match(r"MemAvailable:\s+(\d+)", line)
+                m !== nothing && (avail_kb = parse(Int, m.captures[1]))
+            end
+            stats["memory_total_gb"] = round(total_kb / 1e6, digits=2)
+            stats["memory_used_gb"] = round((total_kb - avail_kb) / 1e6, digits=2)
+        end
+    catch e
+        @debug "Failed to collect system stats" exception=e
+    end
+
+    return stats
+end
+
+"""Send client stats to server (fire-and-forget)."""
+function send_client_stats(client::SelfPlayClient, stats::Dict)
+    stats["client_id"] = client.client_id
+    Threads.@spawn begin
+        try
+            headers = vcat(auth_headers(client),
+                           ["Content-Type" => "application/json"])
+            HTTP.post("$(client.server_url)/api/client_stats",
+                      headers, JSON.json(stats);
+                      status_exception=false,
+                      connect_timeout=10, readtimeout=10)
+        catch e
+            @debug "Failed to send client stats" exception=e
+        end
+    end
+end
 
 flush(stdout)
 println("\n" * "=" ^ 60)
@@ -1005,6 +1397,7 @@ function main_loop()
 
         t_play = time() - t_batch_start
         gps = UPLOAD_INTERVAL / t_play
+        sps = n_samples / t_play
         println("Batch $batch_num: $UPLOAD_INTERVAL games, $n_samples samples, $(round(gps, digits=1)) games/sec")
 
         # Convert samples to SampleBatch and upload
@@ -1015,7 +1408,8 @@ function main_loop()
                        ["Content-Type" => "application/msgpack"])
         try
             resp = HTTP.post("$(client.server_url)/api/samples",
-                             headers, bytes; status_exception=false)
+                             headers, bytes; status_exception=false,
+                             connect_timeout=30, readtimeout=1800)
             if resp.status == 200
                 result = JSON.parse(String(resp.body))
                 t_upload = time() - t_upload_start
@@ -1026,31 +1420,44 @@ function main_loop()
         catch e
             println("  Upload error: $e")
         end
+
+        # Collect and send system stats (fire-and-forget)
+        stats = collect_system_stats(games_per_sec=gps, samples_per_sec=sps)
+        send_client_stats(client, stats)
+
         flush(stdout)
 
         # Check for weight updates periodically
         if time() - last_weight_check > ARGS["weight_sync_interval"]
-            updated = sync_weights!(client, contact_network, race_network)
-            if updated
-                # Refresh FastWeights from updated networks
-                refresh_fast_weights!()
-                println("  Weights updated! contact=$(client.contact_version), race=$(client.race_version)")
+            try
+                updated = sync_weights!(client, contact_network, race_network)
+                if updated
+                    # Refresh FastWeights from updated networks
+                    refresh_fast_weights!()
+                    println("  Weights updated! contact=$(client.contact_version), race=$(client.race_version)")
 
-                # Update iteration counter from server
-                version = check_weight_version(client)
-                if version !== nothing
-                    CURRENT_ITERATION[] = get(version, "iteration", CURRENT_ITERATION[])
+                    # Update iteration counter from server
+                    version = check_weight_version(client)
+                    if version !== nothing
+                        CURRENT_ITERATION[] = get(version, "iteration", CURRENT_ITERATION[])
+                    end
                 end
+            catch e
+                println("  Weight sync error: $e")
             end
             last_weight_check = time()
         end
 
         # Periodic status
         if batch_num % 5 == 0
-            status = server_status(client)
-            if status !== nothing
-                println("  Server: iter=$(status["iteration"]), buffer=$(status["buffer_size"]), " *
-                        "games=$(status["total_games"]), clients=$(status["total_clients"])")
+            try
+                status = server_status(client)
+                if status !== nothing
+                    println("  Server: iter=$(status["iteration"]), buffer=$(status["buffer_size"]), " *
+                            "games=$(status["total_games"]), clients=$(status["total_clients"])")
+                end
+            catch e
+                println("  Status check error: $e")
             end
         end
         flush(stdout)
