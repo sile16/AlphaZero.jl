@@ -49,7 +49,7 @@ function parse_args()
         "--upload-interval"
             help = "Upload samples every N games"
             arg_type = Int
-            default = 50
+            default = 10
         "--weight-sync-interval"
             help = "Check for weight updates every N seconds"
             arg_type = Float64
