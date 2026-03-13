@@ -667,7 +667,10 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         n_clients = length(server_state.clients)
         print("\rIteration $iter: waiting for samples ($cur / $target_samples = $pct%, $n_clients clients)  ")
         flush(stdout)
-        sleep(5.0)
+        # ccall(:sleep, Cint, (Cuint,), 5) blocks the OS thread, preventing
+        # the libuv event loop from busy-spinning. HTTP.serve! runs its own
+        # threads so it doesn't need the main thread's event loop.
+        ccall(:sleep, Cint, (Cuint,), 5)
     end
     println()
 
@@ -753,6 +756,10 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         @info "Saved checkpoint at iteration $iter"
     end
 end
+
+println("\nTraining complete!")
+println("Checkpoints at: $CHECKPOINT_DIR")
+println("TensorBoard: tensorboard --logdir $TB_DIR")
 
 println("\nTraining complete!")
 println("Checkpoints at: $CHECKPOINT_DIR")
