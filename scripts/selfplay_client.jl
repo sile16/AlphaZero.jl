@@ -1381,6 +1381,31 @@ flush(stdout)
 
 const UPLOAD_INTERVAL = ARGS["upload_interval"]
 
+# Background upload channel — self-play never blocks on network I/O
+const UPLOAD_CHANNEL = Channel{Vector{UInt8}}(4)  # buffer up to 4 batches
+Threads.@spawn begin
+    while true
+        bytes = take!(UPLOAD_CHANNEL)
+        headers = vcat(auth_headers(client),
+                       ["Content-Type" => "application/msgpack"])
+        try
+            t0 = time()
+            resp = HTTP.post("$(client.server_url)/api/samples",
+                             headers, bytes; status_exception=false,
+                             connect_timeout=30, readtimeout=1800)
+            t_upload = time() - t0
+            if resp.status == 200
+                result = JSON.parse(String(resp.body))
+                println("  Uploaded $(result["accepted"]) samples ($(round(length(bytes)/1024, digits=1)) KB, $(round(t_upload, digits=2))s), buffer=$(result["buffer_size"]), queue=$(length(UPLOAD_CHANNEL.data)))")
+            else
+                println("  Upload failed: $(resp.status)")
+            end
+        catch e
+            println("  Upload error: $e")
+        end
+    end
+end
+
 function main_loop()
     games_played = 0
     last_weight_check = time()
@@ -1400,26 +1425,10 @@ function main_loop()
         sps = n_samples / t_play
         println("Batch $batch_num: $UPLOAD_INTERVAL games, $n_samples samples, $(round(gps, digits=1)) games/sec")
 
-        # Convert samples to SampleBatch and upload
-        t_upload_start = time()
+        # Serialize and queue for async upload (non-blocking unless queue is full)
         batch = samples_to_batch(samples)
         bytes = pack_samples(batch)
-        headers = vcat(auth_headers(client),
-                       ["Content-Type" => "application/msgpack"])
-        try
-            resp = HTTP.post("$(client.server_url)/api/samples",
-                             headers, bytes; status_exception=false,
-                             connect_timeout=30, readtimeout=1800)
-            if resp.status == 200
-                result = JSON.parse(String(resp.body))
-                t_upload = time() - t_upload_start
-                println("  Uploaded $(result["accepted"]) samples ($(round(length(bytes)/1024, digits=1)) KB, $(round(t_upload, digits=2))s), buffer=$(result["buffer_size"])")
-            else
-                println("  Upload failed: $(resp.status)")
-            end
-        catch e
-            println("  Upload error: $e")
-        end
+        put!(UPLOAD_CHANNEL, bytes)
 
         # Collect and send system stats (fire-and-forget)
         stats = collect_system_stats(games_per_sec=gps, samples_per_sec=sps)
