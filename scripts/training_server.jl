@@ -657,7 +657,10 @@ end
 # Samples threshold for one iteration
 const SAMPLES_PER_ITERATION = ARGS["games_per_iteration"] * 200  # ~200 samples per game
 
-# Main training loop
+# Main training loop — runs on a spawned thread so the main thread's
+# libuv event loop stays active for HTTP.jl to handle requests.
+training_task = Threads.@spawn begin
+
 for iter in (START_ITER + 1):ARGS["total_iterations"]
     # Wait for enough new samples
     target_samples = iter * SAMPLES_PER_ITERATION
@@ -667,10 +670,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         n_clients = length(server_state.clients)
         print("\rIteration $iter: waiting for samples ($cur / $target_samples = $pct%, $n_clients clients)  ")
         flush(stdout)
-        # ccall(:sleep, Cint, (Cuint,), 5) blocks the OS thread, preventing
-        # the libuv event loop from busy-spinning. HTTP.serve! runs its own
-        # threads so it doesn't need the main thread's event loop.
-        ccall(:sleep, Cint, (Cuint,), 5)
+        sleep(5)
     end
     println()
 
@@ -761,14 +761,13 @@ println("\nTraining complete!")
 println("Checkpoints at: $CHECKPOINT_DIR")
 println("TensorBoard: tensorboard --logdir $TB_DIR")
 
-println("\nTraining complete!")
-println("Checkpoints at: $CHECKPOINT_DIR")
-println("TensorBoard: tensorboard --logdir $TB_DIR")
+end # Threads.@spawn
 
-# Keep server running for eval/client connections
-println("\nServer still running on port $(ARGS["port"]). Press Ctrl+C to stop.")
+# Keep server running — main thread runs libuv event loop for HTTP.jl
+println("Server running on port $(ARGS["port"]). Training loop started on background thread.")
+println("Press Ctrl+C to stop.")
 try
-    wait(http_server)
+    wait(training_task)
 catch e
     e isa InterruptException || rethrow()
     println("\nShutting down...")
