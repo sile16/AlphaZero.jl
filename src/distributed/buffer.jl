@@ -160,6 +160,62 @@ function per_sample(buf::PERBuffer, batch_size::Int, alpha::Float32, epsilon::Fl
     end
 end
 
+"""Sample from a SUBSET of buffer indices using PER priorities.
+
+Given `subset_indices` (e.g. contact-only or race-only indices from partition_indices),
+samples `batch_size` entries proportional to their PER priorities.
+Returns (sampled_buf_indices, importance_weights)."""
+function per_sample_partition(buf::PERBuffer, subset_indices::Vector{Int},
+                              batch_size::Int, alpha::Float32, epsilon::Float32)
+    n = length(subset_indices)
+    n < batch_size && error("Subset too small ($n < $batch_size)")
+
+    # Compute priorities^alpha and cumulative sum over the subset
+    cumsum_pα = Vector{Float32}(undef, n)
+    @inbounds begin
+        cumsum_pα[1] = (buf.priorities[subset_indices[1]] + epsilon) ^ alpha
+        for i in 2:n
+            cumsum_pα[i] = cumsum_pα[i-1] + (buf.priorities[subset_indices[i]] + epsilon) ^ alpha
+        end
+    end
+    total = cumsum_pα[n]
+
+    # Proportional sampling via binary search on cumsum
+    local_indices = Vector{Int}(undef, batch_size)
+    for j in 1:batch_size
+        r = rand(Float32) * total
+        lo, hi = 1, n
+        while lo < hi
+            mid = (lo + hi) >>> 1
+            if cumsum_pα[mid] < r
+                lo = mid + 1
+            else
+                hi = mid
+            end
+        end
+        local_indices[j] = lo
+    end
+
+    # Map back to buffer indices
+    buf_indices = Vector{Int}(undef, batch_size)
+    @inbounds for j in 1:batch_size
+        buf_indices[j] = subset_indices[local_indices[j]]
+    end
+
+    # Importance sampling weights: w_i = (N * P(i))^(-beta) / max(w)
+    inv_total = 1.0f0 / total
+    weights = Vector{Float32}(undef, batch_size)
+    @inbounds for j in 1:batch_size
+        idx = local_indices[j]
+        pα_i = idx == 1 ? cumsum_pα[1] : cumsum_pα[idx] - cumsum_pα[idx-1]
+        weights[j] = (Float32(n) * pα_i * inv_total) ^ (-buf.beta)
+    end
+    max_w = maximum(weights)
+    weights ./= max_w
+
+    return (buf_indices, weights)
+end
+
 """Update priorities for given indices with new TD-errors."""
 function per_update_priorities!(buf::PERBuffer, indices::Vector{Int}, td_errors::Vector{Float32})
     lock(buf.lock) do

@@ -175,9 +175,11 @@ end
 
 # ── Game Play from Position ─────────────────────────────────────────────
 
-"""Play a game starting from a fixed race position. Returns (reward, value_samples)."""
+"""Play a game starting from a fixed race position. Returns (reward, value_samples).
+
+`az_is_white`: if true, AZ plays as P0 (white); if false, AZ plays as P1 (black)."""
 function eval_race_game(az_agent::AlphaZeroAgent, wildbg_agent::BackgammonNet.BackendAgent,
-                        position_data::Tuple, net; seed::Int=1)
+                        position_data::Tuple, net; seed::Int=1, az_is_white::Bool=true)
     rng = MersenneTwister(seed)
     p0, p1, cp = position_data
 
@@ -186,9 +188,6 @@ function eval_race_game(az_agent::AlphaZeroAgent, wildbg_agent::BackgammonNet.Ba
                        obs_type=:minimal_flat)
 
     value_samples = PositionValueSample[]
-
-    # AZ always plays as P0 (white)
-    az_is_white = true
 
     while !BackgammonNet.game_terminated(g)
         if BackgammonNet.is_chance_node(g)
@@ -243,9 +242,12 @@ function main()
     batch_size = ARGS["inference_batch_size"]
     num_workers = ARGS["num_workers"]
 
+    # Total games = 2 * n_positions (each position played from both sides)
+    n_total = 2 * n_games
+
     println("Checkpoint: $checkpoint")
     println("Architecture: $(width)w×$(blocks)b")
-    println("Games: $n_games race positions")
+    println("Positions: $n_games | Games: $n_total (both sides)")
     println("MCTS: $mcts_iters iterations")
     println("Workers: $num_workers CPU")
 
@@ -285,9 +287,11 @@ function main()
     println("=" ^ 70)
     flush(stdout)
 
-    # Play all positions
-    rewards = Vector{Float64}(undef, n_games)
-    vsamples = Vector{Vector{PositionValueSample}}(undef, n_games)
+    # Play each position from both sides:
+    #   job 1..n_games:         AZ as white (P0)
+    #   job n_games+1..2*n_games: AZ as black (P1)
+    rewards = Vector{Float64}(undef, n_total)
+    vsamples = Vector{Vector{PositionValueSample}}(undef, n_total)
 
     t_start = time()
     claimed = Threads.Atomic{Int}(0)
@@ -296,17 +300,27 @@ function main()
     Threads.@threads for tid in 1:num_workers
         wa = wildbg_agents[tid]
         while true
-            i = Threads.atomic_add!(claimed, 1) + 1
-            i > n_games && break
-            result = eval_race_game(agent, wa, positions[i], network; seed=i)
-            rewards[i] = result.reward
-            vsamples[i] = result.value_samples
+            job = Threads.atomic_add!(claimed, 1) + 1
+            job > n_total && break
+            if job <= n_games
+                pos_idx = job
+                az_white = true
+                seed = job
+            else
+                pos_idx = job - n_games
+                az_white = false
+                seed = job  # different seed than white game
+            end
+            result = eval_race_game(agent, wa, positions[pos_idx], network;
+                                    seed=seed, az_is_white=az_white)
+            rewards[job] = result.reward
+            vsamples[job] = result.value_samples
             d = Threads.atomic_add!(done, 1) + 1
             if d % 100 == 0
                 elapsed = time() - t_start
                 rate = d / elapsed
-                eta = (n_games - d) / rate
-                @printf("  %d/%d games (%.1f g/min, ETA %.0fs)\n", d, n_games, rate*60, eta)
+                eta = (n_total - d) / rate
+                @printf("  %d/%d games (%.1f g/min, ETA %.0fs)\n", d, n_total, rate*60, eta)
                 flush(stdout)
             end
         end
@@ -318,22 +332,28 @@ function main()
         BackgammonNet.close(wa.backend)
     end
 
-    # Results
+    # Split results by side
+    white_rewards = rewards[1:n_games]
+    black_rewards = rewards[n_games+1:end]
+
     avg_reward = mean(rewards)
+    white_avg = mean(white_rewards)
+    black_avg = mean(black_rewards)
     win_count = count(r -> r > 0, rewards)
-    win_pct = 100 * win_count / n_games
+    win_pct = 100 * win_count / n_total
 
     all_vs = PositionValueSample[]
     for vs in vsamples; append!(all_vs, vs); end
     vstats = compute_value_stats(all_vs)
 
     println("=" ^ 70)
-    println("Results (vs wildbg, race positions only):")
-    @printf("  Equity:    %.3f\n", avg_reward)
+    println("Results (vs wildbg, race positions, both sides):")
+    @printf("  Equity:    %.3f  (as white: %+.3f, as black: %+.3f)\n",
+            avg_reward, white_avg, black_avg)
     @printf("  Win%%:      %.1f%%\n", win_pct)
-    @printf("  Games:     %d\n", n_games)
+    @printf("  Games:     %d (%d positions × 2 sides)\n", n_total, n_games)
     @printf("  Time:      %.1f min\n", elapsed / 60)
-    @printf("  Rate:      %.1f games/min\n", n_games / (elapsed / 60))
+    @printf("  Rate:      %.1f games/min\n", n_total / (elapsed / 60))
 
     if vstats !== nothing
         println("\nValue Error (NN vs Wildbg):")

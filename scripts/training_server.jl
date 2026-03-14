@@ -480,29 +480,45 @@ function _train_model_on_samples!(buf_indices::Vector{Int}, network, opt_state)
     total_Linv = 0.0
 
     for _ in 1:num_batches
-        # Sample random indices from the subset
-        sample_idx = rand(1:n, BATCH_SIZE)
-        batch_buf_indices = buf_indices[sample_idx]
+        # PER: sample proportional to priorities within this model's partition
+        # Uniform: sample randomly from the partition
+        if USE_PER
+            batch_buf_indices, is_weights = per_sample_partition(
+                replay_buffer, buf_indices, BATCH_SIZE, PER_ALPHA, PER_EPSILON)
+        else
+            sample_idx = rand(1:n, BATCH_SIZE)
+            batch_buf_indices = buf_indices[sample_idx]
+            is_weights = ones(Float32, BATCH_SIZE)
+        end
 
-        # Extract columnar data from buffer (single lock acquisition)
+        # Extract columnar data from buffer
         col_data = extract_batch(replay_buffer, batch_buf_indices)
         batch_data = prepare_batch_columnar(col_data, NUM_ACTIONS, USE_GPU, network)
-        Wmean = mean(batch_data.W)
+
+        # IS weights: scale sample weights by importance sampling correction
+        W_is = reshape(is_weights, 1, BATCH_SIZE)
+        if USE_GPU
+            W_is = Flux.gpu(W_is)
+        end
+        Wmean = mean(W_is)
         Hp = 0.0f0
 
-        loss_fn(nn) = losses(nn, LEARNING_PARAMS, Wmean, Hp, batch_data)[1]
+        # Replace uniform weights with IS weights for PER-corrected loss
+        batch_data_per = merge(batch_data, (W=W_is,))
+
+        loss_fn(nn) = losses(nn, LEARNING_PARAMS, Wmean, Hp, batch_data_per)[1]
         loss, grads = Flux.withgradient(loss_fn, network)
         Flux.update!(opt_state, network, grads[1])
 
-        L, Lp, Lv, _, Linv = losses(network, LEARNING_PARAMS, Wmean, Hp, batch_data)
+        L, Lp, Lv, _, Linv = losses(network, LEARNING_PARAMS, Wmean, Hp, batch_data_per)
         total_loss += Float64(L)
         total_Lp += Float64(Lp)
         total_Lv += Float64(Lv)
         total_Linv += Float64(Linv)
 
-        # Update PER priorities
+        # Update PER priorities with TD-errors
         if USE_PER
-            td_errors = compute_td_errors(network, batch_data)
+            td_errors = compute_td_errors(network, batch_data_per)
             per_update_priorities!(replay_buffer, batch_buf_indices, td_errors)
         end
     end
@@ -793,11 +809,27 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         @info "loss/avg" value=avg_loss log_step_increment=0
         @info "loss/contact" value=contact_loss log_step_increment=0
         @info "loss/race" value=race_loss log_step_increment=0
+        # Per-component losses
+        if train_result.contact.num_batches > 0
+            @info "loss/contact_policy" value=train_result.contact.avg_Lp log_step_increment=0
+            @info "loss/contact_value" value=train_result.contact.avg_Lv log_step_increment=0
+            @info "loss/contact_invalid" value=train_result.contact.avg_Linv log_step_increment=0
+        end
+        if train_result.race.num_batches > 0
+            @info "loss/race_policy" value=train_result.race.avg_Lp log_step_increment=0
+            @info "loss/race_value" value=train_result.race.avg_Lv log_step_increment=0
+            @info "loss/race_invalid" value=train_result.race.avg_Linv log_step_increment=0
+        end
         @info "perf/train_s" value=t_train log_step_increment=0
         @info "perf/reanalyze_s" value=t_reanalyze log_step_increment=0
         @info "perf/iter_time" value=iter_time log_step_increment=0
         @info "buffer/size" value=buf_length(replay_buffer) log_step_increment=0
         @info "buffer/total_samples" value=server_state.total_samples[] log_step_increment=0
+        @info "buffer/contact_samples" value=length(parts.contact) log_step_increment=0
+        @info "buffer/race_samples" value=length(parts.race) log_step_increment=0
+        if USE_PER
+            @info "per/beta" value=replay_buffer.beta log_step_increment=0
+        end
 
         # Cluster performance
         @info "cluster/total_games_per_sec" value=cluster_stats.total_games_per_sec log_step_increment=0

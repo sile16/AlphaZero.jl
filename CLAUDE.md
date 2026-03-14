@@ -51,17 +51,30 @@ julia --threads 30 --project scripts/selfplay_client.jl --server http://jarvis:9
 
 ## Evaluation
 
-```bash
-# GnuBG evaluation (RECOMMENDED — use 8 workers for ~12 min runtime)
-julia --threads 16 --project scripts/eval_vs_gnubg.jl <checkpoint> [obs_type] [num_games] [width] [blocks] [num_workers] [mcts_iters]
-# Example:
-julia --threads 16 --project scripts/eval_vs_gnubg.jl /homeshare/projects/AlphaZero.jl/sessions/distributed_20260206_204548/checkpoints/latest.data minimal 500 128 3 8 100
+### Standard: Race Eval (effective 2026-03-14)
 
-# Quick eval vs random
-julia --project scripts/quick_eval.jl
+**Race models MUST be evaluated from race starting positions**, not opening positions. The race model is untrained on contact positions and will play terribly from the opening.
+
+```bash
+# Race eval: 2000 fixed positions, both sides, 600 MCTS iters, wildbg large nets
+julia --threads 28 --project scripts/eval_race.jl <checkpoint> \
+    --width=128 --blocks=3 --num-workers=24 --mcts-iters=600 --num-games=0 \
+    --wildbg-lib=/Users/sile/github/wildbg/target/release/libwildbg.dylib
 ```
 
-**Always evaluate against GnuBG**, not just random. Random baseline is misleading -- models that dominate random may not generalize.
+- `--num-games=0` means all 2000 positions (each played from both sides = 4000 games)
+- `--mcts-iters=600` is the standard MCTS budget
+- Uses wildbg large nets (not small/main branch)
+- Fixed positions: `/homeshare/projects/AlphaZero.jl/eval_data/race_eval_2000.jls`
+
+### Full-Game Eval (contact models)
+
+```bash
+# Wildbg evaluation (primary for contact models)
+julia --threads 28 --project scripts/eval_vs_wildbg.jl <checkpoint> --width=256 --blocks=5 --num-workers=24 --mcts-iters=600
+```
+
+**Always evaluate against wildbg**, not random. Random baseline is misleading.
 
 ## Performance Baselines
 
@@ -112,22 +125,23 @@ Full results (28 checkpoints): `/homeshare/projects/AlphaZero.jl/sessions/wildbg
 - `src/params.jl` - MctsParams, LearningParams
 
 ### Distributed Training
-- `scripts/training_server.jl` - **Training server** (Jarvis, port 9090)
-- `scripts/selfplay_client.jl` - **Self-play client** (Neo)
+- `scripts/training_server.jl` - **Training server** (Jarvis, port 9090) — training loop, PER sampling, loss, checkpoints
+- `scripts/selfplay_client.jl` - **Self-play client** (Neo) — MCTS self-play, sample upload, weight sync
 - `src/distributed/server.jl` - HTTP server + routes + client tracking
 - `src/distributed/client.jl` - HTTP client for self-play workers
-- `src/distributed/buffer.jl` - Thread-safe PER buffer
+- `src/distributed/buffer.jl` - Thread-safe PER buffer with `per_sample_partition()` for dual-model
 - `src/distributed/protocol.jl` - Wire format (MsgPack + JSON)
-- `src/distributed/training.jl` - GPU training engine
 
-### Evaluation Scripts
-- `scripts/eval_vs_wildbg.jl` - Wildbg evaluation (primary)
-- `scripts/eval_vs_gnubg.jl` - GnuBG evaluation (parallel, multi-process)
-- `scripts/eval_race.jl` - Race model evaluation on fixed 2000 positions
+### Evaluation & Utility Scripts
+- `scripts/eval_vs_wildbg.jl` - Full-game wildbg evaluation (contact models)
+- `scripts/eval_race.jl` - Race model evaluation on 2000 fixed positions (standard: 600 MCTS, wildbg large)
 - `scripts/diagnose_loss.jl` - Per-component loss analysis across checkpoints
+- `scripts/generate_race_positions.jl` - Generate fixed race eval positions
 
 ### PER + Reanalyze + Bear-off
-- PER: proportional priority sampling with IS weights (α=0.6, β=0.4→1.0)
+- PER: per-model partition sampling with IS weight correction (α=0.6, β=0.4→1.0, ε=0.01)
+  - `per_sample_partition()` samples from contact/race subsets independently — avoids cross-model priority scale mismatch
+  - IS weights passed to `losses()` via batch `W` field
 - Reanalyze: buffer reanalysis with EMA value blending (25% per iter)
 - Bear-off: exact k=6 table values for race/bearoff positions
 
@@ -135,10 +149,17 @@ Full results (28 checkpoints): `/homeshare/projects/AlphaZero.jl/sessions/wildbg
 - `/homeshare/projects/AlphaZero.jl/eval_data/race_starts_tuples.jls` — 98,516 beginning-of-race positions
 - `/homeshare/projects/AlphaZero.jl/eval_data/race_eval_2000.jls` — 2000 fixed eval positions
 
-### Archived
-- `scripts/archive/` - Old single-machine training scripts (train_distributed.jl, train_race.jl, etc.)
+### Archived (2026-03-14 cleanup)
+- `scripts/archive/` - Old single-machine training scripts, completed benchmarks, quick_eval
 - `src/archive/distributed/` - Old ZMQ-based distributed module (unused)
+- `src/archive/cluster_v0/` - Old thread-based cluster module (replaced by HTTP distributed)
 - `/homeshare/projects/AlphaZero.jl/sessions/archive/` - Pre-v0.3.2 and experimental sessions
+
+### Legacy modules (still compiled by AlphaZero.jl, not used by active training/eval)
+- `src/async_mcts.jl` - Async MCTS (unused, kept for module compilation)
+- `src/gumbel_mcts.jl` - Gumbel MCTS (unused, kept for module compilation)
+- `src/eval_mcts.jl` - EvalMCTS (3 critical bugs, unused)
+- `src/batchifier.jl`, `src/async_batchifier.jl`, `src/pingpong_batchifier.jl` - Old batchifiers (used by simulations.jl)
 
 ## Testing
 
@@ -160,14 +181,32 @@ Sessions saved to `/homeshare/projects/AlphaZero.jl/sessions/distributed_YYYYMMD
 
 **TensorBoard**: `tensorboard --logdir /homeshare/projects/AlphaZero.jl/sessions`
 
-### Active Sessions (corrected equity vs GnuBG 0-ply)
+### Active Sessions
 All under `/homeshare/projects/AlphaZero.jl/sessions/`:
+
+**Full-game (contact) models** (corrected equity vs GnuBG 0-ply):
 - `distributed_20260213_031243_per_reanalyze` - **Best overall** (256w×5b, 200 iter PER+Reanalyze, -1.361 equity, 9.6% wins)
 - `distributed_20260209_215824_per` - Best 128w (200 iter PER, -1.558 equity, 7.8% wins)
 - `distributed_20260213_010615_per_reanalyze` - 256w×5b 50-iter (-1.573 equity, 7.0% wins)
 - `distributed_20260206_223524` - 200 iter baseline (-1.746 equity, 4.6% wins)
 - `distributed_20260207_030412_per` - PER 50-iter (-1.759 equity, 4.8% wins)
 - `distributed_20260206_204548` - Original 50-iter baseline (-1.841 equity, 3.5% wins)
+
+**Race-only models** (distributed training, 2026-03-14):
+- `distributed_race_20260314` - Race 128w×3b, 50 iter, bootstrap-seeded, Reanalyze (NOTE: PER was broken — uniform sampling)
+  - Standard eval (2000 pos × 2 sides = 4000 games, 600 MCTS iters, wildbg large):
+
+  | Iter | Equity | Win% | As White | As Black | Value MSE | Value Corr |
+  |------|--------|------|----------|----------|-----------|------------|
+  | 5 | -0.128 | 46.0% | -0.120 | -0.135 | 0.595 | 0.959 |
+  | 10 | -0.090 | 46.5% | -0.074 | -0.105 | 0.801 | 0.811 |
+  | 20 | -0.065 | 47.4% | -0.054 | -0.075 | 0.796 | 0.824 |
+  | 30 | **-0.051** | **47.8%** | -0.044 | -0.059 | 0.801 | 0.825 |
+  | 40 | -0.053 | 47.7% | -0.045 | -0.061 | 0.821 | 0.808 |
+  | 50 | -0.056 | 47.5% | -0.053 | -0.059 | 0.805 | 0.822 |
+
+  - Peak at iter 30 (-0.051 equity). Plateaus after. AZ slightly weaker as black.
+  - PER fix + more iterations should improve next run.
 
 ## Key Lessons
 
@@ -186,22 +225,23 @@ All under `/homeshare/projects/AlphaZero.jl/sessions/`:
 7. **256w×5b >> 128w×3b** -- larger model at 200 iter beats best 128w by +0.197 equity
 8. **All models are genuinely weak** -- best gets 4.4% wins vs wildbg (small nets), 9.6% vs GnuBG 0-ply. Need training efficiency improvements before scaling.
 9. **Bear-off table has signal mismatch** -- table values are pre-dice, game states are post-dice. See `notes/bearoff_chance_node_issue.md`. Previous "bearoff hurt" finding needs retesting post-board-fix.
-10. **Dual-model architecture** (2026-03-10) -- contact (256w×10b) + race (128w×3b) implemented in train_distributed.jl. Testing in progress.
+10. **Dual-model architecture** (2026-03-10) -- contact (256w×10b) + race (128w×3b) implemented in training_server.jl. Race-only training tested (50 iter).
+11. **PER was broken in distributed training** (fixed 2026-03-14) -- training_server.jl used uniform sampling instead of `per_sample()`. IS weights were not passed to the loss function. Fixed: per-model partition PER sampling with IS weight correction via `per_sample_partition()`. Per-component loss (policy/value/invalid) now logged to TensorBoard.
 
 ### Evaluation
-11. **Random baseline is misleading** -- always evaluate vs wildbg or GnuBG
-12. **Wildbg is harder than GnuBG 0-ply** -- roughly halves win rates, but rankings are consistent across both opponents
-13. **MINIMAL features generalize best** -- simpler obs beats larger feature sets (relative ranking valid post-fix)
-14. **1000+ eval games** for reliable comparisons (500 per side). Eval script: `scripts/eval_vs_wildbg.jl`
-15. **Wildbg eval used small nets on main branch** (2026-03-10) -- not large/custom wildbg nets. Results may change with stronger wildbg build.
+12. **Random baseline is misleading** -- always evaluate vs wildbg or GnuBG
+13. **Wildbg is harder than GnuBG 0-ply** -- roughly halves win rates, but rankings are consistent across both opponents
+14. **MINIMAL features generalize best** -- simpler obs beats larger feature sets (relative ranking valid post-fix)
+15. **Race eval standard (2026-03-14)** -- 2000 fixed race positions, both sides (4000 games), 600 MCTS iters, wildbg large nets. Script: `scripts/eval_race.jl`
+16. **Full-game eval**: 1000+ games for reliable comparisons. Script: `scripts/eval_vs_wildbg.jl`
 
 ### MCTS & Eval (2026-03-11)
-16. **Passthrough chance sampling is best for eval** -- Benchmarked all 5 mcts.jl chance modes (passthrough, sampling, stratified, progressive, full) at 1600 iters. Passthrough wins: -1.050 equity, 16% wins vs wildbg. Best alternative (sampling v=1.0) was -1.180. At 1600 iters, alternatives waste iterations on chance coverage instead of decision-tree depth. With a weak network, depth > width.
-17. **1600 MCTS iters >> 100 iters for eval** -- dual-model at 1600 iters: -1.277 equity, 9.7% wins vs wildbg small. At 100 iters: -1.828, 1.6% wins vs wildbg large. More MCTS budget at eval time dramatically improves play quality.
-18. **EvalMCTS module (`src/eval_mcts.jl`) has 3 critical bugs** -- terminal_value always 0.0 (no game outcome signal), player_switch always false at chance nodes, no virtual loss in batched traversal. These explain why EvalMCTS full expansion scored -2.304 equity (0% wins) vs passthrough -1.266 (10.8%). Fix bugs before retesting full expansion.
-19. **Re-test progressive widening when model is stronger** -- As NN values become more accurate, proper chance averaging should help. The crossover point is likely when model can consistently beat wildbg/GnuBG 0-ply. Progressive widening is the best candidate (probability-ordered expansion).
-20. **GPU inference on M3 Max (Metal.jl)** -- 4.12x raw speedup at batch=500, but 12ms kernel launch overhead means crossover at batch≈20-30. Best end-to-end: GPU-Lock with 6 workers = 2.36x (30 games/min). Metal is NOT thread-safe. Adding CPU workers alongside GPU HURTS. Speculative prefetch failed (0.09x). GPU is useful only when batch sizes are guaranteed large.
-21. **Value error vs wildbg not yet measured** -- Need to track NN value prediction accuracy against wildbg equity to understand when chance expansion will start helping. TODO: build eval script with per-position value comparison.
+17. **Passthrough chance sampling is best for eval** -- Benchmarked all 5 mcts.jl chance modes (passthrough, sampling, stratified, progressive, full) at 1600 iters. Passthrough wins: -1.050 equity, 16% wins vs wildbg. Best alternative (sampling v=1.0) was -1.180. At 1600 iters, alternatives waste iterations on chance coverage instead of decision-tree depth. With a weak network, depth > width.
+18. **1600 MCTS iters >> 100 iters for eval** -- dual-model at 1600 iters: -1.277 equity, 9.7% wins vs wildbg small. At 100 iters: -1.828, 1.6% wins vs wildbg large. More MCTS budget at eval time dramatically improves play quality.
+19. **EvalMCTS module (`src/eval_mcts.jl`) has 3 critical bugs** -- terminal_value always 0.0 (no game outcome signal), player_switch always false at chance nodes, no virtual loss in batched traversal. These explain why EvalMCTS full expansion scored -2.304 equity (0% wins) vs passthrough -1.266 (10.8%). Fix bugs before retesting full expansion.
+20. **Re-test progressive widening when model is stronger** -- As NN values become more accurate, proper chance averaging should help. The crossover point is likely when model can consistently beat wildbg/GnuBG 0-ply. Progressive widening is the best candidate (probability-ordered expansion).
+21. **GPU inference on M3 Max (Metal.jl)** -- 4.12x raw speedup at batch=500, but 12ms kernel launch overhead means crossover at batch≈20-30. Best end-to-end: GPU-Lock with 6 workers = 2.36x (30 games/min). Metal is NOT thread-safe. Adding CPU workers alongside GPU HURTS. Speculative prefetch failed (0.09x). GPU is useful only when batch sizes are guaranteed large.
+22. **Value error vs wildbg not yet measured** -- Need to track NN value prediction accuracy against wildbg equity to understand when chance expansion will start helping. TODO: build eval script with per-position value comparison.
 
 ## Next Steps
 

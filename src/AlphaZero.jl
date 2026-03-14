@@ -212,11 +212,6 @@ module AlphaZero
   include("scripts/scripts.jl")
   export Scripts
 
-  # Cluster training module (thread-based, with PER + reanalyze)
-  include("cluster/Cluster.jl")
-  using .Cluster
-  export Cluster
-
   function __init__()
     # OpenSpiel.jl Wrapper
     @require OpenSpiel="ceb70bd2-fe3f-44f0-b81f-41608acaf2f2" begin
