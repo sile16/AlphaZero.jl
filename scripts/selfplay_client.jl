@@ -246,72 +246,41 @@ end
 const BEAROFF_EVALUATOR = make_bearoff_evaluator(BEAROFF_TABLE)
 
 #####
-##### Race starting positions (for race-only training mode)
+##### Custom starting positions (loaded from NFS file if configured)
 #####
 
+using Serialization
+using StaticArrays
+
 const TRAINING_MODE = get(config, "training_mode", "dual")
+const START_POSITIONS_FILE = get(config, "start_positions_file", "")
 
-"""Generate race starting positions by playing random games and collecting first race state."""
-function generate_race_positions(n::Int; rng=Random.default_rng())
-    positions = BackgammonNet.BackgammonGame[]
-    attempts = 0
-    max_attempts = n * 20  # most games reach race eventually
-
-    while length(positions) < n && attempts < max_attempts
-        attempts += 1
-        game = BackgammonNet.initial_state(;
-            short_game=SHORT_GAME, doubles_only=false, obs_type=OBSERVATION_TYPE)
-
-        # Play random moves until we reach a race position or game ends
-        move_count = 0
-        max_moves = 300
-
-        while !BackgammonNet.game_terminated(game) && move_count < max_moves
-            if BackgammonNet.is_chance_node(game)
-                BackgammonNet.sample_chance!(game, rng)
-            else
-                actions = BackgammonNet.legal_actions(game)
-                if isempty(actions)
-                    break
-                end
-                BackgammonNet.apply_action!(game, actions[rand(rng, 1:length(actions))])
-            end
-            move_count += 1
-
-            # Check for race position at chance nodes (post-move, pre-dice)
-            if BackgammonNet.is_chance_node(game) && BackgammonNet.is_race_position(game)
-                push!(positions, BackgammonNet.clone(game))
-                break
-            end
-        end
+const START_POSITIONS = if !isempty(START_POSITIONS_FILE)
+    if !isfile(START_POSITIONS_FILE)
+        error("Start positions file not found: $START_POSITIONS_FILE")
     end
-
-    println("Generated $(length(positions)) race starting positions from $attempts random games")
-    return positions
-end
-
-const RACE_POSITIONS = if TRAINING_MODE == "race"
-    println("\nGenerating race starting positions...")
+    tuples = Serialization.deserialize(START_POSITIONS_FILE)
+    println("Loaded $(length(tuples)) starting positions from $START_POSITIONS_FILE")
     flush(stdout)
-    t0 = time()
-    positions = generate_race_positions(10000; rng=MersenneTwister(MAIN_SEED === nothing ? 12345 : MAIN_SEED))
-    println("  $(length(positions)) positions in $(round(time() - t0, digits=1))s")
-    flush(stdout)
-    positions
+    tuples  # Vector{Tuple{UInt128, UInt128, Int8}}
 else
-    BackgammonNet.BackgammonGame[]
+    nothing
 end
 
-"""Initialize a game environment, starting from race position if in race training mode."""
+"""Initialize a game environment from configured starting positions or default opening."""
 function init_game(rng::AbstractRNG)
     env = GI.init(gspec)
     if hasproperty(env, :rng)
         env.rng = rng
     end
-    if TRAINING_MODE == "race" && !isempty(RACE_POSITIONS)
-        pos = RACE_POSITIONS[rand(rng, 1:length(RACE_POSITIONS))]
-        GI.set_state!(env, pos)
-        # Roll initial dice for the race position
+    if START_POSITIONS !== nothing
+        # Pick a random starting position, create a BackgammonGame at chance node (pre-dice)
+        p0, p1, cp = START_POSITIONS[rand(rng, 1:length(START_POSITIONS))]
+        game = BackgammonNet.BackgammonGame(
+            p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
+            obs_type=:minimal_flat)
+        GI.set_state!(env, game)
+        # Roll initial dice
         BackgammonNet.sample_chance!(env.game, rng)
     end
     return env
@@ -837,6 +806,7 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
             has_equity=has_eq,
             is_chance=is_ch,
             is_contact=is_contact,
+            is_bearoff=is_bearoff_pos,
         ))
     end
 

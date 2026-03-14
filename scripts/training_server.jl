@@ -145,6 +145,16 @@ function parse_args()
         "--bearoff-truncation"
             action = :store_true
 
+        # Starting positions (for race-only or custom start mode)
+        "--start-positions-file"
+            help = "File with starting positions (portable tuples on NFS). Empty = use default opening."
+            arg_type = String
+            default = ""
+        "--eval-positions-file"
+            help = "File with fixed eval positions (portable tuples on NFS). Empty = no position-based eval."
+            arg_type = String
+            default = ""
+
         # Eval
         "--eval-interval"
             help = "Run eval every N iterations (0 = disabled)"
@@ -189,6 +199,12 @@ println("Contact model: $(ARGS["contact_width"])w×$(ARGS["contact_blocks"])b")
 println("Race model: $(ARGS["race_width"])w×$(ARGS["race_blocks"])b")
 println("Buffer capacity: $(ARGS["buffer_capacity"])")
 println("Training mode: $(ARGS["training_mode"])")
+if !isempty(ARGS["start_positions_file"])
+    println("Start positions: $(ARGS["start_positions_file"])")
+end
+if !isempty(ARGS["eval_positions_file"])
+    println("Eval positions: $(ARGS["eval_positions_file"])")
+end
 println("PER: $(ARGS["use_per"])")
 println("Reanalyze: $(ARGS["use_reanalyze"])")
 println("=" ^ 60)
@@ -485,7 +501,9 @@ function reanalyze_buffer!()
         end
 
         for (is_contact_flag, net) in [(true, contact_network), (false, race_network)]
-            sub_batch_map = [(j, bi) for (j, (bi, s)) in enumerate(zip(batch_indices, batch)) if s.is_contact == is_contact_flag]
+            # Skip bearoff samples — they already have exact table values, NN blending would degrade them
+            sub_batch_map = [(j, bi) for (j, (bi, s)) in enumerate(zip(batch_indices, batch))
+                             if s.is_contact == is_contact_flag && !s.is_bearoff]
             isempty(sub_batch_map) && continue
 
             sub_batch = [batch[j] for (j, _) in sub_batch_map]
@@ -582,6 +600,8 @@ const SERVER_CONFIG = Dict{String, Any}(
     "bearoff_hard_targets" => ARGS["bearoff_hard_targets"],
     "bearoff_truncation" => ARGS["bearoff_truncation"],
     "training_mode" => ARGS["training_mode"],
+    "start_positions_file" => ARGS["start_positions_file"],
+    "eval_positions_file" => ARGS["eval_positions_file"],
 )
 
 # Initialize server state

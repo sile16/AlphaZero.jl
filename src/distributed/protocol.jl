@@ -19,6 +19,7 @@ struct SampleBatch
     equities::Matrix{Float32}          # (5, n)
     has_equity::Vector{Bool}           # (n,)
     is_contact::Vector{Bool}           # (n,)
+    is_bearoff::Vector{Bool}           # (n,) — exact table value, skip reanalyze
 end
 
 """Convert a vector of NamedTuple samples to a SampleBatch."""
@@ -35,6 +36,7 @@ function samples_to_batch(samples::Vector)::SampleBatch
     equities = zeros(Float32, 5, n)
     has_equity = Vector{Bool}(undef, n)
     is_contact = Vector{Bool}(undef, n)
+    is_bearoff = Vector{Bool}(undef, n)
 
     for i in 1:n
         s = samples[i]
@@ -43,6 +45,7 @@ function samples_to_batch(samples::Vector)::SampleBatch
         values[i] = s.value
         has_equity[i] = s.has_equity
         is_contact[i] = s.is_contact
+        is_bearoff[i] = hasproperty(s, :is_bearoff) ? s.is_bearoff : false
         if s.has_equity
             eq = s.equity
             for j in 1:5
@@ -51,7 +54,7 @@ function samples_to_batch(samples::Vector)::SampleBatch
         end
     end
 
-    SampleBatch(Int32(n), states, policies, values, equities, has_equity, is_contact)
+    SampleBatch(Int32(n), states, policies, values, equities, has_equity, is_contact, is_bearoff)
 end
 
 """Convert a SampleBatch back to a vector of NamedTuples."""
@@ -65,10 +68,9 @@ function batch_to_samples(batch::SampleBatch)::Vector
             value = batch.values[i],
             equity = eq,
             has_equity = batch.has_equity[i],
-            is_chance = false,  # Chance nodes not traced in self-play
-            bearoff_probs = nothing,
-            wp = true,  # White perspective (already flipped during self-play)
+            is_chance = false,
             is_contact = batch.is_contact[i],
+            is_bearoff = batch.is_bearoff[i],
         )
     end
     samples
@@ -86,6 +88,7 @@ function pack_samples(batch::SampleBatch)::Vector{UInt8}
         "equities" => vec(batch.equities),      # Column-major flat
         "has_equity" => batch.has_equity,
         "is_contact" => batch.is_contact,
+        "is_bearoff" => batch.is_bearoff,
     )
     MsgPack.pack(d)
 end
@@ -103,8 +106,9 @@ function unpack_samples(bytes::Vector{UInt8})::SampleBatch
     equities = reshape(Float32.(d["equities"]), 5, Int(n))
     has_equity = Bool.(d["has_equity"])
     is_contact = Bool.(d["is_contact"])
+    is_bearoff = haskey(d, "is_bearoff") ? Bool.(d["is_bearoff"]) : fill(false, Int(n))
 
-    SampleBatch(n, states, policies, values, equities, has_equity, is_contact)
+    SampleBatch(n, states, policies, values, equities, has_equity, is_contact, is_bearoff)
 end
 
 """Serialize a SampleBatch to JSON string (for web clients)."""
@@ -119,6 +123,7 @@ function pack_samples_json(batch::SampleBatch)::String
         "equities" => vec(batch.equities),
         "has_equity" => batch.has_equity,
         "is_contact" => batch.is_contact,
+        "is_bearoff" => batch.is_bearoff,
     )
     JSON.json(d)
 end
@@ -136,8 +141,9 @@ function unpack_samples_json(json_str::String)::SampleBatch
     equities = reshape(Float32.(d["equities"]), 5, Int(n))
     has_equity = Bool.(d["has_equity"])
     is_contact = Bool.(d["is_contact"])
+    is_bearoff = haskey(d, "is_bearoff") ? Bool.(d["is_bearoff"]) : fill(false, Int(n))
 
-    SampleBatch(n, states, policies, values, equities, has_equity, is_contact)
+    SampleBatch(n, states, policies, values, equities, has_equity, is_contact, is_bearoff)
 end
 
 # Weight serialization with metadata header

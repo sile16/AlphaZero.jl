@@ -7,9 +7,9 @@
 ## Project Overview
 
 Julia implementation of AlphaZero for backgammon with:
+- **Distributed training**: Jarvis (GPU training server) + Neo (self-play client) via HTTP API
 - Multi-head equity network (5 value heads: P(win), P(gammon|win), P(bg|win), P(gammon|loss), P(bg|loss))
-- Threaded training with CPU inference (14 workers on i7-10700K)
-- GnuBG evaluation for meaningful benchmarks
+- GnuBG/Wildbg evaluation for meaningful benchmarks
 - Exact k=6 bear-off table (c14: 3.0GB + c15: 5.8GB from BackgammonNet.jl) for training targets, with gammon conditionals for c15 positions
 
 ## Best Practices
@@ -20,27 +20,26 @@ Julia implementation of AlphaZero for backgammon with:
 - **One change at a time** for experiments — isolate variables to know what works
 - **2000+ GnuBG eval games** (500 per matchup × 4) for reliable comparisons
 
-## Training
+## Training (Distributed Only)
 
+**Distributed is the ONLY training path.** No single-machine training scripts. To run on one machine, spin up both server and client locally.
+
+### Training Server (Jarvis)
 ```bash
-julia --threads 16 --project scripts/train_distributed.jl \
-    --num-workers=14 \
-    --total-iterations=50 \
-    --games-per-iteration=500 \
-    --mcts-iters=400 \
-    --inference-batch-size=50 \
-    --buffer-capacity=600000 \
-    --learning-rate=0.001 \
-    --eval-interval=5 --eval-games=100 \
-    --final-eval-games=200 \
-    --seed=42
+julia --threads 16 --project scripts/training_server.jl --port 9090 --data-dir /home/sile/alphazero-server
 ```
 
-**Note**: Use `--threads 16` (with space) before `--project`. The `--threads=16` form after `--project` leaks into ARGS.
+### Self-Play Client (Neo)
+```bash
+julia --threads 30 --project scripts/selfplay_client.jl --server http://jarvis:9090 --api-key <key> --num-workers 22
+```
+
+**Note**: Use `--threads N` (with space) before `--project`. The `--threads=N` form after `--project` leaks into ARGS.
 
 ### Architecture
-- Main thread: training loop, replay buffer, weight updates (AdamW optimizer)
-- Worker threads (14): self-play with batched MCTS, CPU BLAS inference
+- **Server** (Jarvis): HTTP API, PER buffer, GPU training (RTX 4090), weight serving, eval, TensorBoard
+- **Client** (Neo): self-play with batched MCTS, CPU inference (22 workers), sample upload, weight sync
+- Same HTTP API for Julia clients and future web clients (tavlatalk)
 - Per-component loss logging to TensorBoard (policy, value, invalid)
 - Training uses `AlphaZero.losses()` from `src/learning.jl` (multi-head equity BCE + policy KL)
 
@@ -112,20 +111,32 @@ Full results (28 checkpoints): `/homeshare/projects/AlphaZero.jl/sessions/wildbg
 - `src/game.jl` - Game interface (`game_outcome()` for win types)
 - `src/params.jl` - MctsParams, LearningParams
 
-### Training & Evaluation Scripts
-- `scripts/train_distributed.jl` - **Primary training script** (threaded, CPU inference)
+### Distributed Training
+- `scripts/training_server.jl` - **Training server** (Jarvis, port 9090)
+- `scripts/selfplay_client.jl` - **Self-play client** (Neo)
+- `src/distributed/server.jl` - HTTP server + routes + client tracking
+- `src/distributed/client.jl` - HTTP client for self-play workers
+- `src/distributed/buffer.jl` - Thread-safe PER buffer
+- `src/distributed/protocol.jl` - Wire format (MsgPack + JSON)
+- `src/distributed/training.jl` - GPU training engine
+
+### Evaluation Scripts
+- `scripts/eval_vs_wildbg.jl` - Wildbg evaluation (primary)
 - `scripts/eval_vs_gnubg.jl` - GnuBG evaluation (parallel, multi-process)
-- `scripts/GnubgPlayer.jl` - GnuBG integration (uses BackgammonNet's GnubgInterface)
+- `scripts/eval_race.jl` - Race model evaluation on fixed 2000 positions
 - `scripts/diagnose_loss.jl` - Per-component loss analysis across checkpoints
 
-### PER + Reanalyze + Bear-off (implemented in train_distributed.jl)
-- PER: `--use-per` — proportional priority sampling with IS weights (α=0.6, β=0.4→1.0)
-- Reanalyze: `--use-reanalyze` — buffer reanalysis with EMA value blending (25% per iter)
-- Bear-off: `--use-bearoff` — rollout equity for no-contact race positions (50 rollouts)
-- Resume: `--resume <session_dir>` — load weights from checkpoint, continue iteration count
+### PER + Reanalyze + Bear-off
+- PER: proportional priority sampling with IS weights (α=0.6, β=0.4→1.0)
+- Reanalyze: buffer reanalysis with EMA value blending (25% per iter)
+- Bear-off: exact k=6 table values for race/bearoff positions
+
+### Shared Data (NFS)
+- `/homeshare/projects/AlphaZero.jl/eval_data/race_starts_tuples.jls` — 98,516 beginning-of-race positions
+- `/homeshare/projects/AlphaZero.jl/eval_data/race_eval_2000.jls` — 2000 fixed eval positions
 
 ### Archived
-- `scripts/archive/` - Archived scripts including train_cluster.jl
+- `scripts/archive/` - Old single-machine training scripts (train_distributed.jl, train_race.jl, etc.)
 - `src/archive/distributed/` - Old ZMQ-based distributed module (unused)
 - `/homeshare/projects/AlphaZero.jl/sessions/archive/` - Pre-v0.3.2 and experimental sessions
 
