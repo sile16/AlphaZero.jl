@@ -187,6 +187,11 @@ function traverse_to_leaf(env::EvalEnv, game; η=nothing, noise_ϵ=0.0)
                 end
             end
 
+            # Apply virtual loss to selected chance outcome
+            # (Prevents all sims in a batch from taking the same path)
+            cnode.W[best_idx] -= VIRTUAL_LOSS
+            cnode.N[best_idx] += 1
+
             wp = GI.white_playing(game)
             GI.apply_chance!(game, cnode.outcomes[best_idx])
             pswitch = wp != GI.white_playing(game)
@@ -254,11 +259,11 @@ function backpropagate!(env::EvalEnv, path, leaf_value)
         end
 
         if entry.is_chance
-            # Update chance node statistics
+            # Remove virtual loss + update: W += VL + v, N unchanged
             cnode = env.chance_tree[entry.state]
             oidx = entry.chance_outcome_idx
-            cnode.W[oidx] += v
-            cnode.N[oidx] += 1
+            cnode.W[oidx] += VIRTUAL_LOSS + v
+            # N already incremented by virtual loss apply, don't increment again
         else
             # Remove virtual loss + update: W += VL + v, N unchanged (VL added 1, we don't add again)
             dnode = env.decision_tree[entry.state]
@@ -409,13 +414,15 @@ function chance_value(env::EvalEnv, game)
     cnode = get(env.chance_tree, state, nothing)
     cnode === nothing && return 0.0
 
-    total = 0.0
+    total_val = 0.0
+    total_prob = 0.0
     for i in eachindex(cnode.probs)
         if cnode.N[i] > 0
-            total += cnode.probs[i] * (cnode.W[i] / cnode.N[i])
+            total_val += cnode.probs[i] * (cnode.W[i] / cnode.N[i])
+            total_prob += cnode.probs[i]
         end
     end
-    return total
+    return total_prob > 0 ? total_val / total_prob : 0.0
 end
 
 # ============================================================================

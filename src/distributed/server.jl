@@ -130,6 +130,7 @@ function handle_samples(req::HTTP.Request, state::ServerState, buffer::PERBuffer
         content_type = HTTP.header(req, "Content-Type", "application/msgpack")
         client_id = HTTP.header(req, "X-Client-Id", "unknown")
 
+        # Deserialize OUTSIDE the buffer lock (reduces lock contention)
         local batch::SampleBatch
         if occursin("json", content_type)
             batch = unpack_samples_json(String(req.body))
@@ -137,9 +138,10 @@ function handle_samples(req::HTTP.Request, state::ServerState, buffer::PERBuffer
             batch = unpack_samples(req.body)
         end
 
-        # Convert to NamedTuples and add to buffer
-        samples = batch_to_samples(batch)
-        per_add!(buffer, samples)
+        # Add columnar data directly to buffer (no NamedTuple allocation)
+        per_add_batch!(buffer,
+            batch.states, batch.policies, batch.values,
+            batch.equities, batch.has_equity, batch.is_contact, batch.is_bearoff)
 
         # Update stats
         Threads.atomic_add!(state.total_samples, Int(batch.n))

@@ -151,7 +151,7 @@ function losses(nn, params, Wmean, Hp, batch)
       # Fallback: use standard value loss if no equity targets
       V_normalized = V ./ params.rewards_renormalization
       equity = FluxLib.compute_equity(V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl)
-      V̂_combined = equity ./ 3f0  # Scale to [-1, 1]
+      V̂_combined = equity ./ params.rewards_renormalization
       Lv = mse_wmean(V̂_combined, V_normalized, W)
     end
   else

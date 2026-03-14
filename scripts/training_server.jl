@@ -22,6 +22,7 @@ Usage:
 using ArgParse
 using Dates
 using Random
+using Serialization
 using Statistics
 using TensorBoardLogger
 using Logging: with_logger
@@ -155,6 +156,16 @@ function parse_args()
             arg_type = String
             default = ""
 
+        # Bootstrap (pre-fill buffer with expert games before self-play)
+        "--bootstrap-file"
+            help = "File with pre-converted training samples (NamedTuples on NFS). Loaded into buffer at startup."
+            arg_type = String
+            default = ""
+        "--bootstrap-max-samples"
+            help = "Max samples to load from bootstrap file (0 = all, capped at buffer capacity)"
+            arg_type = Int
+            default = 0
+
         # Eval
         "--eval-interval"
             help = "Run eval every N iterations (0 = disabled)"
@@ -204,6 +215,12 @@ if !isempty(ARGS["start_positions_file"])
 end
 if !isempty(ARGS["eval_positions_file"])
     println("Eval positions: $(ARGS["eval_positions_file"])")
+end
+if !isempty(ARGS["bootstrap_file"])
+    println("Bootstrap: $(ARGS["bootstrap_file"])")
+    if ARGS["bootstrap_max_samples"] > 0
+        println("Bootstrap max: $(ARGS["bootstrap_max_samples"])")
+    end
 end
 println("PER: $(ARGS["use_per"])")
 println("Reanalyze: $(ARGS["use_reanalyze"])")
@@ -332,28 +349,81 @@ const LEARNING_PARAMS = LearningParams(
     num_checkpoints=1
 )
 
-# PER buffer
-replay_buffer = USE_PER ?
-    PERBuffer(BUFFER_CAPACITY; beta_init=PER_BETA_INIT, annealing_iters=ARGS["total_iterations"]) :
-    PERBuffer(BUFFER_CAPACITY)  # Still use PERBuffer for thread safety
+# PER buffer (columnar, pre-allocated)
+replay_buffer = PERBuffer(BUFFER_CAPACITY, _state_dim, NUM_ACTIONS;
+                           beta_init=PER_BETA_INIT, annealing_iters=ARGS["total_iterations"])
+
+# Bootstrap: pre-fill buffer with expert games
+if !isempty(ARGS["bootstrap_file"])
+    bootstrap_path = ARGS["bootstrap_file"]
+    println("\nLoading bootstrap data from: $bootstrap_path")
+    flush(stdout)
+    t0 = time()
+    bootstrap_samples = Serialization.deserialize(bootstrap_path)
+    n_bootstrap = length(bootstrap_samples)
+    max_load = ARGS["bootstrap_max_samples"] > 0 ?
+        min(ARGS["bootstrap_max_samples"], BUFFER_CAPACITY) : min(n_bootstrap, BUFFER_CAPACITY)
+
+    # Load in chunks to avoid huge temporary matrices
+    chunk_size = 10000
+    loaded = 0
+    for start_idx in 1:chunk_size:max_load
+        end_idx = min(start_idx + chunk_size - 1, max_load)
+        chunk = bootstrap_samples[start_idx:end_idx]
+        n = length(chunk)
+
+        # Build columnar arrays from NamedTuple samples
+        states = hcat([s.state for s in chunk]...)
+        policies_raw = hcat([s.policy for s in chunk]...)
+        # Pad policy from 676 to NUM_ACTIONS if needed
+        if size(policies_raw, 1) < NUM_ACTIONS
+            policies = zeros(Float32, NUM_ACTIONS, n)
+            policies[1:size(policies_raw, 1), :] .= policies_raw
+        else
+            policies = policies_raw[1:NUM_ACTIONS, :]
+        end
+        values = Float32[s.value for s in chunk]
+        equities = hcat([s.equity for s in chunk]...)
+        has_equity = Bool[s.has_equity for s in chunk]
+        is_contact = Bool[s.is_contact for s in chunk]
+        is_bearoff = Bool[s.is_bearoff for s in chunk]
+
+        per_add_batch!(replay_buffer, states, policies, values,
+                       equities, has_equity, is_contact, is_bearoff)
+        loaded += n
+    end
+
+    bootstrap_samples = nothing  # Free memory
+    GC.gc()
+    t_load = time() - t0
+    println("  Loaded $loaded / $n_bootstrap bootstrap samples in $(round(t_load, digits=1))s")
+    println("  Buffer size: $(buf_length(replay_buffer))")
+    flush(stdout)
+end
 
 # Training functions (extracted from train_distributed.jl)
 
-function prepare_batch(batch, num_actions, use_gpu_flag, net)
-    n = length(batch)
+"""Prepare training batch from columnar buffer extract.
+
+Accepts the NamedTuple from extract_batch (columnar matrices) instead of
+a Vector of NamedTuples — avoids per-sample allocation entirely."""
+function prepare_batch_columnar(col_data, num_actions, use_gpu_flag, net)
+    n = size(col_data.states, 2)
     W = ones(Float32, 1, n)
-    X = hcat([s.state for s in batch]...)
-    P = hcat([s.policy for s in batch]...)
-    V = reshape(Float32[s.value for s in batch], 1, n)
+    X = col_data.states           # Already (state_dim, n)
+    P = col_data.policies         # Already (num_actions, n)
+    V = reshape(col_data.values, 1, n)
 
     A = zeros(Float32, num_actions, n)
     IsChance = zeros(Float32, 1, n)
-    for i in 1:n
-        if batch[i].is_chance
+    @inbounds for i in 1:n
+        if col_data.is_chance[i]
             A[:, i] .= 1.0f0
             IsChance[1, i] = 1.0f0
         else
-            A[:, i] .= Float32.(batch[i].policy .> 0)
+            for j in 1:num_actions
+                A[j, i] = col_data.policies[j, i] > 0 ? 1.0f0 : 0.0f0
+            end
         end
     end
 
@@ -363,14 +433,13 @@ function prepare_batch(batch, num_actions, use_gpu_flag, net)
     EqGL = zeros(Float32, 1, n)
     EqBGL = zeros(Float32, 1, n)
     HasEquity = zeros(Float32, 1, n)
-    for i in 1:n
-        if batch[i].has_equity
-            eq = batch[i].equity
-            EqWin[1, i] = eq[1]
-            EqGW[1, i] = eq[2]
-            EqBGW[1, i] = eq[3]
-            EqGL[1, i] = eq[4]
-            EqBGL[1, i] = eq[5]
+    @inbounds for i in 1:n
+        if col_data.has_equity[i]
+            EqWin[1, i] = col_data.equities[1, i]
+            EqGW[1, i] = col_data.equities[2, i]
+            EqBGW[1, i] = col_data.equities[3, i]
+            EqGL[1, i] = col_data.equities[4, i]
+            EqBGL[1, i] = col_data.equities[5, i]
             HasEquity[1, i] = 1.0f0
         end
     end
@@ -400,8 +469,8 @@ function compute_td_errors(nn, batch_data)
     return Float32.(vec(td))
 end
 
-function _train_model_on_samples!(samples_subset, indices_subset, network, opt_state)
-    n = length(samples_subset)
+function _train_model_on_samples!(buf_indices::Vector{Int}, network, opt_state)
+    n = length(buf_indices)
     n < BATCH_SIZE && return (avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0, num_batches=0)
 
     max_batches = max(1, ARGS["games_per_iteration"] * 200 ÷ BATCH_SIZE)
@@ -412,11 +481,13 @@ function _train_model_on_samples!(samples_subset, indices_subset, network, opt_s
     total_Linv = 0.0
 
     for _ in 1:num_batches
-        batch_idx = rand(1:n, BATCH_SIZE)
-        batch = [samples_subset[i] for i in batch_idx]
-        buf_indices = [indices_subset[i] for i in batch_idx]
+        # Sample random indices from the subset
+        sample_idx = rand(1:n, BATCH_SIZE)
+        batch_buf_indices = buf_indices[sample_idx]
 
-        batch_data = prepare_batch(batch, NUM_ACTIONS, USE_GPU, network)
+        # Extract columnar data from buffer (single lock acquisition)
+        col_data = extract_batch(replay_buffer, batch_buf_indices)
+        batch_data = prepare_batch_columnar(col_data, NUM_ACTIONS, USE_GPU, network)
         Wmean = mean(batch_data.W)
         Hp = 0.0f0
 
@@ -433,7 +504,7 @@ function _train_model_on_samples!(samples_subset, indices_subset, network, opt_s
         # Update PER priorities
         if USE_PER
             td_errors = compute_td_errors(network, batch_data)
-            per_update_priorities!(replay_buffer, buf_indices, td_errors)
+            per_update_priorities!(replay_buffer, batch_buf_indices, td_errors)
         end
     end
 
@@ -450,30 +521,16 @@ function train_on_buffer!()
         per_anneal_beta!(replay_buffer)
     end
 
-    # Get snapshot of samples (under lock)
-    all_samples, contact_samples, contact_indices, race_samples, race_indices = lock(replay_buffer.lock) do
-        all = replay_buffer.samples
-        cs, ci, rs, ri = [], Int[], [], Int[]
-        for i in 1:length(all)
-            s = all[i]
-            if s.is_contact
-                push!(cs, s); push!(ci, i)
-            else
-                push!(rs, s); push!(ri, i)
-            end
-        end
-        (all, cs, ci, rs, ri)
-    end
+    # Partition buffer indices by contact/race (single lock acquisition)
+    parts = partition_indices(replay_buffer)
 
     if ARGS["training_mode"] == "race"
-        # Race-only mode: skip contact training, train race on ALL samples
-        # (in race mode, all positions are race positions, but is_contact flag might still be set)
-        all_indices = collect(1:length(all_samples))
+        # Race-only mode: train race on ALL samples
         contact_result = (avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0, num_batches=0)
-        race_result = _train_model_on_samples!(collect(all_samples), all_indices, race_network, race_opt_state)
+        race_result = _train_model_on_samples!(parts.all, race_network, race_opt_state)
     else
-        contact_result = _train_model_on_samples!(contact_samples, contact_indices, contact_network, contact_opt_state)
-        race_result = _train_model_on_samples!(race_samples, race_indices, race_network, race_opt_state)
+        contact_result = _train_model_on_samples!(parts.contact, contact_network, contact_opt_state)
+        race_result = _train_model_on_samples!(parts.race, race_network, race_opt_state)
     end
 
     return (contact=contact_result, race=race_result)
@@ -481,10 +538,7 @@ end
 
 function reanalyze_buffer!()
     USE_REANALYZE || return 0
-    samples = lock(replay_buffer.lock) do
-        replay_buffer.samples
-    end
-    n = length(samples)
+    n = buf_length(replay_buffer)
     n == 0 && return 0
 
     num_to_reanalyze = max(1, round(Int, n * REANALYZE_FRACTION))
@@ -496,18 +550,22 @@ function reanalyze_buffer!()
     for batch_start in 1:batch_size:length(reanalyze_indices)
         batch_end = min(batch_start + batch_size - 1, length(reanalyze_indices))
         batch_indices = reanalyze_indices[batch_start:batch_end]
-        batch = lock(replay_buffer.lock) do
-            [samples[i] for i in batch_indices]
-        end
+
+        # Extract columnar data (single lock)
+        col_data = extract_batch(replay_buffer, batch_indices)
 
         for (is_contact_flag, net) in [(true, contact_network), (false, race_network)]
-            # Skip bearoff samples — they already have exact table values, NN blending would degrade them
-            sub_batch_map = [(j, bi) for (j, (bi, s)) in enumerate(zip(batch_indices, batch))
-                             if s.is_contact == is_contact_flag && !s.is_bearoff]
-            isempty(sub_batch_map) && continue
+            # Filter to matching model type, skip bearoff samples (exact table values)
+            sub_mask = [col_data.is_contact[j] == is_contact_flag && !col_data.is_bearoff[j]
+                        for j in 1:length(batch_indices)]
+            any(sub_mask) || continue
 
-            sub_batch = [batch[j] for (j, _) in sub_batch_map]
-            sub_batch_data = prepare_batch(sub_batch, NUM_ACTIONS, USE_GPU, net)
+            sub_local_idx = findall(sub_mask)
+            sub_buf_indices = batch_indices[sub_local_idx]
+
+            # Extract sub-batch columnar data
+            sub_col = extract_batch(replay_buffer, sub_buf_indices)
+            sub_batch_data = prepare_batch_columnar(sub_col, NUM_ACTIONS, USE_GPU, net)
 
             _, V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl, _ =
                 FluxLib.forward_normalized_multihead(net, sub_batch_data.X, sub_batch_data.A)
@@ -520,34 +578,11 @@ function reanalyze_buffer!()
             new_eq_gl = Float32.(vec(Flux.cpu(V̂_gl)))
             new_eq_bgl = Float32.(vec(Flux.cpu(V̂_bgl)))
 
-            α_blend = 0.5f0
-            lock(replay_buffer.lock) do
-                for (k, (_, buf_idx)) in enumerate(sub_batch_map)
-                    old = samples[buf_idx]
-                    old_val = old.value
-                    blended_val = (1f0 - α_blend) * old_val + α_blend * new_values[k]
+            # Vectorized blend into buffer (single lock in reanalyze_update!)
+            reanalyze_update!(replay_buffer, sub_buf_indices,
+                              new_values, new_eq_win, new_eq_gw, new_eq_bgw, new_eq_gl, new_eq_bgl)
 
-                    if old.has_equity
-                        old_eq = old.equity
-                        new_eq = Float32[
-                            (1f0 - α_blend) * old_eq[1] + α_blend * new_eq_win[k],
-                            (1f0 - α_blend) * old_eq[2] + α_blend * new_eq_gw[k],
-                            (1f0 - α_blend) * old_eq[3] + α_blend * new_eq_bgw[k],
-                            (1f0 - α_blend) * old_eq[4] + α_blend * new_eq_gl[k],
-                            (1f0 - α_blend) * old_eq[5] + α_blend * new_eq_bgl[k],
-                        ]
-                        samples[buf_idx] = merge(old, (value=blended_val, equity=new_eq))
-                    else
-                        samples[buf_idx] = merge(old, (value=blended_val,))
-                    end
-
-                    if USE_PER
-                        td_error = abs(new_values[k] - old_val)
-                        replay_buffer.priorities[buf_idx] = td_error
-                    end
-                    total_updated += 1
-                end
-            end
+            total_updated += length(sub_buf_indices)
         end
     end
 

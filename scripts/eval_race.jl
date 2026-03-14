@@ -1,0 +1,350 @@
+#!/usr/bin/env julia
+"""
+Evaluate a race model on fixed race positions vs wildbg.
+
+Loads the 2000 fixed race positions, plays each to completion using AZ MCTS
+vs wildbg, tracks equity and value error.
+
+Usage:
+    julia --threads 30 --project scripts/eval_race.jl <checkpoint> [options...]
+
+    # Race-only model:
+    julia --threads 30 --project scripts/eval_race.jl /path/to/race_latest.data \\
+        --width=128 --blocks=3 --num-workers=22 --mcts-iters=600
+
+    # Defaults to wildbg small nets, 600 MCTS iters
+"""
+
+using ArgParse
+
+function parse_args_eval()
+    s = ArgParseSettings(description="Evaluate race model on fixed positions", autofix_names=true)
+    @add_arg_table! s begin
+        "checkpoint"
+            help = "Race model checkpoint file"
+            arg_type = String
+            required = true
+        "--obs-type"
+            arg_type = String
+            default = "minimal"
+        "--num-games"
+            help = "How many of the 2000 positions to play (0=all)"
+            arg_type = Int
+            default = 0
+        "--width"
+            arg_type = Int
+            default = 128
+        "--blocks"
+            arg_type = Int
+            default = 3
+        "--num-workers"
+            arg_type = Int
+            default = 22
+        "--mcts-iters"
+            arg_type = Int
+            default = 600
+        "--wildbg-lib"
+            arg_type = String
+            default = ""
+        "--positions-file"
+            arg_type = String
+            default = "/homeshare/projects/AlphaZero.jl/eval_data/race_eval_2000.jls"
+        "--inference-batch-size"
+            arg_type = Int
+            default = 50
+    end
+    return ArgParse.parse_args(s)
+end
+
+const ARGS = parse_args_eval()
+
+# Load packages
+using AlphaZero
+using AlphaZero: GI, MCTS, Network, FluxLib, MctsParams, ConstSchedule, BatchedMCTS
+using AlphaZero.NetLib
+import Flux
+using Random
+using Statistics
+using Dates
+using Printf
+using Serialization
+using StaticArrays
+
+# BackgammonNet
+using BackgammonNet
+
+# Set up game
+ENV["BACKGAMMON_OBS_TYPE"] = ARGS["obs_type"]
+include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
+const gspec = GameSpec()
+const NUM_ACTIONS = GI.num_actions(gspec)
+const _state_dim = GI.state_dim(gspec)[1]
+
+# ── Wildbg Library ──────────────────────────────────────────────────────
+
+function find_wildbg_lib()
+    if !isempty(ARGS["wildbg_lib"])
+        return ARGS["wildbg_lib"]
+    end
+    candidates = [
+        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg_main.dylib"),
+        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg_main.so"),
+        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg.dylib"),
+        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg.so"),
+    ]
+    for c in candidates
+        isfile(c) && return c
+    end
+    error("libwildbg not found. Pass --wildbg-lib=/path/to/libwildbg")
+end
+
+# ── Network Forward ─────────────────────────────────────────────────────
+
+function _forward_network(net, states, gspec)
+    n = length(states)
+    X = zeros(Float32, _state_dim, n)
+    A = zeros(Float32, NUM_ACTIONS, n)
+    for (i, s) in enumerate(states)
+        v = GI.vectorize_state(gspec, s)
+        X[:, i] .= vec(v)
+        if !BackgammonNet.game_terminated(s)
+            for action in BackgammonNet.legal_actions(s)
+                if 1 <= action <= NUM_ACTIONS
+                    A[action, i] = 1.0f0
+                end
+            end
+        end
+    end
+    P_raw, V, _ = Network.convert_output_tuple(
+        net, Network.forward_normalized(net, X, A))
+    results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
+    for i in 1:n
+        legal = @view(A[:, i]) .> 0
+        results[i] = (P_raw[legal, i], V[1, i])
+    end
+    return results
+end
+
+# ── Oracle ──────────────────────────────────────────────────────────────
+
+function make_oracles(net)
+    batch_oracle(states::Vector) = _forward_network(net, states, gspec)
+    single_oracle(s) = batch_oracle([s])[1]
+    return single_oracle, batch_oracle
+end
+
+# ── AlphaZero Agent ─────────────────────────────────────────────────────
+
+struct AlphaZeroAgent <: BackgammonNet.AbstractAgent
+    single_oracle::Any
+    batch_oracle::Any
+    mcts_params::MctsParams
+    batch_size::Int
+    gspec::Any
+end
+
+function BackgammonNet.agent_move(agent::AlphaZeroAgent, g::BackgammonGame)
+    env = GI.init(agent.gspec)
+    env.game = BackgammonNet.clone(g)
+    player = BatchedMCTS.BatchedMctsPlayer(
+        agent.gspec, agent.single_oracle, agent.mcts_params;
+        batch_size=agent.batch_size, batch_oracle=agent.batch_oracle)
+    actions, policy = BatchedMCTS.think(player, env)
+    BatchedMCTS.reset_player!(player)
+    return actions[argmax(policy)]
+end
+
+# ── Value Stats ─────────────────────────────────────────────────────────
+
+struct PositionValueSample
+    nn_val::Float64
+    wb_val::Float64
+end
+
+function compute_value_stats(samples::Vector{PositionValueSample})
+    isempty(samples) && return nothing
+    nn = [s.nn_val for s in samples]
+    wb = [s.wb_val for s in samples]
+    mse = mean((nn .- wb) .^ 2)
+    mae = mean(abs.(nn .- wb))
+    bias = mean(nn) - mean(wb)
+    corr = length(nn) >= 3 ? cor(nn, wb) : NaN
+    return (n=length(samples), mse=mse, mae=mae, bias=bias, corr=corr,
+            nn_mean=mean(nn), wb_mean=mean(wb), nn_std=std(nn), wb_std=std(wb))
+end
+
+# ── Game Play from Position ─────────────────────────────────────────────
+
+"""Play a game starting from a fixed race position. Returns (reward, value_samples)."""
+function eval_race_game(az_agent::AlphaZeroAgent, wildbg_agent::BackgammonNet.BackendAgent,
+                        position_data::Tuple, net; seed::Int=1)
+    rng = MersenneTwister(seed)
+    p0, p1, cp = position_data
+
+    # Create game at chance node (needs dice roll first)
+    g = BackgammonGame(p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
+                       obs_type=:minimal_flat)
+
+    value_samples = PositionValueSample[]
+
+    # AZ always plays as P0 (white)
+    az_is_white = true
+
+    while !BackgammonNet.game_terminated(g)
+        if BackgammonNet.is_chance_node(g)
+            BackgammonNet.sample_chance!(g, rng)
+        else
+            is_p0_turn = g.current_player == 0
+            is_az_turn = is_p0_turn == az_is_white
+
+            # Collect value comparison at AZ decision points
+            if is_az_turn
+                r = _forward_network(net, [g], gspec)
+                nn_v = Float64(r[1][2])
+                wb_v = Float64(BackgammonNet.evaluate(wildbg_agent.backend, g))
+                push!(value_samples, PositionValueSample(nn_v, wb_v))
+            end
+
+            agent = is_az_turn ? az_agent : wildbg_agent
+            action = BackgammonNet.agent_move(agent, g)
+            BackgammonNet.apply_action!(g, action)
+        end
+    end
+
+    white_reward = Float64(g.reward)
+    az_reward = az_is_white ? white_reward : -white_reward
+    return (reward=az_reward, value_samples=value_samples)
+end
+
+# ── Main ────────────────────────────────────────────────────────────────
+
+function main()
+    # Load positions
+    positions_file = ARGS["positions_file"]
+    if !isfile(positions_file)
+        error("Positions file not found: $positions_file\nRun scripts/generate_race_positions.jl first")
+    end
+    all_positions = deserialize(positions_file)
+    println("Loaded $(length(all_positions)) race positions from $positions_file")
+
+    # Subset if requested
+    n_games = ARGS["num_games"]
+    if n_games > 0 && n_games < length(all_positions)
+        positions = all_positions[1:n_games]
+    else
+        positions = all_positions
+        n_games = length(positions)
+    end
+
+    checkpoint = ARGS["checkpoint"]
+    width = ARGS["width"]
+    blocks = ARGS["blocks"]
+    mcts_iters = ARGS["mcts_iters"]
+    batch_size = ARGS["inference_batch_size"]
+    num_workers = ARGS["num_workers"]
+
+    println("Checkpoint: $checkpoint")
+    println("Architecture: $(width)w×$(blocks)b")
+    println("Games: $n_games race positions")
+    println("MCTS: $mcts_iters iterations")
+    println("Workers: $num_workers CPU")
+
+    # Load network
+    network = FluxLib.FCResNetMultiHead(
+        gspec, FluxLib.FCResNetMultiHeadHP(width=width, num_blocks=blocks))
+    FluxLib.load_weights(checkpoint, network)
+    network = Flux.cpu(network)
+
+    mcts_params = MctsParams(
+        num_iters_per_turn=mcts_iters,
+        cpuct=1.5,
+        temperature=ConstSchedule(0.0),
+        dirichlet_noise_ϵ=0.0,
+        dirichlet_noise_α=1.0)
+
+    single_oracle, batch_oracle = make_oracles(network)
+    agent = AlphaZeroAgent(single_oracle, batch_oracle, mcts_params, batch_size, gspec)
+
+    # Wildbg setup
+    wildbg_lib = find_wildbg_lib()
+    lib_size = filesize(wildbg_lib)
+    nets_variant = lib_size > 10_000_000 ? :large : :small
+    if nets_variant == :large
+        BackgammonNet.wildbg_set_lib_path!(large=wildbg_lib)
+    else
+        BackgammonNet.wildbg_set_lib_path!(small=wildbg_lib)
+    end
+    println("wildbg: $nets_variant ($(round(lib_size/1e6, digits=1))MB)")
+
+    wildbg_agents = [begin
+        wb = BackgammonNet.WildbgBackend(nets=nets_variant)
+        BackgammonNet.open!(wb)
+        BackgammonNet.BackendAgent(wb)
+    end for _ in 1:num_workers]
+
+    println("=" ^ 70)
+    flush(stdout)
+
+    # Play all positions
+    rewards = Vector{Float64}(undef, n_games)
+    vsamples = Vector{Vector{PositionValueSample}}(undef, n_games)
+
+    t_start = time()
+    claimed = Threads.Atomic{Int}(0)
+    done = Threads.Atomic{Int}(0)
+
+    Threads.@threads for tid in 1:num_workers
+        wa = wildbg_agents[tid]
+        while true
+            i = Threads.atomic_add!(claimed, 1) + 1
+            i > n_games && break
+            result = eval_race_game(agent, wa, positions[i], network; seed=i)
+            rewards[i] = result.reward
+            vsamples[i] = result.value_samples
+            d = Threads.atomic_add!(done, 1) + 1
+            if d % 100 == 0
+                elapsed = time() - t_start
+                rate = d / elapsed
+                eta = (n_games - d) / rate
+                @printf("  %d/%d games (%.1f g/min, ETA %.0fs)\n", d, n_games, rate*60, eta)
+                flush(stdout)
+            end
+        end
+    end
+
+    elapsed = time() - t_start
+
+    for wa in wildbg_agents
+        BackgammonNet.close(wa.backend)
+    end
+
+    # Results
+    avg_reward = mean(rewards)
+    win_count = count(r -> r > 0, rewards)
+    win_pct = 100 * win_count / n_games
+
+    all_vs = PositionValueSample[]
+    for vs in vsamples; append!(all_vs, vs); end
+    vstats = compute_value_stats(all_vs)
+
+    println("=" ^ 70)
+    println("Results (vs wildbg, race positions only):")
+    @printf("  Equity:    %.3f\n", avg_reward)
+    @printf("  Win%%:      %.1f%%\n", win_pct)
+    @printf("  Games:     %d\n", n_games)
+    @printf("  Time:      %.1f min\n", elapsed / 60)
+    @printf("  Rate:      %.1f games/min\n", n_games / (elapsed / 60))
+
+    if vstats !== nothing
+        println("\nValue Error (NN vs Wildbg):")
+        @printf("  n=%d | MSE=%.4f | MAE=%.4f | bias=%+.4f | corr=%.4f\n",
+                vstats.n, vstats.mse, vstats.mae, vstats.bias, vstats.corr)
+        @printf("  NN=%.3f±%.3f | WB=%.3f±%.3f\n",
+                vstats.nn_mean, vstats.nn_std, vstats.wb_mean, vstats.wb_std)
+    end
+    println("=" ^ 70)
+
+    return (equity=avg_reward, win_pct=win_pct, vstats=vstats)
+end
+
+main()
