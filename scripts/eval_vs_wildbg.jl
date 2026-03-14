@@ -123,6 +123,7 @@ using BackgammonNet
 # Try to load Metal.jl for GPU support
 const HAS_METAL = try
     @eval using Metal
+    Metal.current_device()  # Verify actual GPU availability
     true
 catch
     false
