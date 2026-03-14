@@ -355,50 +355,49 @@ replay_buffer = PERBuffer(BUFFER_CAPACITY, _state_dim, NUM_ACTIONS;
 
 # Bootstrap: pre-fill buffer with expert games
 if !isempty(ARGS["bootstrap_file"])
-    bootstrap_path = ARGS["bootstrap_file"]
-    println("\nLoading bootstrap data from: $bootstrap_path")
-    flush(stdout)
-    t0 = time()
-    bootstrap_samples = Serialization.deserialize(bootstrap_path)
-    n_bootstrap = length(bootstrap_samples)
-    max_load = ARGS["bootstrap_max_samples"] > 0 ?
-        min(ARGS["bootstrap_max_samples"], BUFFER_CAPACITY) : min(n_bootstrap, BUFFER_CAPACITY)
+    let bootstrap_path = ARGS["bootstrap_file"],
+        t0 = time()
 
-    # Load in chunks to avoid huge temporary matrices
-    chunk_size = 10000
-    loaded = 0
-    for start_idx in 1:chunk_size:max_load
-        end_idx = min(start_idx + chunk_size - 1, max_load)
-        chunk = bootstrap_samples[start_idx:end_idx]
-        n = length(chunk)
+        println("\nLoading bootstrap data from: $bootstrap_path")
+        flush(stdout)
+        bootstrap_samples = Serialization.deserialize(bootstrap_path)
+        n_bootstrap = length(bootstrap_samples)
+        max_load = ARGS["bootstrap_max_samples"] > 0 ?
+            min(ARGS["bootstrap_max_samples"], BUFFER_CAPACITY) : min(n_bootstrap, BUFFER_CAPACITY)
 
-        # Build columnar arrays from NamedTuple samples
-        states = hcat([s.state for s in chunk]...)
-        policies_raw = hcat([s.policy for s in chunk]...)
-        # Pad policy from 676 to NUM_ACTIONS if needed
-        if size(policies_raw, 1) < NUM_ACTIONS
-            policies = zeros(Float32, NUM_ACTIONS, n)
-            policies[1:size(policies_raw, 1), :] .= policies_raw
-        else
-            policies = policies_raw[1:NUM_ACTIONS, :]
+        chunk_size = 10000
+        loaded = 0
+        for start_idx in 1:chunk_size:max_load
+            end_idx = min(start_idx + chunk_size - 1, max_load)
+            chunk = bootstrap_samples[start_idx:end_idx]
+            n = length(chunk)
+
+            states = hcat([s.state for s in chunk]...)
+            policies_raw = hcat([s.policy for s in chunk]...)
+            if size(policies_raw, 1) < NUM_ACTIONS
+                policies = zeros(Float32, NUM_ACTIONS, n)
+                policies[1:size(policies_raw, 1), :] .= policies_raw
+            else
+                policies = policies_raw[1:NUM_ACTIONS, :]
+            end
+            values = Float32[s.value for s in chunk]
+            equities = hcat([s.equity for s in chunk]...)
+            has_equity = Bool[s.has_equity for s in chunk]
+            is_contact = Bool[s.is_contact for s in chunk]
+            is_bearoff = Bool[s.is_bearoff for s in chunk]
+
+            per_add_batch!(replay_buffer, states, policies, values,
+                           equities, has_equity, is_contact, is_bearoff)
+            loaded += n
         end
-        values = Float32[s.value for s in chunk]
-        equities = hcat([s.equity for s in chunk]...)
-        has_equity = Bool[s.has_equity for s in chunk]
-        is_contact = Bool[s.is_contact for s in chunk]
-        is_bearoff = Bool[s.is_bearoff for s in chunk]
 
-        per_add_batch!(replay_buffer, states, policies, values,
-                       equities, has_equity, is_contact, is_bearoff)
-        loaded += n
+        bootstrap_samples = nothing
+        GC.gc()
+        t_load = time() - t0
+        println("  Loaded $loaded / $n_bootstrap bootstrap samples in $(round(t_load, digits=1))s")
+        println("  Buffer size: $(buf_length(replay_buffer))")
+        flush(stdout)
     end
-
-    bootstrap_samples = nothing  # Free memory
-    GC.gc()
-    t_load = time() - t0
-    println("  Loaded $loaded / $n_bootstrap bootstrap samples in $(round(t_load, digits=1))s")
-    println("  Buffer size: $(buf_length(replay_buffer))")
-    flush(stdout)
 end
 
 # Training functions (extracted from train_distributed.jl)
