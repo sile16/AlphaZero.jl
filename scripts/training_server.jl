@@ -543,14 +543,14 @@ function reanalyze_buffer!()
     num_to_reanalyze = max(1, round(Int, n * REANALYZE_FRACTION))
     reanalyze_indices = randperm(n)[1:min(num_to_reanalyze, n)]
 
-    batch_size = min(4096, length(reanalyze_indices))
+    batch_size = min(2048, length(reanalyze_indices))
     total_updated = 0
 
     for batch_start in 1:batch_size:length(reanalyze_indices)
         batch_end = min(batch_start + batch_size - 1, length(reanalyze_indices))
         batch_indices = reanalyze_indices[batch_start:batch_end]
 
-        # Extract columnar data (single lock)
+        # Extract columnar data once (lock-free)
         col_data = extract_batch(replay_buffer, batch_indices)
 
         for (is_contact_flag, net) in [(true, contact_network), (false, race_network)]
@@ -562,8 +562,17 @@ function reanalyze_buffer!()
             sub_local_idx = findall(sub_mask)
             sub_buf_indices = batch_indices[sub_local_idx]
 
-            # Extract sub-batch columnar data
-            sub_col = extract_batch(replay_buffer, sub_buf_indices)
+            # Slice from already-extracted data (no second buffer read)
+            sub_col = (
+                states = col_data.states[:, sub_local_idx],
+                policies = col_data.policies[:, sub_local_idx],
+                values = col_data.values[sub_local_idx],
+                equities = col_data.equities[:, sub_local_idx],
+                has_equity = col_data.has_equity[sub_local_idx],
+                is_chance = col_data.is_chance[sub_local_idx],
+                is_contact = col_data.is_contact[sub_local_idx],
+                is_bearoff = col_data.is_bearoff[sub_local_idx],
+            )
             sub_batch_data = prepare_batch_columnar(sub_col, NUM_ACTIONS, USE_GPU, net)
 
             _, V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl, _ =
@@ -577,12 +586,15 @@ function reanalyze_buffer!()
             new_eq_gl = Float32.(vec(Flux.cpu(V̂_gl)))
             new_eq_bgl = Float32.(vec(Flux.cpu(V̂_bgl)))
 
-            # Vectorized blend into buffer (single lock in reanalyze_update!)
+            # Write blended values back (lock-free)
             reanalyze_update!(replay_buffer, sub_buf_indices,
                               new_values, new_eq_win, new_eq_gw, new_eq_bgw, new_eq_gl, new_eq_bgl)
 
             total_updated += length(sub_buf_indices)
         end
+
+        # Let GC clean up batch temporaries
+        col_data = nothing
     end
 
     return total_updated

@@ -181,41 +181,43 @@ end
 """Extract a training batch from buffer at given indices.
 
 Returns columnar data ready for prepare_batch — no NamedTuple allocation.
-Uses views where possible to avoid copies."""
+Lock-free: safe because training thread is the only mutator of sample data
+(HTTP thread only appends at write_pos, never modifies existing entries).
+Only priorities are written concurrently, but we don't read those here."""
 function extract_batch(buf::PERBuffer, indices::Vector{Int})
-    lock(buf.lock) do
-        n = length(indices)
-        states = buf.states[:, indices]
-        policies = buf.policies[:, indices]
-        values = buf.values[indices]
-        equities = buf.equities[:, indices]
-        has_equity = buf.has_equity[indices]
-        is_chance = buf.is_chance[indices]
-        is_contact = buf.is_contact[indices]
-        is_bearoff = buf.is_bearoff[indices]
-        return (; states, policies, values, equities, has_equity, is_chance, is_contact, is_bearoff)
-    end
+    n = length(indices)
+    states = buf.states[:, indices]
+    policies = buf.policies[:, indices]
+    values = buf.values[indices]
+    equities = buf.equities[:, indices]
+    has_equity = buf.has_equity[indices]
+    is_chance = buf.is_chance[indices]
+    is_contact = buf.is_contact[indices]
+    is_bearoff = buf.is_bearoff[indices]
+    return (; states, policies, values, equities, has_equity, is_chance, is_contact, is_bearoff)
 end
 
-"""Get indices for contact vs race samples."""
+"""Get indices for contact vs race samples.
+Lock-free: reads immutable sample flags (only write_pos changes concurrently)."""
 function partition_indices(buf::PERBuffer)
-    lock(buf.lock) do
-        contact_idx = Int[]
-        race_idx = Int[]
-        for i in 1:buf.size
-            if buf.is_contact[i]
-                push!(contact_idx, i)
-            else
-                push!(race_idx, i)
-            end
+    n = buf.size
+    contact_idx = Int[]
+    race_idx = Int[]
+    for i in 1:n
+        if buf.is_contact[i]
+            push!(contact_idx, i)
+        else
+            push!(race_idx, i)
         end
-        return (contact=contact_idx, race=race_idx, all=collect(1:buf.size))
     end
+    return (contact=contact_idx, race=race_idx, all=collect(1:n))
 end
 
 """Vectorized reanalyze update — blends new NN values into buffer at given indices.
 
-Uses broadcasting for bulk updates instead of per-sample loops."""
+Lock-free for value/equity writes (training thread is sole writer).
+Only priorities need atomic-style updates but races are benign (stale priority
+just means slightly suboptimal PER sampling, not correctness issues)."""
 function reanalyze_update!(buf::PERBuffer, indices::Vector{Int},
                            new_values::Vector{Float32},
                            new_eq_win::Vector{Float32},
@@ -224,26 +226,23 @@ function reanalyze_update!(buf::PERBuffer, indices::Vector{Int},
                            new_eq_gl::Vector{Float32},
                            new_eq_bgl::Vector{Float32};
                            α_blend::Float32=0.5f0)
-    lock(buf.lock) do
-        n = length(indices)
+    n = length(indices)
 
-        # Vectorized value blending
-        @inbounds for k in 1:n
-            idx = indices[k]
-            old_val = buf.values[idx]
-            buf.values[idx] = (1f0 - α_blend) * old_val + α_blend * new_values[k]
+    @inbounds for k in 1:n
+        idx = indices[k]
+        old_val = buf.values[idx]
+        buf.values[idx] = (1f0 - α_blend) * old_val + α_blend * new_values[k]
 
-            # Blend equity heads
-            if buf.has_equity[idx]
-                buf.equities[1, idx] = (1f0 - α_blend) * buf.equities[1, idx] + α_blend * new_eq_win[k]
-                buf.equities[2, idx] = (1f0 - α_blend) * buf.equities[2, idx] + α_blend * new_eq_gw[k]
-                buf.equities[3, idx] = (1f0 - α_blend) * buf.equities[3, idx] + α_blend * new_eq_bgw[k]
-                buf.equities[4, idx] = (1f0 - α_blend) * buf.equities[4, idx] + α_blend * new_eq_gl[k]
-                buf.equities[5, idx] = (1f0 - α_blend) * buf.equities[5, idx] + α_blend * new_eq_bgl[k]
-            end
-
-            # Update PER priority
-            buf.priorities[idx] = abs(new_values[k] - old_val)
+        # Blend equity heads
+        if buf.has_equity[idx]
+            buf.equities[1, idx] = (1f0 - α_blend) * buf.equities[1, idx] + α_blend * new_eq_win[k]
+            buf.equities[2, idx] = (1f0 - α_blend) * buf.equities[2, idx] + α_blend * new_eq_gw[k]
+            buf.equities[3, idx] = (1f0 - α_blend) * buf.equities[3, idx] + α_blend * new_eq_bgw[k]
+            buf.equities[4, idx] = (1f0 - α_blend) * buf.equities[4, idx] + α_blend * new_eq_gl[k]
+            buf.equities[5, idx] = (1f0 - α_blend) * buf.equities[5, idx] + α_blend * new_eq_bgl[k]
         end
+
+        # Update PER priority (benign race with per_add_batch!)
+        buf.priorities[idx] = abs(new_values[k] - old_val)
     end
 end
