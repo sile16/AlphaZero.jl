@@ -84,6 +84,10 @@ function parse_args()
         "--seed"
             arg_type = Int
             default = 42
+        "--training-mode"
+            help = "Training mode: 'dual' (contact+race), 'race' (race-only)"
+            arg_type = String
+            default = "dual"
 
         # PER
         "--use-per"
@@ -135,9 +139,7 @@ function parse_args()
             arg_type = Float64
             default = 0.3
 
-        # Bear-off (clients load locally)
-        "--use-bearoff"
-            action = :store_true
+        # Bear-off (always enabled — clients load table locally)
         "--bearoff-hard-targets"
             action = :store_true
         "--bearoff-truncation"
@@ -186,6 +188,7 @@ println("Data dir: $DATA_DIR")
 println("Contact model: $(ARGS["contact_width"])w×$(ARGS["contact_blocks"])b")
 println("Race model: $(ARGS["race_width"])w×$(ARGS["race_blocks"])b")
 println("Buffer capacity: $(ARGS["buffer_capacity"])")
+println("Training mode: $(ARGS["training_mode"])")
 println("PER: $(ARGS["use_per"])")
 println("Reanalyze: $(ARGS["use_reanalyze"])")
 println("=" ^ 60)
@@ -446,8 +449,16 @@ function train_on_buffer!()
         (all, cs, ci, rs, ri)
     end
 
-    contact_result = _train_model_on_samples!(contact_samples, contact_indices, contact_network, contact_opt_state)
-    race_result = _train_model_on_samples!(race_samples, race_indices, race_network, race_opt_state)
+    if ARGS["training_mode"] == "race"
+        # Race-only mode: skip contact training, train race on ALL samples
+        # (in race mode, all positions are race positions, but is_contact flag might still be set)
+        all_indices = collect(1:length(all_samples))
+        contact_result = (avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0, num_batches=0)
+        race_result = _train_model_on_samples!(collect(all_samples), all_indices, race_network, race_opt_state)
+    else
+        contact_result = _train_model_on_samples!(contact_samples, contact_indices, contact_network, contact_opt_state)
+        race_result = _train_model_on_samples!(race_samples, race_indices, race_network, race_opt_state)
+    end
 
     return (contact=contact_result, race=race_result)
 end
@@ -567,9 +578,10 @@ const SERVER_CONFIG = Dict{String, Any}(
     "temp_iter_decay" => ARGS["temp_iter_decay"],
     "temp_iter_final" => ARGS["temp_iter_final"],
     "total_iterations" => ARGS["total_iterations"],
-    "use_bearoff" => ARGS["use_bearoff"],
+    "use_bearoff" => true,  # always enabled
     "bearoff_hard_targets" => ARGS["bearoff_hard_targets"],
     "bearoff_truncation" => ARGS["bearoff_truncation"],
+    "training_mode" => ARGS["training_mode"],
 )
 
 # Initialize server state
@@ -683,7 +695,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
 
     contact_loss = train_result.contact.avg_loss
     race_loss = train_result.race.avg_loss
-    avg_loss = (contact_loss + race_loss) / 2
+    avg_loss = ARGS["training_mode"] == "race" ? race_loss : (contact_loss + race_loss) / 2
 
     # Reanalyze (GPU)
     t0 = time()

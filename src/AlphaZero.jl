@@ -59,6 +59,11 @@ module AlphaZero
   using .GumbelMCTS
   export GumbelMCTS
 
+  # EvalMCTS: GPU-friendly evaluation with full chance expansion + virtual loss
+  include("eval_mcts.jl")
+  using .EvalMCTS
+  export EvalMCTS
+
   # A generic network interface
   include("networks/network.jl")
   using .Network

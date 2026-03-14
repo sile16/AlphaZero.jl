@@ -160,10 +160,13 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
             if benv.bearoff_evaluator !== nothing
                 val = benv.bearoff_evaluator(game)
                 if val !== nothing
+                    # Bear-off returns white-relative equity; convert to player-relative
+                    wp = GI.white_playing(game)
+                    player_val = wp ? val : -val
                     sim.leaf_state = GI.current_state(game)
                     sim.leaf_actions = Int[]
                     sim.is_new_node = false
-                    sim.terminal_value = val
+                    sim.terminal_value = player_val
                     return sim
                 end
             end
@@ -190,10 +193,6 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
         # Single Dict lookup (was: haskey + env.tree[state] = 2 lookups)
         info = get(env.tree, state, nothing)
         if info === nothing
-            # Note: bearoff evaluator only fires at chance nodes (line 160-168).
-            # Decision nodes always need a tree entry for policy() to work,
-            # so we go through normal NN evaluation even for bear-off positions.
-
             leaf_actions = GI.available_actions(game)
 
             # Single-option states (e.g., forced PASS): create trivial tree entry
@@ -205,6 +204,28 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
                 env.tree[state] = info
                 # Fall through to normal traversal below (info is now set)
             else
+                # Bear-off table: use exact value instead of NN oracle
+                if benv.bearoff_evaluator !== nothing
+                    val = benv.bearoff_evaluator(game)
+                    if val !== nothing
+                        # Bear-off returns white-relative equity; convert to player-relative
+                        # (matching NN oracle convention where Vest is player-relative)
+                        wp = GI.white_playing(game)
+                        player_val = wp ? val : -val
+                        # Create tree entry with uniform policy + exact bear-off value
+                        n = length(leaf_actions)
+                        P_uniform = Float32(1.0 / n)
+                        stats = [MCTS.ActionStats(P_uniform, Float64(0), 0) for _ in 1:n]
+                        info = MCTS.StateInfo(stats, leaf_actions, Float32(player_val))
+                        env.tree[state] = info
+                        sim.leaf_state = state
+                        sim.leaf_actions = Int[]
+                        sim.is_new_node = false
+                        sim.terminal_value = player_val
+                        return sim
+                    end
+                end
+
                 sim.leaf_state = state
                 sim.leaf_actions = leaf_actions
                 sim.is_new_node = true

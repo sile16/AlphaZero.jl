@@ -51,7 +51,7 @@ function auth_headers(client::SelfPlayClient)
      "X-Client-Id" => client.client_id]
 end
 
-"""Register this client with the server."""
+"""Register and return (success, assigned_seed). Server assigns unique seed per client."""
 function register!(client::SelfPlayClient; name::String=client.client_id)
     body = JSON.json(Dict(
         "client_id" => client.client_id,
@@ -64,8 +64,11 @@ function register!(client::SelfPlayClient; name::String=client.client_id)
                      status_exception=false)
     if resp.status != 200
         @warn "Registration failed" status=resp.status body=String(resp.body)
+        return (success=false, assigned_seed=nothing)
     end
-    return resp.status == 200
+    result = JSON.parse(String(resp.body))
+    seed = get(result, "assigned_seed", nothing)
+    return (success=true, assigned_seed=seed)
 end
 
 """Fetch self-play config from server."""

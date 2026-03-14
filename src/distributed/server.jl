@@ -97,15 +97,22 @@ function handle_register(req::HTTP.Request, state::ServerState)
         client_type = get(body, "client_type", "julia")
         name = get(body, "name", client_id)
 
-        lock(state.clients_lock) do
+        # Assign unique seed based on client count (deterministic, non-overlapping)
+        assigned_seed = lock(state.clients_lock) do
+            n = length(state.clients)
+            seed = state.config["seed"] + (n + 1) * 104729  # large prime stride
             state.clients[client_id] = ClientStats(
                 client_id, client_type, name,
                 0, 0, now(), now(),
                 0.0, 0.0, 0.0, 0.0, 0.0
             )
+            seed
         end
 
-        return HTTP.Response(200, JSON.json(Dict("session_id" => client_id)))
+        return HTTP.Response(200, JSON.json(Dict(
+            "session_id" => client_id,
+            "assigned_seed" => assigned_seed,
+        )))
     catch e
         return HTTP.Response(400, "Bad request: $e")
     end

@@ -50,10 +50,6 @@ function parse_args()
             help = "Upload samples every N games"
             arg_type = Int
             default = 10
-        "--weight-sync-interval"
-            help = "Check for weight updates every N seconds"
-            arg_type = Float64
-            default = 30.0
         "--seed"
             arg_type = Int
             default = 0
@@ -69,14 +65,8 @@ end
 const ARGS = parse_args()
 const SERVER_URL = ARGS["server"]
 const NUM_WORKERS = ARGS["num_workers"]
-const MAIN_SEED = ARGS["seed"] > 0 ? ARGS["seed"] : nothing
 const GPU_WORKERS = ARGS["gpu_workers"]
 const USE_GPU = GPU_WORKERS > 0
-
-# Set seed (0 = random)
-if ARGS["seed"] > 0
-    Random.seed!(ARGS["seed"])
-end
 
 println("=" ^ 60)
 println("AlphaZero Self-Play Client")
@@ -106,8 +96,24 @@ client = SelfPlayClient(SERVER_URL, ARGS["api_key"];
                         client_id=client_name, upload_threshold=ARGS["upload_interval"] * 200)
 
 println("\nConnecting to server...")
-if !register!(client; name=client_name)
+reg = register!(client; name=client_name)
+if !reg.success
     error("Failed to register with server")
+end
+
+# Use server-assigned seed (unique per client) or fall back to CLI arg
+const MAIN_SEED = if reg.assigned_seed !== nothing
+    println("Using server-assigned seed: $(reg.assigned_seed)")
+    Int(reg.assigned_seed)
+elseif ARGS["seed"] > 0
+    println("Using CLI seed: $(ARGS["seed"])")
+    ARGS["seed"]
+else
+    println("Using random seed")
+    nothing
+end
+if MAIN_SEED !== nothing
+    Random.seed!(MAIN_SEED)
 end
 println("Registered as: $client_name")
 
@@ -136,8 +142,7 @@ const TEMP_ITER_DECAY = Bool(get(config, "temp_iter_decay", false))
 const TEMP_ITER_FINAL = Float64(get(config, "temp_iter_final", 0.3))
 const TOTAL_ITERS = Int(get(config, "total_iterations", 200))
 
-# Bear-off config
-const USE_BEAROFF = Bool(get(config, "use_bearoff", false))
+# Bear-off config (always enabled — mandatory for backgammon training)
 const BEAROFF_HARD_TARGETS = Bool(get(config, "bearoff_hard_targets", false))
 const BEAROFF_TRUNCATION = Bool(get(config, "bearoff_truncation", false))
 
@@ -187,10 +192,10 @@ if USE_GPU
 end
 
 #####
-##### Bear-off table (loaded locally — too large to serve over HTTP)
+##### Bear-off table (mandatory — loaded locally, too large to serve over HTTP)
 #####
 
-const BEAROFF_SRC_DIR = if USE_BEAROFF
+const BEAROFF_SRC_DIR = let
     local_path = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k6.jl")
     pkg_path = joinpath(dirname(pathof(BackgammonNet)), "bearoff_k6.jl")
     if isfile(local_path)
@@ -200,16 +205,12 @@ const BEAROFF_SRC_DIR = if USE_BEAROFF
     else
         error("Cannot find bearoff_k6.jl. Expected at:\n  $local_path\n  $pkg_path")
     end
-else
-    nothing
 end
 
-if USE_BEAROFF
-    include(joinpath(BEAROFF_SRC_DIR, "bearoff_k6.jl"))
-    using .BearoffK6
-end
+include(joinpath(BEAROFF_SRC_DIR, "bearoff_k6.jl"))
+using .BearoffK6
 
-const BEAROFF_TABLE = if USE_BEAROFF
+const BEAROFF_TABLE = let
     table_dir = joinpath(BEAROFF_SRC_DIR, "..", "tools", "bearoff_twosided", "bearoff_k6_twosided")
     if !isdir(table_dir)
         error("Bear-off table not found at: $table_dir")
@@ -220,8 +221,6 @@ const BEAROFF_TABLE = if USE_BEAROFF
     println("  c15: $(t.c15_pairs) pairs ($(round(length(t.c15_data)/1e9, digits=1)) GB)")
     flush(stdout)
     t
-else
-    nothing
 end
 
 """Look up exact bear-off equity from precomputed table."""
@@ -232,9 +231,8 @@ function bearoff_table_equity(game::BackgammonNet.BackgammonGame)
     return (value=value, equity=eq)
 end
 
-"""Create bear-off evaluator for MCTS chance nodes."""
+"""Create bear-off evaluator for MCTS (used at both chance and decision node leaves)."""
 function make_bearoff_evaluator(table)
-    table === nothing && return nothing
     return function(game_env)
         bg = game_env.game
         if BearoffK6.is_bearoff_position(bg.p0, bg.p1)
@@ -245,7 +243,79 @@ function make_bearoff_evaluator(table)
     end
 end
 
-const BEAROFF_EVALUATOR = USE_BEAROFF ? make_bearoff_evaluator(BEAROFF_TABLE) : nothing
+const BEAROFF_EVALUATOR = make_bearoff_evaluator(BEAROFF_TABLE)
+
+#####
+##### Race starting positions (for race-only training mode)
+#####
+
+const TRAINING_MODE = get(config, "training_mode", "dual")
+
+"""Generate race starting positions by playing random games and collecting first race state."""
+function generate_race_positions(n::Int; rng=Random.default_rng())
+    positions = BackgammonNet.BackgammonGame[]
+    attempts = 0
+    max_attempts = n * 20  # most games reach race eventually
+
+    while length(positions) < n && attempts < max_attempts
+        attempts += 1
+        game = BackgammonNet.initial_state(;
+            short_game=SHORT_GAME, doubles_only=false, obs_type=OBSERVATION_TYPE)
+
+        # Play random moves until we reach a race position or game ends
+        move_count = 0
+        max_moves = 300
+
+        while !BackgammonNet.game_terminated(game) && move_count < max_moves
+            if BackgammonNet.is_chance_node(game)
+                BackgammonNet.sample_chance!(game, rng)
+            else
+                actions = BackgammonNet.legal_actions(game)
+                if isempty(actions)
+                    break
+                end
+                BackgammonNet.apply_action!(game, actions[rand(rng, 1:length(actions))])
+            end
+            move_count += 1
+
+            # Check for race position at chance nodes (post-move, pre-dice)
+            if BackgammonNet.is_chance_node(game) && BackgammonNet.is_race_position(game)
+                push!(positions, BackgammonNet.clone(game))
+                break
+            end
+        end
+    end
+
+    println("Generated $(length(positions)) race starting positions from $attempts random games")
+    return positions
+end
+
+const RACE_POSITIONS = if TRAINING_MODE == "race"
+    println("\nGenerating race starting positions...")
+    flush(stdout)
+    t0 = time()
+    positions = generate_race_positions(10000; rng=MersenneTwister(MAIN_SEED === nothing ? 12345 : MAIN_SEED))
+    println("  $(length(positions)) positions in $(round(time() - t0, digits=1))s")
+    flush(stdout)
+    positions
+else
+    BackgammonNet.BackgammonGame[]
+end
+
+"""Initialize a game environment, starting from race position if in race training mode."""
+function init_game(rng::AbstractRNG)
+    env = GI.init(gspec)
+    if hasproperty(env, :rng)
+        env.rng = rng
+    end
+    if TRAINING_MODE == "race" && !isempty(RACE_POSITIONS)
+        pos = RACE_POSITIONS[rand(rng, 1:length(RACE_POSITIONS))]
+        GI.set_state!(env, pos)
+        # Roll initial dice for the race position
+        BackgammonNet.sample_chance!(env.game, rng)
+    end
+    return env
+end
 
 #####
 ##### Allocation-free forward pass (extracted from train_distributed.jl)
@@ -719,7 +789,7 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
         end
 
         is_bearoff_pos = false
-        if bearoff_equity === nothing && USE_BEAROFF && state isa BackgammonNet.BackgammonGame &&
+        if bearoff_equity === nothing && state isa BackgammonNet.BackgammonGame &&
                 BearoffK6.is_bearoff_position(state.p0, state.p1)
             bo = bearoff_table_equity(state)
             z = wp ? bo.value : -bo.value
@@ -884,10 +954,7 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
 
     all_samples = []
     while Threads.atomic_add!(games_claimed, 1) < total_games
-        env = GI.init(gspec)
-        if hasproperty(env, :rng)
-            env.rng = rng
-        end
+        env = init_game(rng)
 
         trace_states = []
         trace_policies = []
@@ -903,19 +970,17 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
 
         while !GI.game_terminated(env)
             if GI.is_chance_node(env)
-                if USE_BEAROFF
-                    bg = env.game
-                    if BearoffK6.is_bearoff_position(bg.p0, bg.p1)
-                        if first_bearoff_bo === nothing
-                            first_bearoff_bo = bearoff_table_equity(bg)
-                            first_bearoff_wp = (bg.current_player == 0)
-                        end
-                        if BEAROFF_TRUNCATION
-                            bearoff_truncated = true
-                            bearoff_bo = first_bearoff_bo
-                            bearoff_wp_at_trunc = first_bearoff_wp
-                            break
-                        end
+                bg = env.game
+                if BearoffK6.is_bearoff_position(bg.p0, bg.p1)
+                    if first_bearoff_bo === nothing
+                        first_bearoff_bo = bearoff_table_equity(bg)
+                        first_bearoff_wp = (bg.current_player == 0)
+                    end
+                    if BEAROFF_TRUNCATION
+                        bearoff_truncated = true
+                        bearoff_bo = first_bearoff_bo
+                        bearoff_wp_at_trunc = first_bearoff_wp
+                        break
                     end
                 end
                 outcomes = GI.chance_outcomes(env)
@@ -1107,10 +1172,7 @@ function worker_play_games_gpu(worker_id::Int, games_claimed::Threads.Atomic{Int
 
     all_samples = []
     while Threads.atomic_add!(games_claimed, 1) < total_games
-        env = GI.init(gspec)
-        if hasproperty(env, :rng)
-            env.rng = sub_rng
-        end
+        env = init_game(sub_rng)
 
         trace_states = []
         trace_policies = []
@@ -1126,19 +1188,17 @@ function worker_play_games_gpu(worker_id::Int, games_claimed::Threads.Atomic{Int
 
         while !GI.game_terminated(env)
             if GI.is_chance_node(env)
-                if USE_BEAROFF
-                    bg = env.game
-                    if BearoffK6.is_bearoff_position(bg.p0, bg.p1)
-                        if first_bearoff_bo === nothing
-                            first_bearoff_bo = bearoff_table_equity(bg)
-                            first_bearoff_wp = (bg.current_player == 0)
-                        end
-                        if BEAROFF_TRUNCATION
-                            bearoff_truncated = true
-                            bearoff_bo = first_bearoff_bo
-                            bearoff_wp_at_trunc = first_bearoff_wp
-                            break
-                        end
+                bg = env.game
+                if BearoffK6.is_bearoff_position(bg.p0, bg.p1)
+                    if first_bearoff_bo === nothing
+                        first_bearoff_bo = bearoff_table_equity(bg)
+                        first_bearoff_wp = (bg.current_player == 0)
+                    end
+                    if BEAROFF_TRUNCATION
+                        bearoff_truncated = true
+                        bearoff_bo = first_bearoff_bo
+                        bearoff_wp_at_trunc = first_bearoff_wp
+                        break
                     end
                 end
                 outcomes = GI.chance_outcomes(env)
@@ -1357,20 +1417,10 @@ function collect_system_stats(; games_per_sec::Float64=0.0, samples_per_sec::Flo
 end
 
 """Send client stats to server (fire-and-forget)."""
+# send_client_stats disabled — HTTP.jl deadlocks with multiple threads doing HTTP.
+# Stats are sent via upload batch metadata instead.
 function send_client_stats(client::SelfPlayClient, stats::Dict)
-    stats["client_id"] = client.client_id
-    Threads.@spawn begin
-        try
-            headers = vcat(auth_headers(client),
-                           ["Content-Type" => "application/json"])
-            HTTP.post("$(client.server_url)/api/client_stats",
-                      headers, JSON.json(stats);
-                      status_exception=false,
-                      connect_timeout=10, readtimeout=10)
-        catch e
-            @debug "Failed to send client stats" exception=e
-        end
-    end
+    # no-op: avoid spawning HTTP threads
 end
 
 flush(stdout)
@@ -1381,94 +1431,142 @@ flush(stdout)
 
 const UPLOAD_INTERVAL = ARGS["upload_interval"]
 
-# Background upload channel — self-play never blocks on network I/O
-const UPLOAD_CHANNEL = Channel{Vector{UInt8}}(4)  # buffer up to 4 batches
+# Single background network thread handles uploads AND weight sync.
+# HTTP.jl deadlocks with multiple concurrent spawned threads doing HTTP.
+const UPLOAD_CHANNEL = Channel{Vector{UInt8}}(8)
 Threads.@spawn begin
     while true
+        # Block waiting for upload data
         bytes = take!(UPLOAD_CHANNEL)
-        headers = vcat(auth_headers(client),
-                       ["Content-Type" => "application/msgpack"])
+
+        # Upload samples
         try
+            headers = vcat(auth_headers(client),
+                           ["Content-Type" => "application/msgpack"])
             t0 = time()
             resp = HTTP.post("$(client.server_url)/api/samples",
                              headers, bytes; status_exception=false,
-                             connect_timeout=30, readtimeout=1800)
+                             connect_timeout=10, readtimeout=60)
             t_upload = time() - t0
             if resp.status == 200
                 result = JSON.parse(String(resp.body))
-                println("  Uploaded $(result["accepted"]) samples ($(round(length(bytes)/1024, digits=1)) KB, $(round(t_upload, digits=2))s), buffer=$(result["buffer_size"]), queue=$(length(UPLOAD_CHANNEL.data)))")
+                println("  Uploaded $(result["accepted"]) samples ($(round(length(bytes)/1024, digits=1)) KB, $(round(t_upload, digits=2))s), buffer=$(result["buffer_size"]))")
             else
                 println("  Upload failed: $(resp.status)")
             end
         catch e
             println("  Upload error: $e")
         end
+
+        # Weight sync — runs on same thread as upload, after each upload
+        try
+            version = check_weight_version(client)
+            if version !== nothing
+                CURRENT_ITERATION[] = get(version, "iteration", 0)
+                needs_contact = version["contact_version"] > client.contact_version
+                needs_race = version["race_version"] > client.race_version
+                if needs_contact || needs_race
+                    updated = sync_weights!(client, contact_network, race_network)
+                    if updated
+                        refresh_fast_weights!()
+                        println("  Weights updated! contact=v$(client.contact_version), race=v$(client.race_version) (server iter=$(CURRENT_ITERATION[]))")
+                    end
+                end
+            end
+        catch e
+            println("  Weight sync error: $e")
+        end
+
+        flush(stdout)
+    end
+end
+
+# Shared sample channel: workers push completed game samples, main thread drains and uploads
+const SAMPLE_CHANNEL = Channel{Vector{Any}}(NUM_WORKERS * 2)
+
+"""Continuous worker: plays games forever, pushing samples into SAMPLE_CHANNEL."""
+function continuous_worker(worker_id::Int, rng::MersenneTwister)
+    println("  Worker $worker_id starting on thread $(Threads.threadid())")
+    flush(stdout)
+    contact_fb = FastBuffers(CONTACT_WIDTH, NUM_ACTIONS, INFERENCE_BATCH_SIZE + 1)
+    race_fb = FastBuffers(RACE_WIDTH, NUM_ACTIONS, INFERENCE_BATCH_SIZE + 1)
+    sub_rng = MersenneTwister(rand(rng, UInt))
+
+    # Play games forever — one at a time, push samples immediately
+    games_played = 0
+    while true
+        # Use _play_games_loop with total_games=1 via atomic counter
+        games_claimed = Threads.Atomic{Int}(0)
+        result = _play_games_loop(worker_id, games_claimed, 1, sub_rng;
+                                   contact_fast_bufs=contact_fb, race_fast_bufs=race_fb)
+        if !isempty(result.samples)
+            put!(SAMPLE_CHANNEL, result.samples)
+        end
+        games_played += 1
+        if games_played <= 3
+            println("  Worker $worker_id: game $games_played done, $(length(result.samples)) samples")
+            flush(stdout)
+        end
     end
 end
 
 function main_loop()
+    # Start all workers as continuous background threads
+    tasks = Task[]
+    for w in 1:NUM_WORKERS
+        rng = MersenneTwister(isnothing(MAIN_SEED) ? rand(UInt) : MAIN_SEED + w * 104729)
+        t = Threads.@spawn continuous_worker(w, rng)
+        push!(tasks, t)
+    end
+    println("Started $NUM_WORKERS continuous CPU workers")
+    flush(stdout)
+
+    # Wait briefly so workers can start and JIT-compile before we block on channel
+    sleep(1)
+
     games_played = 0
-    last_weight_check = time()
+    total_samples_collected = 0
     batch_num = 0
+    batch_samples = []
+    batch_games = 0
+    t_batch_start = time()
 
     while true
+        # Drain completed games from workers (blocking wait for first game)
+        game_samples = take!(SAMPLE_CHANNEL)
+        append!(batch_samples, game_samples)
+        batch_games += 1
+        games_played += 1
+
+        # Drain any other ready games
+        while batch_games < UPLOAD_INTERVAL && isready(SAMPLE_CHANNEL)
+            game_samples = take!(SAMPLE_CHANNEL)
+            append!(batch_samples, game_samples)
+            batch_games += 1
+            games_played += 1
+        end
+
+        if batch_games < UPLOAD_INTERVAL
+            continue
+        end
+
         batch_num += 1
-        t_batch_start = time()
-
-        # Play a batch of games
-        samples = parallel_self_play(UPLOAD_INTERVAL)
-        games_played += UPLOAD_INTERVAL
-        n_samples = length(samples)
-
+        n_samples = length(batch_samples)
+        total_samples_collected += n_samples
         t_play = time() - t_batch_start
-        gps = UPLOAD_INTERVAL / t_play
+        gps = batch_games / t_play
         sps = n_samples / t_play
-        println("Batch $batch_num: $UPLOAD_INTERVAL games, $n_samples samples, $(round(gps, digits=1)) games/sec")
+        println("Batch $batch_num: $batch_games games, $n_samples samples, $(round(gps, digits=1)) games/sec")
 
-        # Serialize and queue for async upload (non-blocking unless queue is full)
-        batch = samples_to_batch(samples)
+        # Queue upload + weight sync on background network thread (non-blocking)
+        batch = samples_to_batch(batch_samples)
         bytes = pack_samples(batch)
         put!(UPLOAD_CHANNEL, bytes)
 
-        # Collect and send system stats (fire-and-forget)
-        stats = collect_system_stats(games_per_sec=gps, samples_per_sec=sps)
-        send_client_stats(client, stats)
-
-        flush(stdout)
-
-        # Check for weight updates periodically
-        if time() - last_weight_check > ARGS["weight_sync_interval"]
-            try
-                updated = sync_weights!(client, contact_network, race_network)
-                if updated
-                    # Refresh FastWeights from updated networks
-                    refresh_fast_weights!()
-                    println("  Weights updated! contact=$(client.contact_version), race=$(client.race_version)")
-
-                    # Update iteration counter from server
-                    version = check_weight_version(client)
-                    if version !== nothing
-                        CURRENT_ITERATION[] = get(version, "iteration", CURRENT_ITERATION[])
-                    end
-                end
-            catch e
-                println("  Weight sync error: $e")
-            end
-            last_weight_check = time()
-        end
-
-        # Periodic status
-        if batch_num % 5 == 0
-            try
-                status = server_status(client)
-                if status !== nothing
-                    println("  Server: iter=$(status["iteration"]), buffer=$(status["buffer_size"]), " *
-                            "games=$(status["total_games"]), clients=$(status["total_clients"])")
-                end
-            catch e
-                println("  Status check error: $e")
-            end
-        end
+        # Reset batch
+        batch_samples = []
+        batch_games = 0
+        t_batch_start = time()
         flush(stdout)
     end
 end
