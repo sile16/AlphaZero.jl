@@ -602,6 +602,7 @@ const SERVER_CONFIG = Dict{String, Any}(
     "training_mode" => ARGS["training_mode"],
     "start_positions_file" => ARGS["start_positions_file"],
     "eval_positions_file" => ARGS["eval_positions_file"],
+    "seed" => ARGS["seed"],
 )
 
 # Initialize server state
