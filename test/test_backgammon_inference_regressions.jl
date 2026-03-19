@@ -128,6 +128,36 @@ end
         end
     end
 
+    @testset "shared gpu oracle builder matches canonical routing" begin
+        primary_net = FluxLib.FCResNetMultiHead(
+            gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1))
+        secondary_net = FluxLib.FCResNetMultiHead(
+            gspec, FluxLib.FCResNetMultiHeadHP(width=16, num_blocks=1))
+        routed_cfg = AlphaZero.BackgammonInference.OracleConfig(
+            state_dim, num_actions, gspec;
+            vectorize_state! = BGD.vectorize_state_into!,
+            route_state = s -> iseven(length(GI.available_actions(GI.init(gspec, s)))) ? 2 : 1)
+
+        states = random_decision_states(gspec, 6; seed=29)
+        _, batch_oracle = AlphaZero.BackgammonInference.make_gpu_oracles(
+            primary_net, routed_cfg;
+            secondary_net_gpu=secondary_net,
+            batch_size=4,
+            gpu_array_fn=identity,
+            sync_fn=() -> nothing)
+
+        shared = batch_oracle(states[1:4])
+        @test length(shared) == 4
+        for i in 1:4
+            expected_net = routed_cfg.route_state(states[i]) == 2 ? secondary_net : primary_net
+            p_canon, v_canon = Network.evaluate_batch(expected_net, [states[i]])[1]
+            p_shared, v_shared = shared[i]
+            @test length(p_shared) == length(p_canon)
+            @test maximum(abs.(p_shared .- p_canon)) ≤ 5f-4
+            @test isapprox(v_shared, v_canon; atol=5f-4)
+        end
+    end
+
     @testset "fast oracle safely reuses policy buffers across changing action counts" begin
         contact_net = FluxLib.FCResNetMultiHead(
             gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1))
@@ -171,6 +201,37 @@ end
             @test length(first[1]) == first_len
             @test first[1] == first_policy
         end
+    end
+
+    @testset "shared gpu oracle builder stays consistent under threaded load" begin
+        contact_net = FluxLib.FCResNetMultiHead(
+            gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1))
+        _, batch_oracle = AlphaZero.BackgammonInference.make_gpu_oracles(
+            contact_net, cfg;
+            batch_size=4,
+            gpu_array_fn=identity,
+            sync_fn=() -> nothing)
+        states = random_decision_states(gspec, 24; seed=31)
+
+        failures = Channel{Any}(1)
+        ntasks = max(Threads.nthreads() * 4, 8)
+        Threads.@sync for task_id in 1:ntasks
+            Threads.@spawn begin
+                try
+                    for iter in 1:10
+                        state = states[mod1(task_id + iter, length(states))]
+                        result = batch_oracle([state])[1]
+                        actions = GI.available_actions(GI.init(gspec, state))
+                        @test length(result[1]) == length(actions)
+                        @test isapprox(sum(result[1]), 1.0f0; atol=5f-4)
+                        yield()
+                    end
+                catch err
+                    put!(failures, err)
+                end
+            end
+        end
+        @test !isready(failures)
     end
 
     @testset "shared oracles stay consistent under threaded load" begin

@@ -9,7 +9,7 @@ import BackgammonNet
 
 export OracleConfig, InputBuffers
 export normalize_cpu_backend, resolve_cpu_backend, cpu_backend_summary
-export make_cpu_oracles
+export make_cpu_oracles, make_gpu_oracles
 
 struct OracleConfig{VF, RF}
     state_dim::Int
@@ -54,6 +54,10 @@ struct FastWorkerBuffers
     scratch::OracleScratch
     primary_fast::FastBuffers
     secondary_fast::Union{FastBuffers, Nothing}
+end
+
+struct GpuWorkerBuffers
+    scratch::OracleScratch
 end
 
 function normalize_cpu_backend(name::Union{Symbol, AbstractString})
@@ -158,6 +162,46 @@ function _new_fast_worker_buffers(cfg::OracleConfig, batch_size::Int,
     )
 end
 
+function _new_gpu_worker_buffers(cfg::OracleConfig, batch_size::Int;
+                                 secondary::Bool=false)
+    max_batch = batch_size + 1
+    GpuWorkerBuffers(OracleScratch(cfg.state_dim, cfg.num_actions, max_batch; dual=secondary))
+end
+
+function _task_buffer_resolver(initfn)
+    buffers_lock = ReentrantLock()
+    buffers_by_task = IdDict{Task, Any}()
+
+    function task_buffers()
+        task = current_task()
+        lock(buffers_lock) do
+            return get!(buffers_by_task, task) do
+                initfn()
+            end
+        end
+    end
+
+    return task_buffers
+end
+
+function _forward_gpu!(scratch::OracleScratch, net_gpu,
+                       input::InputBuffers, idxs::Vector{Int}, n::Int,
+                       cfg::OracleConfig, gpu_array_fn, sync_fn, gpu_lock)
+    n == 0 && return
+    local P_cpu, V_cpu
+    X_active = @view(input.X[:, 1:n])
+    A_active = @view(input.A[:, 1:n])
+    lock(gpu_lock) do
+        X_g = gpu_array_fn(X_active)
+        A_g = gpu_array_fn(A_active)
+        result = Network.forward_normalized(net_gpu, X_g, A_g)
+        sync_fn()
+        P_cpu = Array(result[1])
+        V_cpu = Array(result[2])
+    end
+    _store_results!(scratch, idxs, input.A, P_cpu, V_cpu, n, cfg.num_actions)
+end
+
 function make_cpu_oracles(backend::Union{Symbol, AbstractString},
                           primary_net,
                           cfg::OracleConfig;
@@ -214,16 +258,8 @@ function make_cpu_oracles(backend::Union{Symbol, AbstractString},
     end
     primary_width = size(primary_fw.W_in, 1)
     secondary_width = dual ? size(secondary_fw.W_in, 1) : nothing
-    buffers_lock = ReentrantLock()
-    buffers_by_task = IdDict{Task, FastWorkerBuffers}()
-
-    function task_buffers()
-        task = current_task()
-        lock(buffers_lock) do
-            return get!(buffers_by_task, task) do
-                _new_fast_worker_buffers(cfg, batch_size, primary_width; secondary_width)
-            end
-        end
+    task_buffers = _task_buffer_resolver() do
+        _new_fast_worker_buffers(cfg, batch_size, primary_width; secondary_width)
     end
 
     function fast_batch_oracle(states::Vector)
@@ -241,6 +277,38 @@ function make_cpu_oracles(backend::Union{Symbol, AbstractString},
 
     fast_single_oracle(state) = fast_batch_oracle([state])[1]
     return fast_single_oracle, fast_batch_oracle
+end
+
+function make_gpu_oracles(primary_net_gpu,
+                          cfg::OracleConfig;
+                          secondary_net_gpu=nothing,
+                          batch_size::Int,
+                          gpu_array_fn,
+                          sync_fn,
+                          gpu_lock=ReentrantLock(),
+                          nslots::Int=Threads.nthreads())
+    dual = secondary_net_gpu !== nothing
+    task_buffers = _task_buffer_resolver() do
+        _new_gpu_worker_buffers(cfg, batch_size; secondary=dual)
+    end
+
+    function gpu_batch_oracle(states::Vector)
+        n = length(states)
+        n == 0 && return Tuple{Vector{Float32}, Float32}[]
+        worker = task_buffers()
+        scratch = worker.scratch
+        n_primary, n_secondary = _pack_states!(scratch, states, cfg)
+        _forward_gpu!(scratch, primary_net_gpu, scratch.primary_input, scratch.primary_idxs, n_primary,
+                      cfg, gpu_array_fn, sync_fn, gpu_lock)
+        if dual
+            _forward_gpu!(scratch, secondary_net_gpu, scratch.secondary_input, scratch.secondary_idxs, n_secondary,
+                          cfg, gpu_array_fn, sync_fn, gpu_lock)
+        end
+        return @view(scratch.results[1:n])
+    end
+
+    gpu_single_oracle(state) = gpu_batch_oracle([state])[1]
+    return gpu_single_oracle, gpu_batch_oracle
 end
 
 end

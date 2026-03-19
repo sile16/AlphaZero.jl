@@ -459,6 +459,19 @@ else
 end
 const CPU_SINGLE_ORACLE = CPU_ORACLES[1]
 const CPU_BATCH_ORACLE = CPU_ORACLES[2]
+const GPU_ORACLES = if USE_GPU
+    AlphaZero.BackgammonInference.make_gpu_oracles(
+        contact_network_gpu, ORACLE_CFG;
+        secondary_net_gpu=race_network_gpu,
+        batch_size=INFERENCE_BATCH_SIZE,
+        gpu_array_fn=Metal.MtlArray,
+        sync_fn=Metal.synchronize,
+        gpu_lock=GPU_LOCK)
+else
+    nothing
+end
+const GPU_SINGLE_ORACLE = USE_GPU ? GPU_ORACLES[1] : nothing
+const GPU_BATCH_ORACLE = USE_GPU ? GPU_ORACLES[2] : nothing
 
 function refresh_fast_weights!()
     if CPU_INFERENCE_BACKEND == :fast
@@ -766,103 +779,9 @@ end
 function worker_play_games_gpu(worker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
                                 rng::MersenneTwister)
     sub_rng = MersenneTwister(rand(rng, UInt))
-    gpu_array_fn = x -> Metal.MtlArray(x)
-
-    max_batch = INFERENCE_BATCH_SIZE + 1
-    X_buf = zeros(Float32, _state_dim, max_batch)
-    A_buf = zeros(Float32, NUM_ACTIONS, max_batch)
-    _contact_idxs = Vector{Int}(undef, max_batch)
-    _race_idxs = Vector{Int}(undef, max_batch)
-    _results = Vector{Tuple{Vector{Float32}, Float32}}(undef, max_batch)
 
     n_oracle_calls = 0
     n_bearoff_truncated = 0
-
-    function batch_oracle(states::Vector)
-        n = length(states)
-        n == 0 && return Tuple{Vector{Float32}, Float32}[]
-
-        # Split into contact/race
-        n_contact = 0
-        n_race = 0
-        for (i, s) in enumerate(states)
-            is_contact = s isa BackgammonNet.BackgammonGame ? BackgammonNet.is_contact_position(s) : true
-            if is_contact
-                n_contact += 1
-                _contact_idxs[n_contact] = i
-            else
-                n_race += 1
-                _race_idxs[n_race] = i
-            end
-        end
-
-        # Build feature matrices for each model
-        if n_contact > 0
-            X_c = zeros(Float32, _state_dim, n_contact)
-            A_c = zeros(Float32, NUM_ACTIONS, n_contact)
-            for j in 1:n_contact
-                s = states[_contact_idxs[j]]
-                v = GI.vectorize_state(gspec, s)
-                X_c[:, j] .= vec(v)
-                if !BackgammonNet.game_terminated(s)
-                    for a in BackgammonNet.legal_actions(s)
-                        1 <= a <= NUM_ACTIONS && (A_c[a, j] = 1f0)
-                    end
-                end
-            end
-
-            local Pr_c, V_c
-            lock(GPU_LOCK) do
-                X_g = gpu_array_fn(X_c)
-                A_g = gpu_array_fn(A_c)
-                result = Network.forward_normalized(contact_network_gpu, X_g, A_g)
-                Metal.synchronize()
-                Pr_c = Array(result[1])
-                V_c = Array(result[2])
-            end
-
-            A_bool = A_c .> 0
-            for j in 1:n_contact
-                idx = _contact_idxs[j]
-                _results[idx] = (Pr_c[@view(A_bool[:, j]), j], V_c[1, j])
-            end
-        end
-
-        if n_race > 0
-            X_r = zeros(Float32, _state_dim, n_race)
-            A_r = zeros(Float32, NUM_ACTIONS, n_race)
-            for j in 1:n_race
-                s = states[_race_idxs[j]]
-                v = GI.vectorize_state(gspec, s)
-                X_r[:, j] .= vec(v)
-                if !BackgammonNet.game_terminated(s)
-                    for a in BackgammonNet.legal_actions(s)
-                        1 <= a <= NUM_ACTIONS && (A_r[a, j] = 1f0)
-                    end
-                end
-            end
-
-            local Pr_r, V_r
-            lock(GPU_LOCK) do
-                X_g = gpu_array_fn(X_r)
-                A_g = gpu_array_fn(A_r)
-                result = Network.forward_normalized(race_network_gpu, X_g, A_g)
-                Metal.synchronize()
-                Pr_r = Array(result[1])
-                V_r = Array(result[2])
-            end
-
-            A_bool = A_r .> 0
-            for j in 1:n_race
-                idx = _race_idxs[j]
-                _results[idx] = (Pr_r[@view(A_bool[:, j]), j], V_r[1, j])
-            end
-        end
-
-        n_oracle_calls += 1
-        return @view(_results[1:n])
-    end
-    single_oracle(state) = batch_oracle([state])[1]
 
     mcts_params = MctsParams(
         num_iters_per_turn=MCTS_ITERS,
@@ -871,8 +790,8 @@ function worker_play_games_gpu(worker_id::Int, games_claimed::Threads.Atomic{Int
         dirichlet_noise_ϵ=Float64(config["dirichlet_epsilon"]),
         dirichlet_noise_α=Float64(config["dirichlet_alpha"]))
     player = BatchedMCTS.BatchedMctsPlayer(
-        gspec, single_oracle, mcts_params;
-        batch_size=INFERENCE_BATCH_SIZE, batch_oracle=batch_oracle,
+        gspec, GPU_SINGLE_ORACLE, mcts_params;
+        batch_size=INFERENCE_BATCH_SIZE, batch_oracle=GPU_BATCH_ORACLE,
         bearoff_evaluator=BEAROFF_EVALUATOR)
 
     all_samples = []

@@ -168,69 +168,6 @@ end
 
 const GPU_LOCK = ReentrantLock()
 
-function _forward_network_gpu(net_gpu, states, gspec, gpu_array_fn, sync_fn)
-    n = length(states)
-    X = zeros(Float32, _state_dim, n)
-    A = zeros(Float32, NUM_ACTIONS, n)
-    for (i, s) in enumerate(states)
-        v = GI.vectorize_state(gspec, s)
-        X[:, i] .= vec(v)
-        if !BackgammonNet.game_terminated(s)
-            for action in BackgammonNet.legal_actions(s)
-                if 1 <= action <= NUM_ACTIONS
-                    A[action, i] = 1.0f0
-                end
-            end
-        end
-    end
-    local Pr_cpu, V_cpu
-    lock(GPU_LOCK) do
-        X_g = gpu_array_fn(X)
-        A_g = gpu_array_fn(A)
-        result = Network.forward_normalized(net_gpu, X_g, A_g)
-        sync_fn()
-        Pr_cpu = Array(result[1])
-        V_cpu = Array(result[2])
-    end
-    A_bool = A .> 0
-    results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
-    for i in 1:n
-        results[i] = (Pr_cpu[@view(A_bool[:, i]), i], V_cpu[1, i])
-    end
-    return results
-end
-
-function make_gpu_oracles(cn_gpu, rn_gpu, gpu_array_fn, sync_fn)
-    function batch_oracle(states::Vector)
-        n = length(states)
-        n == 0 && return Tuple{Vector{Float32}, Float32}[]
-        if rn_gpu === nothing
-            return _forward_network_gpu(cn_gpu, states, gspec, gpu_array_fn, sync_fn)
-        end
-        contact_states, contact_idxs = eltype(states)[], Int[]
-        race_states, race_idxs = eltype(states)[], Int[]
-        for (i, s) in enumerate(states)
-            if s isa BackgammonNet.BackgammonGame && !BackgammonNet.is_contact_position(s)
-                push!(race_states, s); push!(race_idxs, i)
-            else
-                push!(contact_states, s); push!(contact_idxs, i)
-            end
-        end
-        results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
-        if !isempty(contact_states)
-            cr = _forward_network_gpu(cn_gpu, contact_states, gspec, gpu_array_fn, sync_fn)
-            for (j, idx) in enumerate(contact_idxs); results[idx] = cr[j]; end
-        end
-        if !isempty(race_states)
-            rr = _forward_network_gpu(rn_gpu, race_states, gspec, gpu_array_fn, sync_fn)
-            for (j, idx) in enumerate(race_idxs); results[idx] = rr[j]; end
-        end
-        results
-    end
-    single_oracle(s) = batch_oracle([s])[1]
-    single_oracle, batch_oracle
-end
-
 # ── Raw NN Value (for value error tracking, always CPU) ──────────────────
 
 """Get raw NN value prediction for a position. Returns (value, is_race).
@@ -391,7 +328,13 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
             Metal.synchronize()
             println("  GPU warmed up")
 
-            gpu_single, gpu_batch = make_gpu_oracles(cn_gpu, rn_gpu, Metal.MtlArray, Metal.synchronize)
+            gpu_single, gpu_batch = AlphaZero.BackgammonInference.make_gpu_oracles(
+                cn_gpu, ORACLE_CFG;
+                secondary_net_gpu=rn_gpu,
+                batch_size=batch_size,
+                gpu_array_fn=Metal.MtlArray,
+                sync_fn=Metal.synchronize,
+                gpu_lock=GPU_LOCK)
             gpu_agent = AlphaZeroAgent(gpu_single, gpu_batch, mcts_params, batch_size, gspec)
         end
     end
