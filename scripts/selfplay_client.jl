@@ -460,10 +460,11 @@ end
 const CPU_SINGLE_ORACLE = CPU_ORACLES[1]
 const CPU_BATCH_ORACLE = CPU_ORACLES[2]
 const GPU_ORACLES = if USE_GPU
-    AlphaZero.BackgammonInference.make_gpu_oracles(
+    AlphaZero.BackgammonInference.make_gpu_server_oracles(
         contact_network_gpu, ORACLE_CFG;
         secondary_net_gpu=race_network_gpu,
         batch_size=INFERENCE_BATCH_SIZE,
+        num_workers=GPU_WORKERS,
         gpu_array_fn=Metal.MtlArray,
         sync_fn=Metal.synchronize,
         gpu_lock=GPU_LOCK)
@@ -472,6 +473,7 @@ else
 end
 const GPU_SINGLE_ORACLE = USE_GPU ? GPU_ORACLES[1] : nothing
 const GPU_BATCH_ORACLE = USE_GPU ? GPU_ORACLES[2] : nothing
+const GPU_ORACLE_SERVER = USE_GPU ? GPU_ORACLES[3] : nothing
 
 function refresh_fast_weights!()
     if CPU_INFERENCE_BACKEND == :fast

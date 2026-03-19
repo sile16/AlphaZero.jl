@@ -234,6 +234,44 @@ end
         @test !isready(failures)
     end
 
+    @testset "shared gpu server oracle batches concurrent clients correctly" begin
+        contact_net = FluxLib.FCResNetMultiHead(
+            gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1))
+        _, batch_oracle, server = AlphaZero.BackgammonInference.make_gpu_server_oracles(
+            contact_net, cfg;
+            batch_size=4,
+            num_workers=max(Threads.nthreads(), 2),
+            gpu_array_fn=identity,
+            sync_fn=() -> nothing,
+            max_wait_ns=100_000)
+        states = random_decision_states(gspec, 24; seed=37)
+
+        failures = Channel{Any}(1)
+        ntasks = max(Threads.nthreads() * 4, 8)
+        Threads.@sync for task_id in 1:ntasks
+            Threads.@spawn begin
+                try
+                    for iter in 1:5
+                        s1 = states[mod1(task_id + iter, length(states))]
+                        s2 = states[mod1(task_id + iter + 7, length(states))]
+                        results = batch_oracle([s1, s2])
+                        @test length(results) == 2
+                        for (state, result) in zip((s1, s2), results)
+                            actions = GI.available_actions(GI.init(gspec, state))
+                            @test length(result[1]) == length(actions)
+                            @test isapprox(sum(result[1]), 1.0f0; atol=5f-4)
+                        end
+                        yield()
+                    end
+                catch err
+                    put!(failures, err)
+                end
+            end
+        end
+        @test !isready(failures)
+        close(server)
+    end
+
     @testset "shared oracles stay consistent under threaded load" begin
         contact_net = FluxLib.FCResNetMultiHead(
             gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1))

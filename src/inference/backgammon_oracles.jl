@@ -9,7 +9,7 @@ import BackgammonNet
 
 export OracleConfig, InputBuffers
 export normalize_cpu_backend, resolve_cpu_backend, cpu_backend_summary
-export make_cpu_oracles, make_gpu_oracles
+export make_cpu_oracles, make_gpu_oracles, make_gpu_server_oracles
 
 struct OracleConfig{VF, RF}
     state_dim::Int
@@ -58,6 +58,16 @@ end
 
 struct GpuWorkerBuffers
     scratch::OracleScratch
+end
+
+struct GpuOracleRequest
+    states::Vector
+    answer_channel::Channel{Vector{Tuple{Vector{Float32}, Float32}}}
+end
+
+struct GpuOracleServer
+    request_channel::Channel{GpuOracleRequest}
+    task::Task
 end
 
 function normalize_cpu_backend(name::Union{Symbol, AbstractString})
@@ -202,6 +212,100 @@ function _forward_gpu!(scratch::OracleScratch, net_gpu,
     _store_results!(scratch, idxs, input.A, P_cpu, V_cpu, n, cfg.num_actions)
 end
 
+function _gpu_server_loop!(server_scratch::OracleScratch, request_channel::Channel{GpuOracleRequest},
+                           primary_net_gpu, secondary_net_gpu, cfg::OracleConfig,
+                           max_batch_size::Int, max_wait_ns::Int,
+                           gpu_array_fn, sync_fn, gpu_lock)
+    dual = secondary_net_gpu !== nothing
+    pending = GpuOracleRequest[]
+
+    while true
+        while isready(request_channel)
+            try
+                push!(pending, take!(request_channel))
+            catch err
+                err isa InvalidStateException || rethrow()
+                break
+            end
+        end
+
+        if isempty(pending)
+            if !isopen(request_channel)
+                break
+            end
+            try
+                push!(pending, take!(request_channel))
+            catch err
+                if err isa InvalidStateException
+                    break
+                end
+                rethrow()
+            end
+        end
+
+        t0 = time_ns()
+        total_states = sum(length(req.states) for req in pending)
+        while total_states < max_batch_size && isopen(request_channel)
+            if isready(request_channel)
+                try
+                    req = take!(request_channel)
+                    push!(pending, req)
+                    total_states += length(req.states)
+                catch err
+                    err isa InvalidStateException || rethrow()
+                    break
+                end
+            elseif time_ns() - t0 >= max_wait_ns
+                break
+            else
+                yield()
+            end
+        end
+
+        isempty(pending) && continue
+
+        used = 0
+        nreq = 0
+        while nreq < length(pending)
+            next_count = length(pending[nreq + 1].states)
+            if nreq > 0 && used + next_count > max_batch_size
+                break
+            end
+            nreq += 1
+            used += next_count
+        end
+
+        batch_requests = pending[1:nreq]
+        deleteat!(pending, 1:nreq)
+
+        first_states = batch_requests[1].states
+        combined_states = Vector{eltype(first_states)}(undef, used)
+        offsets = Vector{Int}(undef, nreq + 1)
+        offsets[1] = 1
+        pos = 1
+        for i in 1:nreq
+            states_i = batch_requests[i].states
+            copyto!(combined_states, pos, states_i, 1, length(states_i))
+            pos += length(states_i)
+            offsets[i + 1] = pos
+        end
+
+        n_primary, n_secondary = _pack_states!(server_scratch, combined_states, cfg)
+        _forward_gpu!(server_scratch, primary_net_gpu, server_scratch.primary_input, server_scratch.primary_idxs, n_primary,
+                      cfg, gpu_array_fn, sync_fn, gpu_lock)
+        if dual
+            _forward_gpu!(server_scratch, secondary_net_gpu, server_scratch.secondary_input, server_scratch.secondary_idxs, n_secondary,
+                          cfg, gpu_array_fn, sync_fn, gpu_lock)
+        end
+
+        for i in 1:nreq
+            lo = offsets[i]
+            hi = offsets[i + 1] - 1
+            put!(batch_requests[i].answer_channel, copy(server_scratch.results[lo:hi]))
+        end
+    end
+end
+
 function make_cpu_oracles(backend::Union{Symbol, AbstractString},
                           primary_net,
                           cfg::OracleConfig;
@@ -309,6 +413,43 @@ function make_gpu_oracles(primary_net_gpu,
 
     gpu_single_oracle(state) = gpu_batch_oracle([state])[1]
     return gpu_single_oracle, gpu_batch_oracle
+end
+
+function make_gpu_server_oracles(primary_net_gpu,
+                                 cfg::OracleConfig;
+                                 secondary_net_gpu=nothing,
+                                 batch_size::Int,
+                                 num_workers::Int,
+                                 gpu_array_fn,
+                                 sync_fn,
+                                 gpu_lock=ReentrantLock(),
+                                 max_wait_ns::Int=1_000_000)
+    dual = secondary_net_gpu !== nothing
+    max_batch_size = max(batch_size, batch_size * max(num_workers, 1))
+    server_buffers = _new_gpu_worker_buffers(cfg, max_batch_size; secondary=dual)
+    request_channel = Channel{GpuOracleRequest}(max(num_workers * 2, 1))
+    server_task = Threads.@spawn _gpu_server_loop!(
+        server_buffers.scratch, request_channel,
+        primary_net_gpu, secondary_net_gpu, cfg,
+        max_batch_size, max_wait_ns,
+        gpu_array_fn, sync_fn, gpu_lock)
+    server = GpuOracleServer(request_channel, server_task)
+
+    function gpu_batch_oracle(states::Vector)
+        isempty(states) && return Tuple{Vector{Float32}, Float32}[]
+        answer_channel = Channel{Vector{Tuple{Vector{Float32}, Float32}}}(1)
+        put!(request_channel, GpuOracleRequest(states, answer_channel))
+        return take!(answer_channel)
+    end
+
+    gpu_single_oracle(state) = gpu_batch_oracle([state])[1]
+    return gpu_single_oracle, gpu_batch_oracle, server
+end
+
+function Base.close(server::GpuOracleServer)
+    close(server.request_channel)
+    wait(server.task)
+    return nothing
 end
 
 end

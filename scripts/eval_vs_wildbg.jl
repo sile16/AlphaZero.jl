@@ -312,6 +312,7 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
 
     # Create GPU oracles and agent (if requested and available)
     gpu_agent = nothing
+    gpu_server = nothing
     if gpu_workers > 0
         if !HAS_METAL
             println("  WARNING: --gpu-workers=$gpu_workers but Metal.jl not available, using CPU only")
@@ -328,10 +329,11 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
             Metal.synchronize()
             println("  GPU warmed up")
 
-            gpu_single, gpu_batch = AlphaZero.BackgammonInference.make_gpu_oracles(
+            gpu_single, gpu_batch, gpu_server = AlphaZero.BackgammonInference.make_gpu_server_oracles(
                 cn_gpu, ORACLE_CFG;
                 secondary_net_gpu=rn_gpu,
                 batch_size=batch_size,
+                num_workers=gpu_workers,
                 gpu_array_fn=Metal.MtlArray,
                 sync_fn=Metal.synchronize,
                 gpu_lock=GPU_LOCK)
@@ -401,6 +403,7 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
     for wa in wildbg_agents
         BackgammonNet.close(wa.backend)
     end
+    gpu_agent !== nothing && close(gpu_server)
 
     # Aggregate game results
     white_avg = mean(white_rewards)
