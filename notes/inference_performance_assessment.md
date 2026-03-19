@@ -812,6 +812,33 @@ the MCTS action-contract fixes.
 
 ---
 
+## Legacy Checkpoint Spot-Check
+
+To estimate whether the old state-aliasing issue may have distorted our view of
+earlier training runs, we re-ran a small set of older 128w×3b checkpoints under
+the fixed code (`8 workers`, `100 MCTS`, `10 games/side`).
+
+| Session | Backend | Outcome | Combined Equity | Games/min | Note |
+|---|---|---|---:|---:|---|
+| `20260206_baseline_v2_50iter` | `fast` | failed | NA | NA | `Oracle policy/action mismatch` |
+| `20260206_baseline_v2_50iter` | `flux` | passed | -2.100 | 181.9 | usable control run |
+| `20260206_baseline_50iter` | `fast` | passed | -1.950 | 200.6 | completed cleanly |
+| `20260207_per_50iter` | `fast` | passed | -1.950 | 205.2 | completed cleanly |
+
+### Legacy Takeaway
+
+- We do **not** have evidence that all old checkpoints are invalid under the
+  fixed code.
+- But we also do **not** have evidence that all old checkpoints are cleanly
+  comparable under the current `fast` eval path.
+- At least one early checkpoint (`baseline_v2_50iter`) still reproduces the
+  remaining `fast` contract failure, while nearby checkpoints do not.
+- That means the old v1-v5-era question should be treated cautiously:
+  the unsafe optimization was present in that era, but its practical impact was
+  likely **checkpoint-dependent**, not uniformly catastrophic.
+
+---
+
 ## Appendix: Reproduction Commands
 
 ```bash
