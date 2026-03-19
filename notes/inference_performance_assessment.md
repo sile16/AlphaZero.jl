@@ -849,11 +849,37 @@ backend layer:
   - `flux`: `6.11 s`, `117.9 games/min`
   - `fast` advantage: `1.45x`
 
+### Neo Mixed CPU+GPU Eval Matrix
+
+After introducing the shared GPU inference server, we ran a small production
+eval matrix on Neo (`50 MCTS`, `batch=16`, `2 games/side`) to check whether
+mixed CPU+GPU workers actually beat CPU-only throughput yet.
+
+| CPU | GPU | Time (s) | Games/min |
+|---:|---:|---:|---:|
+| 1 | 0 | 5.66 | 42.4 |
+| 2 | 0 | 4.89 | 49.1 |
+| 4 | 0 | 4.81 | 49.9 |
+| 1 | 1 | 49.67 | 4.8 |
+| 2 | 2 | 33.07 | 7.3 |
+| 4 | 2 | 46.78 | 5.1 |
+
+Result:
+
+- The new server path is correct, but it is **not yet a throughput win**.
+- At these representative small-batch eval settings, every mixed CPU+GPU
+  configuration was much slower than CPU-only `fast`.
+- That means the remaining bottleneck is not worker orchestration anymore, but
+  per-batch GPU overhead: host packing, `MtlArray(...)` creation, sync, and
+  result copies back to CPU.
+
 ### Takeaway
 
 - The other engineer's `threadid()` race diagnosis was correct.
 - After fixing task ownership of scratch buffers, `fast` is the best validated
   CPU backend on both machines for both eval and self-play.
+- The shared GPU server is the right architecture direction, but the current
+  Metal implementation still does not justify mixed CPU+GPU production use.
 - Current practical default:
   - Neo eval: `fast`
   - Neo self-play: `fast`
