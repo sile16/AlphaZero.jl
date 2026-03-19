@@ -73,6 +73,10 @@ using StaticArrays
 # BackgammonNet
 using BackgammonNet
 
+# FastWeights for thread-safe, allocation-free CPU inference
+include(joinpath(@__DIR__, "..", "src", "inference", "fast_weights.jl"))
+using .FastInference
+
 # Set up game
 ENV["BACKGAMMON_OBS_TYPE"] = ARGS["obs_type"]
 include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
@@ -125,10 +129,76 @@ function _forward_network(net, states, gspec)
     return results
 end
 
+# ── FastWeights Forward ─────────────────────────────────────────────────
+
+struct FastInputBuffers
+    X::Matrix{Float32}
+    A::Matrix{Float32}
+end
+
+FastInputBuffers(max_batch::Int) =
+    FastInputBuffers(zeros(Float32, _state_dim, max_batch), zeros(Float32, NUM_ACTIONS, max_batch))
+
+function _forward_network_fast(fw::FastWeights, fb::FastBuffers, fib::FastInputBuffers,
+                                states, gspec)
+    n = length(states)
+    X = fib.X
+    A = fib.A
+    fill!(@view(A[:, 1:n]), 0.0f0)
+    for (i, s) in enumerate(states)
+        v = GI.vectorize_state(gspec, s)
+        X[:, i] .= vec(v)
+        if !BackgammonNet.game_terminated(s)
+            for action in BackgammonNet.legal_actions(s)
+                if 1 <= action <= NUM_ACTIONS
+                    A[action, i] = 1.0f0
+                end
+            end
+        end
+    end
+    P, V, _ = fast_forward_normalized!(fw, fb, X, A, n)
+    results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
+    for i in 1:n
+        legal = Vector{Float32}()
+        for a in 1:NUM_ACTIONS
+            if A[a, i] > 0.0f0
+                push!(legal, P[a, i])
+            end
+        end
+        results[i] = (legal, V[i])
+    end
+    return results
+end
+
 # ── Oracle ──────────────────────────────────────────────────────────────
 
 function make_oracles(net)
     batch_oracle(states::Vector) = _forward_network(net, states, gspec)
+    single_oracle(s) = batch_oracle([s])[1]
+    return single_oracle, batch_oracle
+end
+
+function make_fast_oracles(fw::FastWeights, width::Int, batch_size::Int)
+    max_batch = batch_size + 1
+    bufs = Dict{UInt64, Tuple{FastBuffers, FastInputBuffers}}()
+    bufs_lock = ReentrantLock()
+
+    function get_bufs()
+        tid = objectid(current_task())
+        lock(bufs_lock) do
+            if !haskey(bufs, tid)
+                bufs[tid] = (FastBuffers(width, NUM_ACTIONS, max_batch), FastInputBuffers(max_batch))
+            end
+            return bufs[tid]
+        end
+    end
+
+    function batch_oracle(states::Vector)
+        n = length(states)
+        n == 0 && return Tuple{Vector{Float32}, Float32}[]
+        fb, fib = get_bufs()
+        return _forward_network_fast(fw, fb, fib, states, gspec)
+    end
     single_oracle(s) = batch_oracle([s])[1]
     return single_oracle, batch_oracle
 end
@@ -257,6 +327,10 @@ function main()
     FluxLib.load_weights(checkpoint, network)
     network = Flux.cpu(network)
 
+    # Extract FastWeights for thread-safe CPU inference (27x faster than Flux multi-threaded)
+    fw = extract_fast_weights(network)
+    println("Using FastWeights inference (thread-safe, no BLAS contention)")
+
     mcts_params = MctsParams(
         num_iters_per_turn=mcts_iters,
         cpuct=1.5,
@@ -264,7 +338,7 @@ function main()
         dirichlet_noise_ϵ=0.0,
         dirichlet_noise_α=1.0)
 
-    single_oracle, batch_oracle = make_oracles(network)
+    single_oracle, batch_oracle = make_fast_oracles(fw, width, batch_size)
     agent = AlphaZeroAgent(single_oracle, batch_oracle, mcts_params, batch_size, gspec)
 
     # Wildbg setup
