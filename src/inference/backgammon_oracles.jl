@@ -38,7 +38,6 @@ struct OracleScratch
     secondary_input::Union{InputBuffers, Nothing}
     primary_idxs::Vector{Int}
     secondary_idxs::Vector{Int}
-    policy_bufs::Vector{Vector{Float32}}
     results::Vector{Tuple{Vector{Float32}, Float32}}
 end
 
@@ -48,7 +47,6 @@ function OracleScratch(state_dim::Int, num_actions::Int, max_batch::Int; dual::B
         dual ? InputBuffers(state_dim, num_actions, max_batch) : nothing,
         Vector{Int}(undef, max_batch),
         Vector{Int}(undef, max_batch),
-        [Vector{Float32}(undef, num_actions) for _ in 1:max_batch],
         Vector{Tuple{Vector{Float32}, Float32}}(undef, max_batch))
 end
 
@@ -81,20 +79,17 @@ function cpu_backend_summary(backend::Union{Symbol, AbstractString})
     end
 end
 
-function _worker_slot(buffers)
-    return min(threadid(), length(buffers))
-end
-
 function _populate_column!(cfg::OracleConfig, X::Matrix{Float32}, A::Matrix{Float32}, col::Int, state)
+    actions = Int[]
+    if !BackgammonNet.game_terminated(state) && !BackgammonNet.is_chance_node(state)
+        actions = GI.available_actions(GI.init(cfg.gspec, state))
+    end
     cfg.vectorize_state!(@view(X[:, col]), cfg.gspec, state)
     a_col = @view(A[:, col])
     fill!(a_col, 0.0f0)
-    if !BackgammonNet.game_terminated(state) && !BackgammonNet.is_chance_node(state)
-        actions = GI.available_actions(GI.init(cfg.gspec, state))
-        @inbounds for action in actions
-            if 1 <= action <= cfg.num_actions
-                a_col[action] = 1.0f0
-            end
+    @inbounds for action in actions
+        if 1 <= action <= cfg.num_actions
+            a_col[action] = 1.0f0
         end
     end
 end
@@ -126,7 +121,13 @@ function _store_results!(scratch::OracleScratch, idxs::Vector{Int}, A::Matrix{Fl
                          P::AbstractMatrix, V, n::Int, num_actions::Int)
     @inbounds for j in 1:n
         idx = idxs[j]
-        pv = scratch.policy_bufs[idx]
+        k = 0
+        for a in 1:num_actions
+            if A[a, j] > 0.0f0
+                k += 1
+            end
+        end
+        pv = Vector{Float32}(undef, k)
         k = 0
         for a in 1:num_actions
             if A[a, j] > 0.0f0
@@ -134,7 +135,6 @@ function _store_results!(scratch::OracleScratch, idxs::Vector{Int}, A::Matrix{Fl
                 pv[k] = P[a, j]
             end
         end
-        resize!(pv, k)
         v = V isa AbstractVector ? V[j] : V[1, j]
         scratch.results[idx] = (pv, v)
     end
@@ -147,15 +147,15 @@ function _forward_fast!(scratch::OracleScratch, fw::FastWeights, fb::FastBuffers
     _store_results!(scratch, idxs, input.A, P, V, n, cfg.num_actions)
 end
 
-function _make_fast_buffers(cfg::OracleConfig, batch_size::Int, nslots::Int,
-                            primary_width::Int; secondary_width::Union{Int, Nothing}=nothing)
+function _new_fast_worker_buffers(cfg::OracleConfig, batch_size::Int,
+                                  primary_width::Int; secondary_width::Union{Int, Nothing}=nothing)
     max_batch = batch_size + 1
     dual = secondary_width !== nothing
-    [FastWorkerBuffers(
+    FastWorkerBuffers(
         OracleScratch(cfg.state_dim, cfg.num_actions, max_batch; dual),
         FastBuffers(primary_width, cfg.num_actions, max_batch),
         dual ? FastBuffers(secondary_width, cfg.num_actions, max_batch) : nothing
-    ) for _ in 1:nslots]
+    )
 end
 
 function make_cpu_oracles(backend::Union{Symbol, AbstractString},
@@ -214,12 +214,22 @@ function make_cpu_oracles(backend::Union{Symbol, AbstractString},
     end
     primary_width = size(primary_fw.W_in, 1)
     secondary_width = dual ? size(secondary_fw.W_in, 1) : nothing
-    buffers = _make_fast_buffers(cfg, batch_size, nslots, primary_width; secondary_width)
+    buffers_lock = ReentrantLock()
+    buffers_by_task = IdDict{Task, FastWorkerBuffers}()
+
+    function task_buffers()
+        task = current_task()
+        lock(buffers_lock) do
+            return get!(buffers_by_task, task) do
+                _new_fast_worker_buffers(cfg, batch_size, primary_width; secondary_width)
+            end
+        end
+    end
 
     function fast_batch_oracle(states::Vector)
         n = length(states)
         n == 0 && return Tuple{Vector{Float32}, Float32}[]
-        worker = buffers[_worker_slot(buffers)]
+        worker = task_buffers()
         scratch = worker.scratch
         n_primary, n_secondary = _pack_states!(scratch, states, cfg)
         _forward_fast!(scratch, primary_fw, worker.primary_fast, scratch.primary_input, scratch.primary_idxs, n_primary, cfg)

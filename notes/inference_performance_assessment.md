@@ -652,8 +652,8 @@ machines.
 - Jarvis raw GEMM / raw oracle benchmarks and older notes suggested MKL/BLAS
   might be best on x86. The current production-path data does not support using
   that as the default.
-- The Jarvis eval `Flux/BLAS` failure at 14 workers should still be investigated,
-  because it may indicate a batching or traversal bug triggered under that path.
+- The old `fast` eval mismatches were real correctness bugs in the shared
+  scratch path, not harmless timing noise.
 - Apple-specific SIMD work remains the most promising next CPU optimization.
 
 ## 13. Lessons Learned
@@ -697,7 +697,16 @@ raw kernel speed:
 - That likely distorted both speed and stress behavior.
 - Reusing buffers is good, but only if the active slice is explicit everywhere.
 
-### 6. Assertions pay for themselves
+### 6. Thread-local is not task-local in modern Julia
+
+- The shared `fast` oracle originally keyed scratch buffers by `threadid()`.
+- In Julia 1.9+, multiple runnable tasks can share a thread, and a task can
+  yield while still "owning" a logical worker.
+- That made `threadid()` an unsafe key for mutable scratch state and produced
+  policy/action mismatches like `23 vs 21` and `8 vs 19`.
+- The fix was to give each concurrent task its own `FastWorkerBuffers`.
+
+### 7. Assertions pay for themselves
 
 - Adding `length(P) == length(actions)` in `init_state_info` turned an obscure
   `BoundsError` deep in traversal into an immediate, actionable contract failure.
@@ -781,34 +790,77 @@ This is especially important for batched MCTS plus pooled state reuse.
 
 ---
 
-## Jarvis Revalidation Matrix
+## Post-Fix Backend Revalidation
 
-These runs were done on the synced Jarvis repo after the backend refactor and
-the MCTS action-contract fixes.
+The remaining `fast` mismatch was traced to the shared oracle scratch path:
 
-### Eval vs Wildbg
+- reused policy vectors could be mutated by later calls
+- scratch buffers were keyed by `threadid()`, which is not safe ownership for
+  concurrent Julia tasks
+- a `num_workers=1` run passed cleanly, while multi-worker runs reproduced the
+  failure, which strongly supported the concurrency diagnosis
 
-- `fast` at `14 workers`, `100 MCTS`, `batch=50`, `20 games/side`: failed with
-  `Oracle policy/action mismatch: length(P)=19 length(actions)=10`
-- `flux` at the same settings: completed in `19.07 s` for `40 games`
-  (`125.9 games/min`)
+The fix set was:
 
-### Self-play
+- return owning policy vectors from `fast` oracle results
+- replace `threadid()` scratch ownership with per-task scratch ownership
+- add regressions for cross-call policy mutation and many-tasks-per-thread load
 
-- `fast` at `8 workers`, `400 MCTS`, `batch=50`, `20 games`: completed in
-  `18.06 s` (`66.4 games/min`)
-- `flux` at the same settings: completed in `28.20 s` (`42.5 games/min`)
+### Neo Eval vs Wildbg
+
+Representative run:
+
+- `fast`, `8 workers`, `100 MCTS`, `batch=50`, `10 games/side`:
+  `5.59 s`, `214.7 games/min`
+- `flux`, same settings:
+  `9.23 s`, `130.1 games/min`
+
+Result:
+
+- `fast` is `1.65x` faster than `flux` on the production eval path after the
+  concurrency fix
+
+### Jarvis Eval vs Wildbg
+
+Representative run:
+
+- `fast`, `14 workers`, `100 MCTS`, `batch=50`, `20 games/side`:
+  `11.07 s`, `216.8 games/min`
+- `flux`, same settings:
+  `13.92 s`, `172.4 games/min`
+
+Result:
+
+- `fast` is `1.26x` faster than `flux` on the production eval path after the
+  concurrency fix
+
+### Self-play Benchmark
+
+Shared benchmark script (`scripts/bench_selfplay_backends.jl`) using the same
+backend layer:
+
+- Neo, `8 workers`, `100 MCTS`, `batch=50`, `12 games`
+  - `fast`: `4.46 s`, `161.4 games/min`
+  - `flux`: `16.42 s`, `43.9 games/min`
+  - `fast` advantage: `3.68x`
+
+- Jarvis, `14 workers`, `100 MCTS`, `batch=50`, `12 games`
+  - `fast`: `4.21 s`, `171.0 games/min`
+  - `flux`: `6.11 s`, `117.9 games/min`
+  - `fast` advantage: `1.45x`
 
 ### Takeaway
 
-- Jarvis eval is currently production-safe on `flux`, not `fast`
-- Jarvis self-play is currently production-fastest on `fast`
-- the remaining `fast` eval failure is a real contract bug, not a timing-only
-  measurement artifact, because it reproduces in the production path at the
-  representative 14-worker setting
-- we should keep both backends available, but select by workload on Jarvis:
-  `flux` for eval, `fast` for self-play, until the remaining `fast` mismatch is
-  eliminated
+- The other engineer's `threadid()` race diagnosis was correct.
+- After fixing task ownership of scratch buffers, `fast` is the best validated
+  CPU backend on both machines for both eval and self-play.
+- Current practical default:
+  - Neo eval: `fast`
+  - Neo self-play: `fast`
+  - Jarvis eval: `fast`
+  - Jarvis self-play: `fast`
+- Backend-selection policy should stay unified unless a future benchmark with
+  the corrected code clearly overturns these results.
 
 ---
 

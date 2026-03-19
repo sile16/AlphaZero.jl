@@ -128,6 +128,51 @@ end
         end
     end
 
+    @testset "fast oracle safely reuses policy buffers across changing action counts" begin
+        contact_net = FluxLib.FCResNetMultiHead(
+            gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1))
+        _, batch_oracle = AlphaZero.BackgammonInference.make_cpu_oracles(
+            :fast, contact_net, cfg;
+            batch_size=4, nslots=max(Threads.nthreads(), 1))
+
+        states = random_decision_states(gspec, 24; seed=11)
+        counts = [length(GI.available_actions(GI.init(gspec, s))) for s in states]
+        order = sortperm(counts)
+        probe_states = [states[order[1]], states[order[end]], states[order[2]], states[order[end-1]]]
+
+        for _ in 1:20
+            for s in probe_states
+                result = batch_oracle([s])[1]
+                @test length(result[1]) == length(GI.available_actions(GI.init(gspec, s)))
+                @test isapprox(sum(result[1]), 1.0f0; atol=5f-4)
+            end
+        end
+    end
+
+    @testset "fast oracle returns owning policy vectors across calls" begin
+        contact_net = FluxLib.FCResNetMultiHead(
+            gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1))
+        _, batch_oracle = AlphaZero.BackgammonInference.make_cpu_oracles(
+            :fast, contact_net, cfg;
+            batch_size=4, nslots=max(Threads.nthreads(), 1))
+
+        states = random_decision_states(gspec, 16; seed=19)
+        counts = [length(GI.available_actions(GI.init(gspec, s))) for s in states]
+        order = sortperm(counts)
+        low_state = states[order[1]]
+        high_state = states[order[end]]
+
+        first = batch_oracle([low_state])[1]
+        first_policy = copy(first[1])
+        first_len = length(first[1])
+
+        for _ in 1:20
+            batch_oracle([high_state])
+            @test length(first[1]) == first_len
+            @test first[1] == first_policy
+        end
+    end
+
     @testset "shared oracles stay consistent under threaded load" begin
         contact_net = FluxLib.FCResNetMultiHead(
             gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1))
@@ -161,6 +206,35 @@ end
             end
             @test !isready(failures)
         end
+    end
+
+    @testset "fast oracle stays consistent with many tasks sharing threads" begin
+        contact_net = FluxLib.FCResNetMultiHead(
+            gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1))
+        _, batch_oracle = AlphaZero.BackgammonInference.make_cpu_oracles(
+            :fast, contact_net, cfg;
+            batch_size=4, nslots=max(Threads.nthreads(), 1))
+        states = random_decision_states(gspec, 32; seed=23)
+
+        failures = Channel{Any}(1)
+        ntasks = max(Threads.nthreads() * 4, 8)
+        Threads.@sync for task_id in 1:ntasks
+            Threads.@spawn begin
+                try
+                    for iter in 1:10
+                        state = states[mod1(task_id + iter, length(states))]
+                        result = batch_oracle([state])[1]
+                        actions = GI.available_actions(GI.init(gspec, state))
+                        @test length(result[1]) == length(actions)
+                        @test isapprox(sum(result[1]), 1.0f0; atol=5f-4)
+                        yield()
+                    end
+                catch err
+                    put!(failures, err)
+                end
+            end
+        end
+        @test !isready(failures)
     end
 
     @testset "BatchedMCTS stays consistent for both backends" begin

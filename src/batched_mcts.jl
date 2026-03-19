@@ -324,6 +324,10 @@ function batch_evaluate_pending!(benv::BatchedEnv{S}) where S
     for (i, result_idx) in enumerate(eval_indices)
         sim = benv.pending[result_idx]
         P, V = results[i]
+        if length(P) != length(sim.leaf_actions)
+            recomputed_actions = GI.available_actions(GI.init(env.gspec, sim.leaf_state))
+            error("Oracle policy/action mismatch: length(P)=$(length(P)) length(actions)=$(length(sim.leaf_actions)) length(recomputed)=$(length(recomputed_actions)) same_actions=$(sim.leaf_actions == recomputed_actions) state=$(sim.leaf_state)")
+        end
         info = MCTS.init_state_info(P, V, env.prior_temperature, sim.leaf_actions)
         env.tree[sim.leaf_state] = info
         sim.terminal_value = V  # Store for backpropagation
