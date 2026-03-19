@@ -917,6 +917,77 @@ the fixed code (`8 workers`, `100 MCTS`, `10 games/side`).
 
 ---
 
+## Current State
+
+### Validated defaults
+
+- Neo eval: CPU `fast`
+- Neo self-play: CPU `fast`
+- Jarvis eval: CPU `fast`
+- Jarvis self-play: CPU `fast`
+
+### What is now considered correct
+
+- `fast` scratch ownership is task-local, not `threadid()`-local
+- `fast` returns owning policy vectors
+- shared CPU inference for eval and self-play is routed through
+  `src/inference/backgammon_oracles.jl`
+- shared GPU inference for eval and self-play is also routed through
+  `src/inference/backgammon_oracles.jl`
+- hard oracle/action invariant checks stay enabled in MCTS integration points
+
+### Lessons learned to preserve
+
+- correctness bugs in inference plumbing can easily look like backend or
+  architecture effects
+- raw kernel benchmarks are useful diagnostics, but end-to-end eval/self-play
+  must decide production backend policy
+- `threadid()` is not a safe ownership key for mutable scratch state in modern
+  Julia task-heavy code
+- any optimization that aliases mutable game state or reuses result buffers must
+  be treated as unsafe until covered by explicit regression tests
+- script-local experimental paths tend to drift; shared backend layers are much
+  easier to verify and maintain
+
+### Outstanding TODOs
+
+1. Apple CPU SIMD work:
+   improve `_gemm_bias!` in `src/inference/fast_weights.jl` with Apple-focused
+   vectorization / blocking. This is still the most plausible next CPU win.
+
+2. Neo GPU server internals:
+   keep the new shared GPU server architecture, but remove the remaining per-batch
+   overheads:
+   persistent host buffers, persistent Metal arrays, less copying, and tuned
+   server wait/batch thresholds.
+
+3. Neo mixed CPU+GPU benchmark follow-up:
+   rerun with larger effective GPU batches after the above buffer work. The
+   current shared server is correct but not yet faster than CPU-only `fast`.
+
+4. Legacy checkpoint cleanup:
+   recheck the remaining failing legacy checkpoint(s), especially
+   `20260206_baseline_v2_50iter`, to determine whether any old-session results
+   need qualification or archival notes.
+
+5. Archive obsolete experiments:
+   now that the shared inference layer is established, move superseded
+   script-local inference experiments and notes into an archive bucket once we
+   confirm nothing still depends on them.
+
+6. Optional future fallback:
+   ONNX Runtime / CoreML remains a possible future path, but only after the
+   current shared CPU and GPU implementations are pushed further.
+
+### Practical recommendation
+
+- Do not use mixed CPU+GPU on Neo in production yet.
+- Keep production on CPU `fast` for both Neo and Jarvis.
+- Treat the GPU server as an optimization branch that still needs lower-level
+  Metal buffer work before it can compete on games/min.
+
+---
+
 ## Appendix: Reproduction Commands
 
 ```bash
