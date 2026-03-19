@@ -1,6 +1,18 @@
 # Bear-off Table: Chance Node Issue (FIXED)
 
-**Status**: Fixed — game wrapper now exposes chance nodes, MCTS uses bear-off table at pre-dice chance nodes.
+**Status**: Fixed — MCTS and training targets now use exact post-dice values via move enumeration (Option B).
+
+## Fix (2026-03-19)
+
+Implemented Option B: post-dice move enumeration in `scripts/selfplay_client.jl`:
+
+1. **MCTS evaluator** (`make_bearoff_evaluator`): At chance nodes, returns pre-dice table value (exact). At decision nodes, enumerates all legal moves, looks up each resulting position in the table, returns the max value. All values properly converted to white-relative.
+
+2. **Training targets** (`bearoff_post_dice_equity`): Same move enumeration for per-position bear-off targets in `convert_trace_to_samples`. Returns white-relative (value, equity) tuple.
+
+3. **Perspective bug fix**: The original evaluator returned mover-relative values from `BearoffK6.compute_equity()` but batched_mcts.jl treated them as white-relative. Fixed by explicitly converting mover-relative → white-relative in the evaluator.
+
+4. **Thread safety**: Each evaluator call allocates a fresh game clone for move enumeration (cheap — just field copies + buffer alloc). No shared mutable state across threads.
 
 ## The Problem (historical)
 

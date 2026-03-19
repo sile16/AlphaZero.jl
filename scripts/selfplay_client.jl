@@ -225,7 +225,7 @@ const BEAROFF_TABLE = let
     t
 end
 
-"""Look up exact bear-off equity from precomputed table."""
+"""Look up exact bear-off equity from precomputed table (pre-dice, valid at chance nodes)."""
 function bearoff_table_equity(game::BackgammonNet.BackgammonGame)
     r = BearoffK6.lookup(BEAROFF_TABLE, game)
     eq = Float32[r.p_win, r.p_gammon_win, r.p_bg_win, r.p_gammon_loss, r.p_bg_loss]
@@ -233,15 +233,153 @@ function bearoff_table_equity(game::BackgammonNet.BackgammonGame)
     return (value=value, equity=eq)
 end
 
-"""Create bear-off evaluator for MCTS (used at both chance and decision node leaves)."""
+"""
+Compute exact post-dice bear-off value via move enumeration.
+
+At a decision node (specific dice rolled), enumerate all legal moves, look up each
+resulting position in the bear-off table, and return the best (max) value.
+This gives the exact Q(board, dice) = max_move V(result(board, dice, move)),
+where V is the opponent's pre-dice table value (negated for perspective flip).
+
+Returns (value, equity) where value is white-relative scalar equity and
+equity is the 5-element probability vector, or nothing if not a bear-off position.
+"""
+function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
+    if !BearoffK6.is_bearoff_position(game.p0, game.p1)
+        return nothing
+    end
+    if BackgammonNet.is_chance_node(game)
+        # Pre-dice: table value is exact. lookup() returns mover-relative;
+        # convert to white-relative for consistency with the function's contract.
+        r = BearoffK6.lookup(table, game)
+        mover_val = BearoffK6.compute_equity(r)
+        mover_eq = Float32[r.p_win, r.p_gammon_win, r.p_bg_win, r.p_gammon_loss, r.p_bg_loss]
+        if game.current_player == 0
+            return (value=mover_val, equity=mover_eq)
+        else
+            return (value=-mover_val,
+                    equity=Float32[1.0f0 - mover_eq[1], mover_eq[4], mover_eq[5], mover_eq[2], mover_eq[3]])
+        end
+    end
+
+    # Decision node: enumerate all legal moves, find the best resulting position
+    actions = BackgammonNet.legal_actions(game)
+    if isempty(actions)
+        return nothing
+    end
+
+    # Compute in mover's perspective (maximize), then convert to white-relative
+    best_mover_value = -Inf32
+    best_mover_equity = nothing  # 5-elem vector from mover's perspective
+    bg_copy = BackgammonNet.clone(game)
+    mover = game.current_player  # 0 (P0/white) or 1 (P1/black)
+
+    for action in actions
+        BackgammonNet.copy_state!(bg_copy, game)
+        BackgammonNet.apply_action!(bg_copy, action)
+
+        local mover_val::Float32
+        local mover_eq::Vector{Float32}
+
+        if bg_copy.terminated
+            # Mover bore off all checkers — they win (simple win, no gammons at terminal bearoff)
+            mover_val = 1.0f0
+            mover_eq = Float32[1.0, 0.0, 0.0, 0.0, 0.0]
+        elseif BearoffK6.is_bearoff_position(bg_copy.p0, bg_copy.p1)
+            # After move, opponent's turn at a chance node.
+            # lookup() returns from bg_copy.current_player's perspective (the opponent).
+            r_opp = BearoffK6.lookup(table, bg_copy)
+            # Negate for mover's perspective
+            mover_val = -BearoffK6.compute_equity(r_opp)
+            # Flip probabilities: mover's P(win) = opponent's P(loss), etc.
+            mover_eq = Float32[1.0f0 - r_opp.p_win, r_opp.p_gammon_loss, r_opp.p_bg_loss,
+                               r_opp.p_gammon_win, r_opp.p_bg_win]
+        else
+            continue
+        end
+
+        if mover_val > best_mover_value
+            best_mover_value = mover_val
+            best_mover_equity = mover_eq
+        end
+    end
+
+    if best_mover_equity === nothing
+        return nothing
+    end
+
+    # Convert mover-relative to white-relative
+    if mover == 0
+        # Mover is white — already white-relative
+        return (value=best_mover_value, equity=best_mover_equity)
+    else
+        # Mover is black — flip to white perspective
+        white_value = -best_mover_value
+        white_eq = Float32[1.0f0 - best_mover_equity[1], best_mover_equity[4], best_mover_equity[5],
+                           best_mover_equity[2], best_mover_equity[3]]
+        return (value=white_value, equity=white_eq)
+    end
+end
+
+"""
+Create bear-off evaluator for MCTS.
+
+At chance nodes (pre-dice): returns the pre-dice table value directly (exact).
+At decision nodes (post-dice): enumerates all legal moves, looks up each resulting
+position in the bear-off table, and returns the best value (exact post-dice Q-value).
+
+Returns white-relative equity or nothing if not a bear-off position.
+"""
 function make_bearoff_evaluator(table)
     return function(game_env)
         bg = game_env.game
-        if BearoffK6.is_bearoff_position(bg.p0, bg.p1)
-            r = BearoffK6.lookup(table, bg)
-            return Float64(BearoffK6.compute_equity(r))
+        if !BearoffK6.is_bearoff_position(bg.p0, bg.p1)
+            return nothing
         end
-        return nothing
+
+        if BackgammonNet.is_chance_node(bg)
+            # Pre-dice: table value is exact (mover-relative → white-relative)
+            r = BearoffK6.lookup(table, bg)
+            mover_equity = Float64(BearoffK6.compute_equity(r))
+            return bg.current_player == 0 ? mover_equity : -mover_equity
+        end
+
+        # Decision node (post-dice): enumerate moves to get exact Q(board, dice)
+        actions = BackgammonNet.legal_actions(bg)
+        if isempty(actions)
+            return nothing
+        end
+
+        # Allocate per-call (thread-safe; clone is cheap — just field copies + buffer alloc)
+        bg_copy = BackgammonNet.clone(bg)
+
+        best_value = -Inf
+        for action in actions
+            BackgammonNet.copy_state!(bg_copy, bg)
+            BackgammonNet.apply_action!(bg_copy, action)
+
+            if bg_copy.terminated
+                # Terminal: current player won (bore off all checkers)
+                move_val = 1.0
+            elseif BearoffK6.is_bearoff_position(bg_copy.p0, bg_copy.p1)
+                # Opponent's turn (chance node). Look up their pre-dice equity, negate.
+                r_opp = BearoffK6.lookup(table, bg_copy)
+                move_val = -Float64(BearoffK6.compute_equity(r_opp))
+            else
+                continue
+            end
+
+            if move_val > best_value
+                best_value = move_val
+            end
+        end
+
+        if best_value == -Inf
+            return nothing
+        end
+
+        # Convert from current-player-relative to white-relative
+        return bg.current_player == 0 ? best_value : -best_value
     end
 end
 
@@ -422,14 +560,17 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
         is_bearoff_pos = false
         if bearoff_equity === nothing && state isa BackgammonNet.BackgammonGame &&
                 BearoffK6.is_bearoff_position(state.p0, state.p1)
-            bo = bearoff_table_equity(state)
-            z = wp ? bo.value : -bo.value
-            eq = copy(bo.equity)
-            if !wp
-                eq = Float32[1.0f0 - bo.equity[1], bo.equity[4], bo.equity[5], bo.equity[2], bo.equity[3]]
+            # Use post-dice move enumeration for exact Q(board, dice) values
+            bo = bearoff_post_dice_equity(state, BEAROFF_TABLE)
+            if bo !== nothing
+                z = wp ? bo.value : -bo.value
+                eq = copy(bo.equity)
+                if !wp
+                    eq = Float32[1.0f0 - bo.equity[1], bo.equity[4], bo.equity[5], bo.equity[2], bo.equity[3]]
+                end
+                has_eq = true
+                is_bearoff_pos = true
             end
-            has_eq = true
-            is_bearoff_pos = true
         end
 
         if !is_bearoff_pos && first_bo_probs_white !== nothing

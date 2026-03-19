@@ -143,7 +143,7 @@ Full results (28 checkpoints): `/homeshare/projects/AlphaZero.jl/sessions/wildbg
   - `per_sample_partition()` samples from contact/race subsets independently — avoids cross-model priority scale mismatch
   - IS weights passed to `losses()` via batch `W` field
 - Reanalyze: buffer reanalysis with EMA value blending (25% per iter)
-- Bear-off: exact k=6 table values for race/bearoff positions
+- Bear-off: exact k=6 table values for race/bearoff positions. Post-dice move enumeration gives exact Q(board, dice) at decision nodes; pre-dice table lookup at chance nodes. Training targets use the same post-dice enumeration.
 
 ### Shared Data (NFS)
 - `/homeshare/projects/AlphaZero.jl/eval_data/race_starts_tuples.jls` — 98,516 beginning-of-race positions
@@ -226,7 +226,7 @@ All under `/homeshare/projects/AlphaZero.jl/sessions/`:
 ### Technique Insights
 7. **256w×5b >> 128w×3b** -- larger model at 200 iter beats best 128w by +0.197 equity
 8. **All models are genuinely weak** -- best gets 4.4% wins vs wildbg (small nets), 9.6% vs GnuBG 0-ply. Need training efficiency improvements before scaling.
-9. **Bear-off table has signal mismatch** -- table values are pre-dice, game states are post-dice. See `notes/bearoff_chance_node_issue.md`. Previous "bearoff hurt" finding needs retesting post-board-fix.
+9. **Bear-off table signal mismatch FIXED** (2026-03-19) -- table values are pre-dice, game states are post-dice. Fixed via move enumeration: at decision nodes, enumerate all legal moves, look up resulting positions in table, take max. Also fixed perspective bug (evaluator returned mover-relative but MCTS assumed white-relative). Previous "bearoff hurt" finding needs retesting with this fix. See `notes/bearoff_chance_node_issue.md`.
 10. **Dual-model architecture** (2026-03-10) -- contact (256w×10b) + race (128w×3b) implemented in training_server.jl. Race-only training tested (50 iter).
 11. **PER was broken in distributed training** (fixed 2026-03-14) -- training_server.jl used uniform sampling instead of `per_sample()`. IS weights were not passed to the loss function. Fixed: per-model partition PER sampling with IS weight correction via `per_sample_partition()`. Per-component loss (policy/value/invalid) now logged to TensorBoard.
 
@@ -255,7 +255,7 @@ All under `/homeshare/projects/AlphaZero.jl/sessions/`:
 
 ### Phase 1: Training Efficiency (before scaling)
 
-4. **Bear-off MCTS value override at decision nodes** -- Currently bear-off evaluator only fires at chance nodes. Add check at decision-node leaves too: if position is in bear-off table, return exact equity immediately (no oracle call). Massive variance reduction for ~50% of game positions. Modify `batched_mcts.jl` leaf evaluation.
+4. **Bear-off MCTS value override at decision nodes** -- DONE (2026-03-19). Bear-off evaluator now fires at both chance nodes (pre-dice, exact table value) and decision nodes (post-dice, exact via move enumeration). Also fixed perspective bug and training target mismatch. Retest bear-off with this fix to see if previous regression reverses.
 
 5. **Progressive MCTS budget** -- Early iterations (1-20): 100 sims. Mid (20-100): 200 sims. Late (100+): 400 sims. Early network is random so deep search is wasted compute. 4x more games/iter in early training. Trivial: parameterize `num_iters_per_turn` as a schedule.
 
