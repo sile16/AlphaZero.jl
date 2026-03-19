@@ -162,6 +162,14 @@ module AlphaZero
   export NetLib
   export SimpleNet, SimpleNetHP, ResNet, ResNetHP, FCResNet, FCResNetHP
 
+  # Inference backends used by self-play and evaluation scripts
+  include("inference/fast_weights.jl")
+  using .FastInference
+  export FastInference
+  include("inference/backgammon_oracles.jl")
+  using .BackgammonInference
+  export BackgammonInference
+
   # A structure that contains the information necessary to replicate a training session
   include("experiments.jl")
   using .Experiments

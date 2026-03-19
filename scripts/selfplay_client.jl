@@ -5,7 +5,7 @@ Self-play client for distributed training.
 Connects to the training server, downloads model weights,
 runs MCTS self-play locally, and uploads samples.
 
-Uses allocation-free fast forward pass with per-worker CPU BLAS inference.
+Uses a shared CPU inference backend with platform-adaptive selection.
 Self-play infrastructure extracted from train_distributed.jl.
 
 Usage:
@@ -57,6 +57,10 @@ function parse_args()
             help = "Number of GPU workers (Metal, Mac only). Runs alongside CPU workers."
             arg_type = Int
             default = 0
+        "--inference-backend"
+            help = "CPU inference backend: auto, fast, or flux"
+            arg_type = String
+            default = "auto"
     end
 
     return ArgParse.parse_args(s)
@@ -71,11 +75,6 @@ const USE_GPU = GPU_WORKERS > 0
 println("=" ^ 60)
 println("AlphaZero Self-Play Client")
 println("=" ^ 60)
-println("Server: $SERVER_URL")
-println("Workers: $NUM_WORKERS CPU" * (GPU_WORKERS > 0 ? " + $GPU_WORKERS GPU" : ""))
-println("GPU: $(GPU_WORKERS > 0 ? "Metal ($GPU_WORKERS workers)" : "disabled")")
-println("=" ^ 60)
-flush(stdout)
 
 # Load packages
 using AlphaZero
@@ -84,13 +83,19 @@ using AlphaZero: BatchedMCTS, Util
 using AlphaZero: ConstSchedule
 import Flux
 import BackgammonNet
+const CPU_INFERENCE_BACKEND = AlphaZero.BackgammonInference.resolve_cpu_backend(ARGS["inference_backend"])
+
+println("Server: $SERVER_URL")
+println("Workers: $NUM_WORKERS CPU" * (GPU_WORKERS > 0 ? " + $GPU_WORKERS GPU" : ""))
+println("GPU: $(GPU_WORKERS > 0 ? "Metal ($GPU_WORKERS workers)" : "disabled")")
+println("CPU inference: $(AlphaZero.BackgammonInference.cpu_backend_summary(CPU_INFERENCE_BACKEND))")
+println("=" ^ 60)
+flush(stdout)
 
 # Include shared modules
 include(joinpath(@__DIR__, "..", "src", "distributed", "buffer.jl"))
 include(joinpath(@__DIR__, "..", "src", "distributed", "protocol.jl"))
 include(joinpath(@__DIR__, "..", "src", "distributed", "client.jl"))
-include(joinpath(@__DIR__, "..", "src", "inference", "fast_weights.jl"))
-using .FastInference
 
 # Connect to server and get config
 client_name = isempty(ARGS["client_name"]) ? "julia-$(gethostname())-$(getpid())" : ARGS["client_name"]
@@ -157,6 +162,10 @@ else
 end
 const gspec = GameSpec()
 const _state_dim = let env = GI.init(gspec); length(vec(GI.vectorize_state(gspec, GI.current_state(env)))); end
+const ORACLE_CFG = AlphaZero.BackgammonInference.OracleConfig(
+    _state_dim, NUM_ACTIONS, gspec;
+    vectorize_state! = vectorize_state_into!,
+    route_state = s -> (s isa BackgammonNet.BackgammonGame && !BackgammonNet.is_contact_position(s) ? 2 : 1))
 
 # Create networks (CPU for self-play inference)
 println("\nCreating networks...")
@@ -177,7 +186,7 @@ flush(stdout)
 
 # Set up BLAS for single-threaded per-worker CPU inference (always needed)
 import LinearAlgebra; LinearAlgebra.BLAS.set_num_threads(1)
-println("CPU inference: BLAS threads=1, per-worker fast forward")
+println("CPU inference: BLAS threads=1, backend=$(AlphaZero.BackgammonInference.cpu_backend_summary(CPU_INFERENCE_BACKEND))")
 
 # GPU setup (Metal.jl for Mac) — runs alongside CPU workers
 if USE_GPU
@@ -427,19 +436,35 @@ function init_game(rng::AbstractRNG)
 end
 
 #####
-##### Allocation-free forward pass (from src/inference/fast_weights.jl)
+##### CPU inference backend
 #####
 
-# Extract weights from networks (always — CPU workers always use fast forward)
-const CONTACT_FAST_WEIGHTS = extract_fast_weights(contact_network)
-const RACE_FAST_WEIGHTS = extract_fast_weights(race_network)
-println("Fast forward (contact): $(CONTACT_FAST_WEIGHTS.num_blocks) res blocks, $(CONTACT_FAST_WEIGHTS.num_policy_layers) policy layers")
-println("Fast forward (race): $(RACE_FAST_WEIGHTS.num_blocks) res blocks, $(RACE_FAST_WEIGHTS.num_policy_layers) policy layers")
+# Extract FastWeights only when the selected CPU backend uses them
+const CONTACT_FAST_WEIGHTS = CPU_INFERENCE_BACKEND == :fast ? AlphaZero.FastInference.extract_fast_weights(contact_network) : nothing
+const RACE_FAST_WEIGHTS = CPU_INFERENCE_BACKEND == :fast ? AlphaZero.FastInference.extract_fast_weights(race_network) : nothing
+if CPU_INFERENCE_BACKEND == :fast
+    println("Fast forward (contact): $(CONTACT_FAST_WEIGHTS.num_blocks) res blocks, $(CONTACT_FAST_WEIGHTS.num_policy_layers) policy layers")
+    println("Fast forward (race): $(RACE_FAST_WEIGHTS.num_blocks) res blocks, $(RACE_FAST_WEIGHTS.num_policy_layers) policy layers")
+end
+
+const CPU_ORACLES = if CPU_INFERENCE_BACKEND == :fast
+    AlphaZero.BackgammonInference.make_cpu_oracles(
+        CPU_INFERENCE_BACKEND, contact_network, ORACLE_CFG;
+        secondary_net=race_network, batch_size=INFERENCE_BATCH_SIZE,
+        primary_fw=CONTACT_FAST_WEIGHTS, secondary_fw=RACE_FAST_WEIGHTS)
+else
+    AlphaZero.BackgammonInference.make_cpu_oracles(
+        CPU_INFERENCE_BACKEND, contact_network, ORACLE_CFG;
+        secondary_net=race_network, batch_size=INFERENCE_BATCH_SIZE)
+end
+const CPU_SINGLE_ORACLE = CPU_ORACLES[1]
+const CPU_BATCH_ORACLE = CPU_ORACLES[2]
 
 function refresh_fast_weights!()
-    # Always update CPU fast weights
-    FastInference.refresh_fast_weights!(CONTACT_FAST_WEIGHTS, contact_network)
-    FastInference.refresh_fast_weights!(RACE_FAST_WEIGHTS, race_network)
+    if CPU_INFERENCE_BACKEND == :fast
+        AlphaZero.FastInference.refresh_fast_weights!(CONTACT_FAST_WEIGHTS, contact_network)
+        AlphaZero.FastInference.refresh_fast_weights!(RACE_FAST_WEIGHTS, race_network)
+    end
 
     # Also update GPU networks if enabled
     if USE_GPU
@@ -620,99 +645,10 @@ end
 ##### Worker functions (self-contained, run on worker threads)
 #####
 
-"""Core game-playing loop with per-worker CPU fast forward inference."""
+"""Core game-playing loop with shared CPU inference backend."""
 function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
-                          rng::MersenneTwister;
-                          contact_fast_bufs::FastBuffers, race_fast_bufs::FastBuffers)
-    max_batch = INFERENCE_BATCH_SIZE + 1
-    contact_X_buf = zeros(Float32, _state_dim, max_batch)
-    contact_A_buf = zeros(Float32, NUM_ACTIONS, max_batch)
-    race_X_buf = zeros(Float32, _state_dim, max_batch)
-    race_A_buf = zeros(Float32, NUM_ACTIONS, max_batch)
-    _contact_idxs = Vector{Int}(undef, max_batch)
-    _race_idxs = Vector{Int}(undef, max_batch)
-    _results = Vector{Tuple{Vector{Float32}, Float32}}(undef, max_batch)
-
-    n_oracle_calls = 0
+                          rng::MersenneTwister)
     n_bearoff_truncated = 0
-
-    function batch_oracle(states::Vector)
-        n = length(states)
-        n == 0 && return Tuple{Vector{Float32}, Float32}[]
-
-        n_contact = 0
-        n_race = 0
-        for (i, s) in enumerate(states)
-            is_contact = s isa BackgammonNet.BackgammonGame ? BackgammonNet.is_contact_position(s) : true
-            if is_contact
-                n_contact += 1
-                _contact_idxs[n_contact] = i
-                vectorize_state_into!(@view(contact_X_buf[:, n_contact]), gspec, s)
-                a_col = @view(contact_A_buf[:, n_contact])
-                fill!(a_col, 0.0f0)
-                if !BackgammonNet.game_terminated(s)
-                    legal = BackgammonNet.legal_actions(s)
-                    @inbounds for action in legal
-                        if 1 <= action <= NUM_ACTIONS
-                            a_col[action] = 1.0f0
-                        end
-                    end
-                end
-            else
-                n_race += 1
-                _race_idxs[n_race] = i
-                vectorize_state_into!(@view(race_X_buf[:, n_race]), gspec, s)
-                a_col = @view(race_A_buf[:, n_race])
-                fill!(a_col, 0.0f0)
-                if !BackgammonNet.game_terminated(s)
-                    legal = BackgammonNet.legal_actions(s)
-                    @inbounds for action in legal
-                        if 1 <= action <= NUM_ACTIONS
-                            a_col[action] = 1.0f0
-                        end
-                    end
-                end
-            end
-        end
-
-        if n_contact > 0
-            P_c, V_c, _ = fast_forward_normalized!(CONTACT_FAST_WEIGHTS, contact_fast_bufs, contact_X_buf, contact_A_buf, n_contact)
-            @inbounds for j in 1:n_contact
-                idx = _contact_idxs[j]
-                pv = contact_fast_bufs.result_vecs[j]
-                k = 0
-                for a in 1:NUM_ACTIONS
-                    if contact_A_buf[a, j] > 0.0f0
-                        k += 1
-                        pv[k] = P_c[a, j]
-                    end
-                end
-                resize!(pv, k)
-                _results[idx] = (pv, V_c[j])
-            end
-        end
-
-        if n_race > 0
-            P_r, V_r, _ = fast_forward_normalized!(RACE_FAST_WEIGHTS, race_fast_bufs, race_X_buf, race_A_buf, n_race)
-            @inbounds for j in 1:n_race
-                idx = _race_idxs[j]
-                pv = race_fast_bufs.result_vecs[j]
-                k = 0
-                for a in 1:NUM_ACTIONS
-                    if race_A_buf[a, j] > 0.0f0
-                        k += 1
-                        pv[k] = P_r[a, j]
-                    end
-                end
-                resize!(pv, k)
-                _results[idx] = (pv, V_r[j])
-            end
-        end
-
-        n_oracle_calls += 1
-        return @view(_results[1:n])
-    end
-    single_oracle(state) = batch_oracle([state])[1]
 
     mcts_params = MctsParams(
         num_iters_per_turn=MCTS_ITERS,
@@ -721,8 +657,8 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         dirichlet_noise_ϵ=Float64(config["dirichlet_epsilon"]),
         dirichlet_noise_α=Float64(config["dirichlet_alpha"]))
     player = BatchedMCTS.BatchedMctsPlayer(
-        gspec, single_oracle, mcts_params;
-        batch_size=INFERENCE_BATCH_SIZE, batch_oracle=batch_oracle,
+        gspec, CPU_SINGLE_ORACLE, mcts_params;
+        batch_size=INFERENCE_BATCH_SIZE, batch_oracle=CPU_BATCH_ORACLE,
         bearoff_evaluator=BEAROFF_EVALUATOR)
 
     all_samples = []
@@ -814,19 +750,15 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         append!(all_samples, samples)
     end
 
-    return (samples=all_samples, n_oracle_calls=n_oracle_calls,
-            n_bearoff_truncated=n_bearoff_truncated)
+    return (samples=all_samples, n_bearoff_truncated=n_bearoff_truncated)
 end
 
-"""Play games on a worker thread with per-worker fast forward buffers (CPU mode)."""
+"""Play games on a worker thread with the shared CPU inference backend."""
 function worker_play_games(worker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
                            rng::MersenneTwister)
-    contact_fb = FastBuffers(CONTACT_WIDTH, NUM_ACTIONS, INFERENCE_BATCH_SIZE + 1)
-    race_fb = FastBuffers(RACE_WIDTH, NUM_ACTIONS, INFERENCE_BATCH_SIZE + 1)
     sub_rng = MersenneTwister(rand(rng, UInt))
 
-    result = _play_games_loop(worker_id, games_claimed, total_games, sub_rng;
-                               contact_fast_bufs=contact_fb, race_fast_bufs=race_fb)
+    result = _play_games_loop(worker_id, games_claimed, total_games, sub_rng)
     return result.samples
 end
 
@@ -1261,8 +1193,6 @@ const SAMPLE_CHANNEL = Channel{Vector{Any}}(NUM_WORKERS * 2)
 function continuous_worker(worker_id::Int, rng::MersenneTwister)
     println("  Worker $worker_id starting on thread $(Threads.threadid())")
     flush(stdout)
-    contact_fb = FastBuffers(CONTACT_WIDTH, NUM_ACTIONS, INFERENCE_BATCH_SIZE + 1)
-    race_fb = FastBuffers(RACE_WIDTH, NUM_ACTIONS, INFERENCE_BATCH_SIZE + 1)
     sub_rng = MersenneTwister(rand(rng, UInt))
 
     # Play games forever — one at a time, push samples immediately
@@ -1270,8 +1200,7 @@ function continuous_worker(worker_id::Int, rng::MersenneTwister)
     while true
         # Use _play_games_loop with total_games=1 via atomic counter
         games_claimed = Threads.Atomic{Int}(0)
-        result = _play_games_loop(worker_id, games_claimed, 1, sub_rng;
-                                   contact_fast_bufs=contact_fb, race_fast_bufs=race_fb)
+        result = _play_games_loop(worker_id, games_claimed, 1, sub_rng)
         if !isempty(result.samples)
             put!(SAMPLE_CHANNEL, result.samples)
         end

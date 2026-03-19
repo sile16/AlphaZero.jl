@@ -100,6 +100,10 @@ function parse_eval_args()
             help = "Inference batch size for MCTS"
             arg_type = Int
             default = 50
+        "--inference-backend"
+            help = "CPU inference backend: auto, fast, or flux"
+            arg_type = String
+            default = "auto"
     end
 
     return ArgParse.parse_args(s)
@@ -120,10 +124,6 @@ using Printf
 # BackgammonNet provides game + wildbg backend
 using BackgammonNet
 
-# FastWeights for thread-safe, allocation-free CPU inference
-include(joinpath(@__DIR__, "..", "src", "inference", "fast_weights.jl"))
-using .FastInference
-
 # Try to load Metal.jl for GPU support
 const HAS_METAL = try
     @eval using Metal
@@ -139,6 +139,10 @@ include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl")
 const gspec = GameSpec()
 const NUM_ACTIONS = GI.num_actions(gspec)
 const _state_dim = GI.state_dim(gspec)[1]
+const ORACLE_CFG = AlphaZero.BackgammonInference.OracleConfig(
+    _state_dim, NUM_ACTIONS, gspec;
+    vectorize_state! = vectorize_state_into!,
+    route_state = s -> (s isa BackgammonNet.BackgammonGame && !BackgammonNet.is_contact_position(s) ? 2 : 1))
 
 # ── Wildbg Library ────────────────────────────────────────────────────────
 
@@ -158,75 +162,6 @@ function find_wildbg_lib()
         isfile(c) && return c
     end
     error("libwildbg not found. Pass --wildbg-lib=/path/to/libwildbg.so")
-end
-
-# ── Network Forward (CPU) ────────────────────────────────────────────────
-
-function _forward_network(net, states, gspec)
-    n = length(states)
-    X = zeros(Float32, _state_dim, n)
-    A = zeros(Float32, NUM_ACTIONS, n)
-    for (i, s) in enumerate(states)
-        v = GI.vectorize_state(gspec, s)
-        X[:, i] .= vec(v)
-        if !BackgammonNet.game_terminated(s)
-            for action in BackgammonNet.legal_actions(s)
-                if 1 <= action <= NUM_ACTIONS
-                    A[action, i] = 1.0f0
-                end
-            end
-        end
-    end
-    P_raw, V, _ = Network.convert_output_tuple(
-        net, Network.forward_normalized(net, X, A))
-    results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
-    for i in 1:n
-        legal = @view(A[:, i]) .> 0
-        results[i] = (P_raw[legal, i], V[1, i])
-    end
-    return results
-end
-
-# ── FastWeights Forward (CPU, thread-safe) ───────────────────────────────
-
-"""Pre-allocated input buffers for FastWeights forward pass (one per worker thread)."""
-struct FastInputBuffers
-    X::Matrix{Float32}
-    A::Matrix{Float32}
-end
-
-FastInputBuffers(max_batch::Int) =
-    FastInputBuffers(zeros(Float32, _state_dim, max_batch), zeros(Float32, NUM_ACTIONS, max_batch))
-
-function _forward_network_fast(fw::FastWeights, fb::FastBuffers, fib::FastInputBuffers,
-                                states, gspec)
-    n = length(states)
-    X = fib.X
-    A = fib.A
-    fill!(@view(A[:, 1:n]), 0.0f0)
-    for (i, s) in enumerate(states)
-        v = GI.vectorize_state(gspec, s)
-        X[:, i] .= vec(v)
-        if !BackgammonNet.game_terminated(s)
-            for action in BackgammonNet.legal_actions(s)
-                if 1 <= action <= NUM_ACTIONS
-                    A[action, i] = 1.0f0
-                end
-            end
-        end
-    end
-    P, V, _ = fast_forward_normalized!(fw, fb, X, A, n)
-    results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
-    for i in 1:n
-        legal = Vector{Float32}()
-        for a in 1:NUM_ACTIONS
-            if A[a, i] > 0.0f0
-                push!(legal, P[a, i])
-            end
-        end
-        results[i] = (legal, V[i])
-    end
-    return results
 end
 
 # ── GPU Forward (Metal, lock-based) ──────────────────────────────────────
@@ -265,94 +200,6 @@ function _forward_network_gpu(net_gpu, states, gspec, gpu_array_fn, sync_fn)
     return results
 end
 
-# ── Oracle Factories ─────────────────────────────────────────────────────
-
-function make_cpu_oracles(contact_net, race_net)
-    function batch_oracle(states::Vector)
-        n = length(states)
-        n == 0 && return Tuple{Vector{Float32}, Float32}[]
-        if race_net === nothing
-            return _forward_network(contact_net, states, gspec)
-        end
-        contact_states, contact_idxs = eltype(states)[], Int[]
-        race_states, race_idxs = eltype(states)[], Int[]
-        for (i, s) in enumerate(states)
-            if s isa BackgammonNet.BackgammonGame && !BackgammonNet.is_contact_position(s)
-                push!(race_states, s); push!(race_idxs, i)
-            else
-                push!(contact_states, s); push!(contact_idxs, i)
-            end
-        end
-        results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
-        if !isempty(contact_states)
-            cr = _forward_network(contact_net, contact_states, gspec)
-            for (j, idx) in enumerate(contact_idxs); results[idx] = cr[j]; end
-        end
-        if !isempty(race_states)
-            rr = _forward_network(race_net, race_states, gspec)
-            for (j, idx) in enumerate(race_idxs); results[idx] = rr[j]; end
-        end
-        results
-    end
-    single_oracle(s) = batch_oracle([s])[1]
-    single_oracle, batch_oracle
-end
-
-function make_fast_cpu_oracles(contact_fw::FastWeights, race_fw::Union{FastWeights,Nothing},
-                                batch_size::Int)
-    # Thread-local buffers: each calling thread gets its own set
-    contact_width = size(contact_fw.W_in, 1)
-    race_width = race_fw !== nothing ? size(race_fw.W_in, 1) : 0
-    max_batch = batch_size + 1
-
-    bufs = Dict{UInt64, Tuple{FastBuffers, FastInputBuffers, Union{FastBuffers,Nothing}, Union{FastInputBuffers,Nothing}}}()
-    bufs_lock = ReentrantLock()
-
-    function get_bufs()
-        tid = objectid(current_task())
-        lock(bufs_lock) do
-            if !haskey(bufs, tid)
-                cfb = FastBuffers(contact_width, NUM_ACTIONS, max_batch)
-                cfib = FastInputBuffers(max_batch)
-                rfb = race_fw !== nothing ? FastBuffers(race_width, NUM_ACTIONS, max_batch) : nothing
-                rfib = race_fw !== nothing ? FastInputBuffers(max_batch) : nothing
-                bufs[tid] = (cfb, cfib, rfb, rfib)
-            end
-            return bufs[tid]
-        end
-    end
-
-    function batch_oracle(states::Vector)
-        n = length(states)
-        n == 0 && return Tuple{Vector{Float32}, Float32}[]
-        cfb, cfib, rfb, rfib = get_bufs()
-        if race_fw === nothing
-            return _forward_network_fast(contact_fw, cfb, cfib, states, gspec)
-        end
-        contact_states, contact_idxs = eltype(states)[], Int[]
-        race_states, race_idxs = eltype(states)[], Int[]
-        for (i, s) in enumerate(states)
-            if s isa BackgammonNet.BackgammonGame && !BackgammonNet.is_contact_position(s)
-                push!(race_states, s); push!(race_idxs, i)
-            else
-                push!(contact_states, s); push!(contact_idxs, i)
-            end
-        end
-        results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
-        if !isempty(contact_states)
-            cr = _forward_network_fast(contact_fw, cfb, cfib, contact_states, gspec)
-            for (j, idx) in enumerate(contact_idxs); results[idx] = cr[j]; end
-        end
-        if !isempty(race_states)
-            rr = _forward_network_fast(race_fw, rfb, rfib, race_states, gspec)
-            for (j, idx) in enumerate(race_idxs); results[idx] = rr[j]; end
-        end
-        results
-    end
-    single_oracle(s) = batch_oracle([s])[1]
-    single_oracle, batch_oracle
-end
-
 function make_gpu_oracles(cn_gpu, rn_gpu, gpu_array_fn, sync_fn)
     function batch_oracle(states::Vector)
         n = length(states)
@@ -388,11 +235,9 @@ end
 
 """Get raw NN value prediction for a position. Returns (value, is_race).
 Uses Flux forward (not FastWeights) — called once per move, not performance-critical."""
-function nn_raw_value(contact_net, race_net, g)
+function nn_raw_value(value_batch_oracle, g)
     is_race = g isa BackgammonNet.BackgammonGame && !BackgammonNet.is_contact_position(g)
-    net = (is_race && race_net !== nothing) ? race_net : contact_net
-    r = _forward_network(net, [g], gspec)
-    _, v = r[1]
+    _, v = value_batch_oracle([g])[1]
     return Float64(v), is_race
 end
 
@@ -455,7 +300,7 @@ end
 """Play a single eval game. Returns (reward, value_samples)."""
 function eval_game(az_agent::AlphaZeroAgent, wildbg_agent::BackgammonNet.BackendAgent,
                    az_is_white::Bool; seed::Int=1,
-                   contact_net=nothing, race_net=nothing)
+                   value_batch_oracle=nothing)
     rng = MersenneTwister(seed)
     g = BackgammonNet.initial_state()
     value_samples = PositionValueSample[]
@@ -468,8 +313,8 @@ function eval_game(az_agent::AlphaZeroAgent, wildbg_agent::BackgammonNet.Backend
             is_az_turn = (cp == 0) == az_is_white
 
             # Collect value comparison at AZ decision points
-            if is_az_turn && contact_net !== nothing
-                nn_v, is_race = nn_raw_value(contact_net, race_net, g)
+            if is_az_turn && value_batch_oracle !== nothing
+                nn_v, is_race = nn_raw_value(value_batch_oracle, g)
                 wb_v = Float64(BackgammonNet.evaluate(wildbg_agent.backend, g))
                 # Both nn_v and wb_v are from current player's perspective
                 push!(value_samples, PositionValueSample(nn_v, wb_v, !is_race))
@@ -491,6 +336,7 @@ end
 function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
                              width::Int, blocks::Int, num_games::Int,
                              num_workers::Int, mcts_iters::Int, batch_size::Int,
+                             inference_backend::Union{Symbol, AbstractString}="auto",
                              gpu_workers::Int=0,
                              race_checkpoint_path::Union{String,Nothing}=nothing,
                              race_width::Int=128, race_blocks::Int=3)
@@ -516,14 +362,16 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
         dirichlet_noise_ϵ=0.0,
         dirichlet_noise_α=1.0)
 
-    # Extract FastWeights for thread-safe CPU inference (27x faster than Flux multi-threaded)
-    contact_fw = extract_fast_weights(contact_network)
-    race_fw = race_network !== nothing ? extract_fast_weights(race_network) : nothing
-    println("  Using FastWeights inference (thread-safe, no BLAS contention)")
+    backend = AlphaZero.BackgammonInference.resolve_cpu_backend(inference_backend)
+    println("  CPU inference: $(AlphaZero.BackgammonInference.cpu_backend_summary(backend))")
 
-    # Create CPU oracles and agent using FastWeights
-    cpu_single, cpu_batch = make_fast_cpu_oracles(contact_fw, race_fw, batch_size)
+    cpu_single, cpu_batch = AlphaZero.BackgammonInference.make_cpu_oracles(
+        backend, contact_network, ORACLE_CFG;
+        secondary_net=race_network, batch_size=batch_size)
     cpu_agent = AlphaZeroAgent(cpu_single, cpu_batch, mcts_params, batch_size, gspec)
+    _, value_batch_oracle = AlphaZero.BackgammonInference.make_cpu_oracles(
+        :flux, contact_network, ORACLE_CFG;
+        secondary_net=race_network, batch_size=1)
 
     # Create GPU oracles and agent (if requested and available)
     gpu_agent = nothing
@@ -584,8 +432,7 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
         while true
             i = Threads.atomic_add!(white_claimed, 1) + 1
             i > games_per_side && break
-            result = eval_game(agent, wa, true; seed=i,
-                               contact_net=contact_network, race_net=race_network)
+            result = eval_game(agent, wa, true; seed=i, value_batch_oracle=value_batch_oracle)
             white_rewards[i] = result.reward
             white_vsamples[i] = result.value_samples
         end
@@ -602,7 +449,7 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
             i = Threads.atomic_add!(black_claimed, 1) + 1
             i > games_per_side && break
             result = eval_game(agent, wa, false; seed=i + games_per_side,
-                               contact_net=contact_network, race_net=race_network)
+                               value_batch_oracle=value_batch_oracle)
             black_rewards[i] = result.reward
             black_vsamples[i] = result.value_samples
         end
@@ -772,6 +619,7 @@ function main()
                     gpu_workers=gpu_workers,
                     mcts_iters=ARGS["mcts_iters"],
                     batch_size=ARGS["inference_batch_size"],
+                    inference_backend=ARGS["inference_backend"],
                     race_checkpoint_path=race_ckpt_path,
                     race_width=race_arch !== nothing ? race_arch.width : 128,
                     race_blocks=race_arch !== nothing ? race_arch.blocks : 3)
@@ -912,6 +760,7 @@ function main()
         println("Games: $(ARGS["num_games"]) per side")
         println("MCTS: $(ARGS["mcts_iters"]) iterations")
         println("Workers: $(ARGS["num_workers"]) CPU" * (gpu_workers > 0 ? " + $gpu_workers GPU" : ""))
+        println("CPU inference: $(AlphaZero.BackgammonInference.cpu_backend_summary(ARGS["inference_backend"]))")
         println("=" ^ 70)
         flush(stdout)
 
@@ -923,6 +772,7 @@ function main()
             gpu_workers=gpu_workers,
             mcts_iters=ARGS["mcts_iters"],
             batch_size=ARGS["inference_batch_size"],
+            inference_backend=ARGS["inference_backend"],
             race_checkpoint_path=race_ckpt_path,
             race_width=race_width, race_blocks=race_blocks)
         eval_time = time() - t0
