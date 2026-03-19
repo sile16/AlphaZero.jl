@@ -61,7 +61,7 @@ done
 
 # Launch Jarvis client
 echo "Starting Jarvis selfplay client..."
-ssh $JARVIS "bash -l -c 'cd /home/sile/github/AlphaZero.jl && nohup julia --threads 16 --project scripts/selfplay_client.jl --server http://127.0.0.1:9090 --api-key alphazero-dev-key --num-workers 8 --client-name jarvis-cpu > /tmp/selfplay_jarvis_cpu_v6.log 2>&1 &'"
+ssh $JARVIS "bash -l -c 'cd /home/sile/github/AlphaZero.jl && nohup julia --threads 16 --project scripts/selfplay_client.jl --server http://127.0.0.1:9090 --api-key alphazero-dev-key --num-workers 14 --client-name jarvis-cpu > /tmp/selfplay_jarvis_cpu_v6.log 2>&1 &'"
 echo "Waiting for Jarvis client to connect..."
 sleep 30
 
@@ -71,14 +71,14 @@ cd /Users/sile/github/AlphaZero.jl
 nohup julia --threads 30 --project scripts/selfplay_client.jl \
   --server http://127.0.0.1:9090 \
   --api-key alphazero-dev-key \
-  --num-workers 22 \
+  --num-workers 26 \
   --client-name neo-cpu \
   > /tmp/selfplay_neo_cpu_v6.log 2>&1 &
 echo "Neo client launched (PID: $!)"
 
 echo ""
 echo "=== v6 launched! ==="
-echo "Config: cosine LR, PER, 4000 gradient steps/iter (10x v5), 2000-game eval, 14 eval workers"
+echo "Config: cosine LR, PER, 4000 gradient steps/iter (10x v5), 2000-game eval, 14 eval workers, 26+14 selfplay workers"
 echo "Server data: $V6_DATA_DIR"
 echo "Logs: /tmp/training_server_race_v6.log, /tmp/selfplay_neo_cpu_v6.log, /tmp/selfplay_jarvis_cpu_v6.log"
 echo ""
