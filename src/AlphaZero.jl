@@ -49,20 +49,11 @@ module AlphaZero
   using .BatchedMCTS
   export BatchedMCTS
 
-  # Async MCTS with continuous GPU inference pipeline
-  include("async_mcts.jl")
-  using .AsyncMCTS
-  export AsyncMCTS
-
-  # Gumbel MCTS implementation (sequential halving with Gumbel-max trick)
-  include("gumbel_mcts.jl")
-  using .GumbelMCTS
-  export GumbelMCTS
-
-  # EvalMCTS: GPU-friendly evaluation with full chance expansion + virtual loss
-  include("eval_mcts.jl")
-  using .EvalMCTS
-  export EvalMCTS
+  # Utilities to batch oracle calls (legacy, used by simulations.jl)
+  include("batchifier.jl")
+  using .Batchifier
+  include("async_batchifier.jl")
+  using .AsyncBatchifier
 
   # A generic network interface
   include("networks/network.jl")
@@ -71,16 +62,6 @@ module AlphaZero
   export AbstractNetwork
   export OptimiserSpec
   export CyclicNesterov, Adam
-
-  # Utilities to batch oracle calls
-  include("batchifier.jl")
-  using .Batchifier
-  export Batchifier
-
-  # Async batchifier for better parallelism
-  include("async_batchifier.jl")
-  using .AsyncBatchifier
-  export AsyncBatchifier
 
   # Schedules
   include("schedule.jl")
@@ -91,7 +72,6 @@ module AlphaZero
   include("params.jl")
   export Params
   export MctsParams
-  export GumbelMctsParams
   export SimParams
   export SelfPlayParams
   export LearningParams
@@ -114,7 +94,6 @@ module AlphaZero
   include("play.jl")
   export AbstractPlayer, think, select_move, reset_player!, player_temperature
   export MctsPlayer, TurnProgressiveMctsPlayer
-  export GumbelMctsPlayer
   export RandomPlayer
   export NetworkPlayer
   export PlayerWithTemperature
@@ -123,11 +102,10 @@ module AlphaZero
   export Human, interactive!
   export play_game
 
-  # Utilities for distributed games simulation
+  # Utilities for distributed games simulation (legacy, used by training.jl/session.jl)
   include("simulations.jl")
   export Simulator, simulate, simulate_distributed
   export record_trace
-  export rewards_and_redundancy
 
   # Memory buffer to hold samples generated during self-play
   include("memory.jl")
@@ -142,7 +120,7 @@ module AlphaZero
   # Utilities to train the neural network based on collected samples
   include("learning.jl")
 
-  # Main training algorithm
+  # Legacy training algorithm (used by session.jl/benchmark.jl)
   include("training.jl")
   export Env, train!, initial_report
   export Handlers
@@ -153,7 +131,7 @@ module AlphaZero
   using .MinMax
   export MinMax
 
-  # Utilities to write benchmarks
+  # Utilities to write benchmarks (legacy, used by experiments.jl/plots.jl)
   include("benchmark.jl")
   using .Benchmark
   export Benchmark

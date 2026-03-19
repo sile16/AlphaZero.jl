@@ -30,7 +30,7 @@ Usage:
     julia --threads 30 --project scripts/eval_vs_wildbg.jl --batch /path/to/sessions/
 
 Options:
-    --obs-type=minimal     Observation type (default: minimal)
+    --obs-type=minimal_flat  Observation type (default: minimal_flat)
     --num-games=500        Games per side (total = 2x this)
     --width=128            Network width (single model or contact model)
     --blocks=3             Network blocks (single model or contact model)
@@ -56,7 +56,7 @@ function parse_eval_args()
         "--obs-type"
             help = "Observation type"
             arg_type = String
-            default = "minimal"
+            default = "minimal_flat"
         "--num-games"
             help = "Games per side (total = 2x)"
             arg_type = Int

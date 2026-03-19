@@ -3,7 +3,7 @@
 
 using Pkg; Pkg.activate(".")
 
-ENV["BACKGAMMON_OBS_TYPE"] = "minimal"
+ENV["BACKGAMMON_OBS_TYPE"] = "minimal_flat"
 include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
 
 using AlphaZero

@@ -23,7 +23,7 @@ using ArgParse
 using Dates
 using Random
 using Serialization
-using Statistics
+using Statistics: mean, cor, std
 using TensorBoardLogger
 using Logging: with_logger
 
@@ -82,6 +82,10 @@ function parse_args()
             help = "Number of games worth of samples per training iteration"
             arg_type = Int
             default = 500
+        "--training-steps"
+            help = "Gradient steps per iteration (0 = auto: games_per_iteration * 200 / batch_size)"
+            arg_type = Int
+            default = 0
         "--seed"
             arg_type = Int
             default = 42
@@ -109,6 +113,20 @@ function parse_args()
         "--reanalyze-fraction"
             arg_type = Float64
             default = 0.25
+        "--reanalyze-blend"
+            help = "EMA blend factor for reanalyze (0.0-1.0, lower = less aggressive)"
+            arg_type = Float64
+            default = 0.5
+
+        # Learning rate schedule
+        "--lr-schedule"
+            help = "LR schedule: 'constant' or 'cosine'"
+            arg_type = String
+            default = "constant"
+        "--lr-min"
+            help = "Minimum LR for cosine schedule"
+            arg_type = Float64
+            default = 0.0001
 
         # Self-play config (served to clients)
         "--mcts-iters"
@@ -172,13 +190,30 @@ function parse_args()
             arg_type = Int
             default = 10
         "--eval-games"
+            help = "Number of eval positions (each played from both sides)"
             arg_type = Int
             default = 100
+        "--eval-mcts-iters"
+            help = "MCTS iterations for eval games"
+            arg_type = Int
+            default = 200
+        "--eval-workers"
+            help = "Number of CPU threads for eval (0 = auto: nthreads - 2)"
+            arg_type = Int
+            default = 4
+        "--wildbg-lib"
+            help = "Path to libwildbg shared library"
+            arg_type = String
+            default = ""
 
         # Checkpoints
         "--checkpoint-interval"
             arg_type = Int
             default = 10
+        "--buffer-checkpoint-interval"
+            help = "Save full buffer every N iterations (0 = disabled)"
+            arg_type = Int
+            default = 50
         "--resume"
             help = "Resume from checkpoint directory"
             arg_type = String
@@ -223,13 +258,14 @@ if !isempty(ARGS["bootstrap_file"])
     end
 end
 println("PER: $(ARGS["use_per"])")
-println("Reanalyze: $(ARGS["use_reanalyze"])")
+println("Reanalyze: $(ARGS["use_reanalyze"]) (blend=$(ARGS["reanalyze_blend"]))")
+println("LR: $(ARGS["learning_rate"]) (schedule=$(ARGS["lr_schedule"]), min=$(ARGS["lr_min"]))")
 println("=" ^ 60)
 flush(stdout)
 
 # Load packages
 using AlphaZero
-using AlphaZero: GI, MCTS, Network, FluxLib, MctsParams, LearningParams, Adam
+using AlphaZero: GI, MCTS, Network, FluxLib, MctsParams, LearningParams, Adam, BatchedMCTS
 using AlphaZero: CONSTANT_WEIGHT, losses, ConstSchedule
 # Note: NetLib not needed - using FluxLib directly for network creation
 import Flux
@@ -253,7 +289,7 @@ include(joinpath(@__DIR__, "..", "src", "distributed", "server.jl"))
 # Game setup
 const GAME_NAME = "backgammon-deterministic"
 if GAME_NAME == "backgammon-deterministic"
-    ENV["BACKGAMMON_OBS_TYPE"] = "minimal"
+    ENV["BACKGAMMON_OBS_TYPE"] = "minimal_flat"
     include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
 else
     error("Unknown game: $GAME_NAME")
@@ -277,6 +313,232 @@ const PER_BETA_INIT = Float32(ARGS["per_beta"])
 const PER_EPSILON = Float32(ARGS["per_epsilon"])
 const USE_REANALYZE = ARGS["use_reanalyze"]
 const REANALYZE_FRACTION = ARGS["reanalyze_fraction"]
+const REANALYZE_BLEND = Float32(ARGS["reanalyze_blend"])
+const LR_SCHEDULE = ARGS["lr_schedule"]
+const LR_MIN = Float32(ARGS["lr_min"])
+const EVAL_INTERVAL = ARGS["eval_interval"]
+const EVAL_GAMES = ARGS["eval_games"]
+const EVAL_MCTS_ITERS = ARGS["eval_mcts_iters"]
+const EVAL_WORKERS = ARGS["eval_workers"]
+
+# ── Eval Setup (wildbg on CPU) ─────────────────────────────────────────
+using BackgammonNet
+using StaticArrays
+
+function find_wildbg_lib_server()
+    if !isempty(ARGS["wildbg_lib"])
+        return ARGS["wildbg_lib"]
+    end
+    candidates = [
+        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg.so"),
+        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg.dylib"),
+        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg_main.so"),
+        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg_main.dylib"),
+    ]
+    for c in candidates
+        isfile(c) && return c
+    end
+    return ""  # No wildbg found — eval disabled
+end
+
+const WILDBG_LIB = find_wildbg_lib_server()
+const EVAL_ENABLED = EVAL_INTERVAL > 0 && !isempty(WILDBG_LIB) && !isempty(ARGS["eval_positions_file"])
+
+# Load eval positions
+const EVAL_POSITIONS = if EVAL_ENABLED && isfile(ARGS["eval_positions_file"])
+    pos = Serialization.deserialize(ARGS["eval_positions_file"])
+    n = EVAL_GAMES > 0 ? min(EVAL_GAMES, length(pos)) : length(pos)
+    pos[1:n]
+else
+    Tuple[]
+end
+
+if EVAL_ENABLED
+    # Set up wildbg
+    lib_size = filesize(WILDBG_LIB)
+    nets_variant = lib_size > 10_000_000 ? :large : :small
+    if nets_variant == :large
+        BackgammonNet.wildbg_set_lib_path!(large=WILDBG_LIB)
+    else
+        BackgammonNet.wildbg_set_lib_path!(small=WILDBG_LIB)
+    end
+    println("Eval: $(length(EVAL_POSITIONS)) positions × 2 sides, $(EVAL_MCTS_ITERS) MCTS iters, $(EVAL_WORKERS) workers")
+    println("Eval: wildbg $nets_variant ($(round(lib_size/1e6, digits=1))MB), every $EVAL_INTERVAL iters")
+else
+    if EVAL_INTERVAL > 0
+        println("Eval: DISABLED (wildbg_lib=$(isempty(WILDBG_LIB) ? "not found" : WILDBG_LIB), eval_positions=$(ARGS["eval_positions_file"]))")
+    else
+        println("Eval: disabled (eval-interval=0)")
+    end
+end
+
+struct PositionValueSample
+    nn_val::Float64
+    wb_val::Float64
+end
+
+function _eval_forward_network(net, states)
+    n = length(states)
+    X = zeros(Float32, _state_dim, n)
+    A = zeros(Float32, NUM_ACTIONS, n)
+    for (i, s) in enumerate(states)
+        v = GI.vectorize_state(gspec, s)
+        X[:, i] .= vec(v)
+        if !BackgammonNet.game_terminated(s)
+            for action in BackgammonNet.legal_actions(s)
+                if 1 <= action <= NUM_ACTIONS
+                    A[action, i] = 1.0f0
+                end
+            end
+        end
+    end
+    P_raw, V, _ = Network.convert_output_tuple(
+        net, Network.forward_normalized(net, X, A))
+    results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
+    for i in 1:n
+        legal = @view(A[:, i]) .> 0
+        results[i] = (P_raw[legal, i], V[1, i])
+    end
+    return results
+end
+
+struct EvalAlphaZeroAgent <: BackgammonNet.AbstractAgent
+    single_oracle::Any
+    batch_oracle::Any
+    mcts_params::MctsParams
+    batch_size::Int
+    gspec_::Any
+end
+
+function BackgammonNet.agent_move(agent::EvalAlphaZeroAgent, g::BackgammonGame)
+    env = GI.init(agent.gspec_)
+    env.game = BackgammonNet.clone(g)
+    player = BatchedMCTS.BatchedMctsPlayer(
+        agent.gspec_, agent.single_oracle, agent.mcts_params;
+        batch_size=agent.batch_size, batch_oracle=agent.batch_oracle)
+    actions, policy = BatchedMCTS.think(player, env)
+    BatchedMCTS.reset_player!(player)
+    return actions[argmax(policy)]
+end
+
+function eval_race_game_server(az_agent::EvalAlphaZeroAgent, wildbg_agent::BackgammonNet.BackendAgent,
+                               position_data::Tuple, net; seed::Int=1, az_is_white::Bool=true)
+    rng = MersenneTwister(seed)
+    p0, p1, cp = position_data
+    g = BackgammonGame(p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
+                       obs_type=:minimal_flat)
+    value_samples = PositionValueSample[]
+    while !BackgammonNet.game_terminated(g)
+        if BackgammonNet.is_chance_node(g)
+            BackgammonNet.sample_chance!(g, rng)
+        else
+            is_p0_turn = g.current_player == 0
+            is_az_turn = is_p0_turn == az_is_white
+            if is_az_turn
+                r = _eval_forward_network(net, [g])
+                nn_v = Float64(r[1][2])
+                wb_v = Float64(BackgammonNet.evaluate(wildbg_agent.backend, g))
+                push!(value_samples, PositionValueSample(nn_v, wb_v))
+            end
+            agent = is_az_turn ? az_agent : wildbg_agent
+            action = BackgammonNet.agent_move(agent, g)
+            BackgammonNet.apply_action!(g, action)
+        end
+    end
+    white_reward = Float64(g.reward)
+    az_reward = az_is_white ? white_reward : -white_reward
+    return (reward=az_reward, value_samples=value_samples)
+end
+
+"""Run eval vs wildbg on fixed positions using CPU threads.
+Returns (equity, win_pct, value_mse, value_corr) or nothing if eval disabled."""
+function run_eval!(network_to_eval, iter::Int)
+    !EVAL_ENABLED && return nothing
+    isempty(EVAL_POSITIONS) && return nothing
+
+    # Copy network to CPU for eval
+    eval_net = Flux.cpu(network_to_eval)
+
+    batch_oracle(states::Vector) = _eval_forward_network(eval_net, states)
+    single_oracle(s) = batch_oracle([s])[1]
+
+    eval_mcts_params = MctsParams(
+        num_iters_per_turn=EVAL_MCTS_ITERS,
+        cpuct=1.5,
+        temperature=ConstSchedule(0.0),
+        dirichlet_noise_ϵ=0.0,
+        dirichlet_noise_α=1.0)
+
+    az_agent = EvalAlphaZeroAgent(single_oracle, batch_oracle, eval_mcts_params, 50, gspec)
+
+    n_pos = length(EVAL_POSITIONS)
+    n_total = 2 * n_pos  # both sides
+    rewards = Vector{Float64}(undef, n_total)
+    vsamples = Vector{Vector{PositionValueSample}}(undef, n_total)
+
+    # Create per-worker wildbg backends
+    n_workers = min(EVAL_WORKERS, Threads.nthreads() - 1)
+    n_workers = max(1, n_workers)
+
+    wildbg_agents = [begin
+        wb = BackgammonNet.WildbgBackend(nets=nets_variant)
+        BackgammonNet.open!(wb)
+        BackgammonNet.BackendAgent(wb)
+    end for _ in 1:n_workers]
+
+    t_start = time()
+    claimed = Threads.Atomic{Int}(0)
+
+    Threads.@threads for tid in 1:n_workers
+        wa = wildbg_agents[tid]
+        while true
+            job = Threads.atomic_add!(claimed, 1) + 1
+            job > n_total && break
+            if job <= n_pos
+                pos_idx = job
+                az_white = true
+            else
+                pos_idx = job - n_pos
+                az_white = false
+            end
+            result = eval_race_game_server(az_agent, wa, EVAL_POSITIONS[pos_idx], eval_net;
+                                           seed=job + iter * 10000, az_is_white=az_white)
+            rewards[job] = result.reward
+            vsamples[job] = result.value_samples
+        end
+    end
+
+    elapsed = time() - t_start
+
+    for wa in wildbg_agents
+        BackgammonNet.close(wa.backend)
+    end
+
+    # Compute stats
+    avg_equity = mean(rewards)
+    win_pct = 100 * count(r -> r > 0, rewards) / n_total
+    white_equity = mean(rewards[1:n_pos])
+    black_equity = mean(rewards[n_pos+1:end])
+
+    all_vs = PositionValueSample[]
+    for vs in vsamples; append!(all_vs, vs); end
+    value_mse = NaN
+    value_corr = NaN
+    if length(all_vs) >= 3
+        nn = [s.nn_val for s in all_vs]
+        wb = [s.wb_val for s in all_vs]
+        value_mse = mean((nn .- wb) .^ 2)
+        value_corr = cor(nn, wb)
+    end
+
+    @info "Eval iter $iter: equity=$(round(avg_equity, digits=3)) win%=$(round(win_pct, digits=1)) " *
+          "white=$(round(white_equity, digits=3)) black=$(round(black_equity, digits=3)) " *
+          "value_mse=$(round(value_mse, digits=4)) corr=$(round(value_corr, digits=4)) " *
+          "$(n_total) games in $(round(elapsed, digits=1))s"
+
+    return (equity=avg_equity, win_pct=win_pct, white_equity=white_equity, black_equity=black_equity,
+            value_mse=value_mse, value_corr=value_corr, n_games=n_total, elapsed=elapsed)
+end
 
 # Create networks
 println("\nCreating networks...")
@@ -310,6 +572,8 @@ if !isempty(ARGS["resume"])
             START_ITER = parse(Int, strip(read(iter_file, String)))
         end
         println("Resumed from $resume_dir at iteration $START_ITER")
+        # Buffer loading deferred to after replay_buffer is created (see RESUME_BUFFER_DIR below)
+        global RESUME_BUFFER_DIR = joinpath(resume_dir, "..")
     else
         # Try single-model checkpoint
         single_path = joinpath(resume_dir, "latest.data")
@@ -332,6 +596,19 @@ contact_opt = Flux.AdamW(LEARNING_RATE, (0.9f0, 0.999f0), L2_REG)
 contact_opt_state = Flux.setup(contact_opt, contact_network)
 race_opt = Flux.AdamW(LEARNING_RATE, (0.9f0, 0.999f0), L2_REG)
 race_opt_state = Flux.setup(race_opt, race_network)
+
+"""Update learning rate based on schedule. Returns current LR."""
+function update_lr!(opt_state, iter::Int, total_iters::Int)
+    if LR_SCHEDULE == "cosine"
+        # Cosine annealing: lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(π * t/T))
+        progress = Float32(iter) / Float32(total_iters)
+        lr = LR_MIN + 0.5f0 * (LEARNING_RATE - LR_MIN) * (1f0 + cos(Float32(π) * progress))
+    else
+        lr = LEARNING_RATE
+    end
+    Flux.adjust!(opt_state; eta=lr)
+    return lr
+end
 
 # Learning params (for loss function)
 const LEARNING_PARAMS = LearningParams(
@@ -397,6 +674,31 @@ if !isempty(ARGS["bootstrap_file"])
         println("  Loaded $loaded / $n_bootstrap bootstrap samples in $(round(t_load, digits=1))s")
         println("  Buffer size: $(buf_length(replay_buffer))")
         flush(stdout)
+    end
+end
+
+# Load buffer checkpoint if resuming (must happen after replay_buffer is created)
+if @isdefined(RESUME_BUFFER_DIR)
+    buf_path = joinpath(RESUME_BUFFER_DIR, "buffer", "buffer_iter_$START_ITER.jls")
+    if isfile(buf_path)
+        load_buffer!(replay_buffer, buf_path)
+        println("Loaded buffer checkpoint from $buf_path")
+    else
+        buf_dir = joinpath(RESUME_BUFFER_DIR, "buffer")
+        if isdir(buf_dir)
+            buf_files = filter(f -> startswith(f, "buffer_iter_") && endswith(f, ".jls"), readdir(buf_dir))
+            buf_iters = [parse(Int, match(r"buffer_iter_(\d+)\.jls", f)[1]) for f in buf_files]
+            valid = filter(i -> i <= START_ITER, buf_iters)
+            if !isempty(valid)
+                best_iter = maximum(valid)
+                load_buffer!(replay_buffer, joinpath(buf_dir, "buffer_iter_$best_iter.jls"))
+                println("Loaded buffer checkpoint from iteration $best_iter")
+            else
+                println("No buffer checkpoint found, starting with empty buffer")
+            end
+        else
+            println("No buffer directory found, starting with empty buffer")
+        end
     end
 end
 
@@ -472,7 +774,11 @@ function _train_model_on_samples!(buf_indices::Vector{Int}, network, opt_state)
     n = length(buf_indices)
     n < BATCH_SIZE && return (avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0, num_batches=0)
 
-    max_batches = max(1, ARGS["games_per_iteration"] * 200 ÷ BATCH_SIZE)
+    if ARGS["training_steps"] > 0
+        max_batches = ARGS["training_steps"]
+    else
+        max_batches = max(1, ARGS["games_per_iteration"] * 200 ÷ BATCH_SIZE)
+    end
     num_batches = min(max(1, n ÷ BATCH_SIZE), max_batches)
     total_loss = 0.0
     total_Lp = 0.0
@@ -604,7 +910,8 @@ function reanalyze_buffer!()
 
             # Write blended values back (lock-free)
             reanalyze_update!(replay_buffer, sub_buf_indices,
-                              new_values, new_eq_win, new_eq_gw, new_eq_bgw, new_eq_gl, new_eq_bgl)
+                              new_values, new_eq_win, new_eq_gw, new_eq_bgw, new_eq_gl, new_eq_bgl;
+                              α_blend=REANALYZE_BLEND)
 
             total_updated += length(sub_buf_indices)
         end
@@ -617,7 +924,14 @@ function reanalyze_buffer!()
 end
 
 # TensorBoard logger
-const TB_LOGGER = TBLogger(TB_DIR, tb_overwrite)
+const TB_LOGGER = if START_ITER > 0
+    lg = TBLogger(TB_DIR, tb_append)
+    lg.global_step = START_ITER
+    println("TensorBoard: appending from step $START_ITER")
+    lg
+else
+    TBLogger(TB_DIR, tb_overwrite)
+end
 
 # Log config
 with_logger(TB_LOGGER) do
@@ -757,8 +1071,8 @@ const SAMPLES_PER_ITERATION = ARGS["games_per_iteration"] * 200  # ~200 samples 
 training_task = Threads.@spawn begin
 
 for iter in (START_ITER + 1):ARGS["total_iterations"]
-    # Wait for enough new samples
-    target_samples = iter * SAMPLES_PER_ITERATION
+    # Wait for enough new samples (offset by START_ITER so resume works)
+    target_samples = (iter - START_ITER) * SAMPLES_PER_ITERATION
     while server_state.total_samples[] < target_samples
         cur = server_state.total_samples[]
         pct = round(100 * cur / target_samples, digits=1)
@@ -770,6 +1084,10 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     println()
 
     iter_start = time()
+
+    # Update learning rate
+    current_lr = update_lr!(contact_opt_state, iter, ARGS["total_iterations"])
+    update_lr!(race_opt_state, iter, ARGS["total_iterations"])
 
     # Train on buffer (GPU)
     t0 = time()
@@ -798,7 +1116,8 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
                          race_width=RACE_WIDTH, race_blocks=RACE_BLOCKS)
 
     # Log to console
-    @info "Iteration $iter" avg_loss contact_loss race_loss buffer_size=buf_length(replay_buffer) total_samples=server_state.total_samples[] n_clients=length(server_state.clients) iter_time t_train t_reanalyze n_reanalyzed
+    grad_steps = train_result.contact.num_batches + train_result.race.num_batches
+    @info "Iteration $iter" avg_loss contact_loss race_loss grad_steps buffer_size=buf_length(replay_buffer) total_samples=server_state.total_samples[] n_clients=length(server_state.clients) iter_time t_train t_reanalyze n_reanalyzed
 
     # Collect server and cluster stats
     server_stats = collect_server_stats()
@@ -825,11 +1144,14 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         @info "perf/iter_time" value=iter_time log_step_increment=0
         @info "buffer/size" value=buf_length(replay_buffer) log_step_increment=0
         @info "buffer/total_samples" value=server_state.total_samples[] log_step_increment=0
-        @info "buffer/contact_samples" value=length(parts.contact) log_step_increment=0
-        @info "buffer/race_samples" value=length(parts.race) log_step_increment=0
+        buf_parts = partition_indices(replay_buffer)
+        @info "buffer/contact_samples" value=length(buf_parts.contact) log_step_increment=0
+        @info "buffer/race_samples" value=length(buf_parts.race) log_step_increment=0
         if USE_PER
             @info "per/beta" value=replay_buffer.beta log_step_increment=0
         end
+        @info "train/lr" value=current_lr log_step_increment=0
+        @info "train/gradient_steps" value=(train_result.contact.num_batches + train_result.race.num_batches) log_step_increment=0
 
         # Cluster performance
         @info "cluster/total_games_per_sec" value=cluster_stats.total_games_per_sec log_step_increment=0
@@ -865,6 +1187,37 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
             print(f, iter)
         end
         @info "Saved checkpoint at iteration $iter"
+    end
+
+    # Buffer checkpoint (large — only every N iterations)
+    buf_interval = ARGS["buffer_checkpoint_interval"]
+    if buf_interval > 0 && iter % buf_interval == 0
+        buf_path = joinpath(DATA_DIR, "buffer", "buffer_iter_$iter.jls")
+        @info "Saving buffer checkpoint..." iter=iter size=replay_buffer.size
+        t0 = time()
+        save_buffer(replay_buffer, buf_path)
+        @info "Buffer checkpoint saved" path=buf_path elapsed=round(time()-t0, digits=1)
+    end
+
+    # Eval vs wildbg (CPU threads, parallel with self-play sample ingestion)
+    if EVAL_ENABLED && iter % EVAL_INTERVAL == 0
+        t0 = time()
+        eval_net = ARGS["training_mode"] == "race" ? race_network : contact_network
+        eval_result = run_eval!(eval_net, iter)
+        t_eval = time() - t0
+
+        if eval_result !== nothing
+            with_logger(TB_LOGGER) do
+                @info "eval/equity" value=eval_result.equity log_step_increment=0
+                @info "eval/win_pct" value=eval_result.win_pct log_step_increment=0
+                @info "eval/white_equity" value=eval_result.white_equity log_step_increment=0
+                @info "eval/black_equity" value=eval_result.black_equity log_step_increment=0
+                @info "eval/value_mse" value=eval_result.value_mse log_step_increment=0
+                @info "eval/value_corr" value=eval_result.value_corr log_step_increment=0
+                @info "eval/games" value=eval_result.n_games log_step_increment=0
+                @info "perf/eval_s" value=t_eval log_step_increment=0
+            end
+        end
     end
 end
 

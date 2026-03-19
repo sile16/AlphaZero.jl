@@ -9,9 +9,9 @@
 # Configuration:
 # - short_game=true: Faster games with pieces closer to bearing off
 # - doubles_only=true: Only doubles dice rolls (simpler game)
-# - OBSERVATION_TYPE: :minimal_flat (330), :full_flat (362), :minimal (780), :full (1612)
+# - OBSERVATION_TYPE: :minimal_flat (344), :full_flat, :minimal (44×1×26), :full (62×1×26)
 #
-# BackgammonNet v0.6.0+ required (344 minimal_flat features)
+# BackgammonNet v0.6.0+ required
 
 import AlphaZero.GI
 using StaticArrays
@@ -26,33 +26,32 @@ const DOUBLES_ONLY = false  # Full 21 dice outcomes for proper stochastic testin
 
 # Observation type: Symbol-based configuration (v0.3.2+)
 # Can be overridden via environment variable BACKGAMMON_OBS_TYPE
-# Available types:
-#   :minimal_flat (330)   - Flat vector for MLP (RECOMMENDED)
-#   :full_flat (362)      - Flat vector with extra features
-#   :biased_flat (?)      - Flat vector with heuristic features
-#   :minimal (30×1×26)    - Tensor for conv networks
-#   :full (62×1×26)       - Tensor with extra features
-#   :minimal_hybrid       - Named tuple (board=12×26, globals) for hybrid nets
-#   :full_hybrid          - Named tuple (board=12×26, globals=50) for hybrid nets
-#   :biased_hybrid        - Named tuple with heuristic features
+# Available types (flat = MLP input, conv = tensor, hybrid = named tuple):
+#   :minimal_flat (344)       - Flat vector for MLP (RECOMMENDED)
+#   :min_plus_flat            - Flat vector with additional features
+#   :full_flat                - Flat vector with all features
+#   :biased_flat              - Flat vector with heuristic features
+#   :minimal (44×1×26)        - Tensor for conv networks
+#   :min_plus                 - Tensor with additional features
+#   :full (62×1×26)           - Tensor with all features
+#   :minimal_hybrid           - Named tuple (board=12×26, globals) for hybrid nets
+#   :min_plus_hybrid          - Named tuple with additional globals
+#   :full_hybrid              - Named tuple with all globals
+#   :biased_hybrid            - Named tuple with heuristic features
 const OBS_TYPE_MAP = Dict(
-    "minimal" => :minimal_flat,      # Default to flat for MLP networks
     "minimal_flat" => :minimal_flat,
-    "min_plus" => :min_plus_flat,
     "min_plus_flat" => :min_plus_flat,
-    "full" => :full_flat,
     "full_flat" => :full_flat,
-    "biased" => :biased_flat,
     "biased_flat" => :biased_flat,
-    "minimal_conv" => :minimal,      # For conv networks
-    "min_plus_conv" => :min_plus,
-    "full_conv" => :full,
-    "minimal_hybrid" => :minimal_hybrid,  # For hybrid networks
+    "minimal" => :minimal,            # Conv tensor format
+    "min_plus" => :min_plus,
+    "full" => :full,
+    "minimal_hybrid" => :minimal_hybrid,
     "min_plus_hybrid" => :min_plus_hybrid,
     "full_hybrid" => :full_hybrid,
     "biased_hybrid" => :biased_hybrid,
 )
-const OBS_TYPE_STR = get(ENV, "BACKGAMMON_OBS_TYPE", "minimal")
+const OBS_TYPE_STR = get(ENV, "BACKGAMMON_OBS_TYPE", "minimal_flat")
 const OBSERVATION_TYPE = get(OBS_TYPE_MAP, OBS_TYPE_STR, :minimal_flat)
 
 # Action space: 676 actions (26*26 locations)

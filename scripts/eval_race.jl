@@ -26,7 +26,7 @@ function parse_args_eval()
             required = true
         "--obs-type"
             arg_type = String
-            default = "minimal"
+            default = "minimal_flat"
         "--num-games"
             help = "How many of the 2000 positions to play (0=all)"
             arg_type = Int

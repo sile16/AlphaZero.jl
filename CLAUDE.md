@@ -46,7 +46,7 @@ julia --threads 30 --project scripts/selfplay_client.jl --server http://jarvis:9
 ### Game
 - `games/backgammon-deterministic/` with `SHORT_GAME=true` (BackgammonNet built-in short positions)
 - BackgammonNet v0.3.2+ has symmetric initial positions (previous versions had asymmetric P0/P1)
-- Observation: `BACKGAMMON_OBS_TYPE=minimal` (330 features, flat vector)
+- Observation: `BACKGAMMON_OBS_TYPE=minimal_flat` (344 features, flat vector for MLP)
 - Action space: ~680 actions (2-checker move encoding)
 
 ## Evaluation
@@ -155,11 +155,13 @@ Full results (28 checkpoints): `/homeshare/projects/AlphaZero.jl/sessions/wildbg
 - `src/archive/cluster_v0/` - Old thread-based cluster module (replaced by HTTP distributed)
 - `/homeshare/projects/AlphaZero.jl/sessions/archive/` - Pre-v0.3.2 and experimental sessions
 
+### Inference
+- `src/inference/fast_weights.jl` - FastInference module: allocation-free CPU forward pass with pure Julia GEMM + LayerNorm (thread-safe, no BLAS contention). Used by selfplay_client.jl.
+
 ### Legacy modules (still compiled by AlphaZero.jl, not used by active training/eval)
-- `src/async_mcts.jl` - Async MCTS (unused, kept for module compilation)
-- `src/gumbel_mcts.jl` - Gumbel MCTS (unused, kept for module compilation)
-- `src/eval_mcts.jl` - EvalMCTS (3 critical bugs, unused)
-- `src/batchifier.jl`, `src/async_batchifier.jl`, `src/pingpong_batchifier.jl` - Old batchifiers (used by simulations.jl)
+- `src/batchifier.jl`, `src/async_batchifier.jl` - Old batchifiers (used by simulations.jl → session.jl)
+- `src/simulations.jl`, `src/training.jl`, `src/benchmark.jl` - Legacy single-machine training (used by session.jl)
+- `src/async_mcts.jl`, `src/gumbel_mcts.jl`, `src/pingpong_batchifier.jl` - Removed from compilation (2026-03-19)
 
 ## Testing
 
@@ -238,7 +240,7 @@ All under `/homeshare/projects/AlphaZero.jl/sessions/`:
 ### MCTS & Eval (2026-03-11)
 17. **Passthrough chance sampling is best for eval** -- Benchmarked all 5 mcts.jl chance modes (passthrough, sampling, stratified, progressive, full) at 1600 iters. Passthrough wins: -1.050 equity, 16% wins vs wildbg. Best alternative (sampling v=1.0) was -1.180. At 1600 iters, alternatives waste iterations on chance coverage instead of decision-tree depth. With a weak network, depth > width.
 18. **1600 MCTS iters >> 100 iters for eval** -- dual-model at 1600 iters: -1.277 equity, 9.7% wins vs wildbg small. At 100 iters: -1.828, 1.6% wins vs wildbg large. More MCTS budget at eval time dramatically improves play quality.
-19. **EvalMCTS module (`src/eval_mcts.jl`) has 3 critical bugs** -- terminal_value always 0.0 (no game outcome signal), player_switch always false at chance nodes, no virtual loss in batched traversal. These explain why EvalMCTS full expansion scored -2.304 equity (0% wins) vs passthrough -1.266 (10.8%). Fix bugs before retesting full expansion.
+19. **EvalMCTS removed** -- Had 3 critical bugs, was unused. All eval uses BatchedMCTS with passthrough chance sampling.
 20. **Re-test progressive widening when model is stronger** -- As NN values become more accurate, proper chance averaging should help. The crossover point is likely when model can consistently beat wildbg/GnuBG 0-ply. Progressive widening is the best candidate (probability-ordered expansion).
 21. **GPU inference on M3 Max (Metal.jl)** -- 4.12x raw speedup at batch=500, but 12ms kernel launch overhead means crossover at batch≈20-30. Best end-to-end: GPU-Lock with 6 workers = 2.36x (30 games/min). Metal is NOT thread-safe. Adding CPU workers alongside GPU HURTS. Speculative prefetch failed (0.09x). GPU is useful only when batch sizes are guaranteed large.
 22. **Value error vs wildbg not yet measured** -- Need to track NN value prediction accuracy against wildbg equity to understand when chance expansion will start helping. TODO: build eval script with per-position value comparison.
@@ -249,9 +251,7 @@ All under `/homeshare/projects/AlphaZero.jl/sessions/`:
 
 1. **Value error tracking vs wildbg** -- Build eval script that compares NN value predictions against wildbg equity on positions from self-play games. Track MSE/correlation separately for contact vs race model. Script: `scripts/eval_value_accuracy.jl` (TODO).
 
-2. **Fix EvalMCTS bugs** -- 3 bugs in `src/eval_mcts.jl`: (a) terminal_value=0.0 → use `GI.white_reward`, (b) player_switch=false at chance nodes, (c) no virtual loss. After fixing, re-benchmark full chance expansion vs passthrough.
-
-3. **GPU eval (revisit after model is stronger)** -- GPU-Lock with 6 workers = 2.36x speedup on Neo. Worth revisiting when model strength justifies longer eval runs. Scripts: `scripts/bench_gpu_eval.jl`.
+2. **GPU eval (revisit after model is stronger)** -- GPU-Lock with 6 workers = 2.36x speedup on Neo. Worth revisiting when model strength justifies longer eval runs. Scripts: `scripts/bench_gpu_eval.jl`.
 
 ### Phase 1: Training Efficiency (before scaling)
 

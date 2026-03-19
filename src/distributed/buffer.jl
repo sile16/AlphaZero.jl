@@ -302,3 +302,56 @@ function reanalyze_update!(buf::PERBuffer, indices::Vector{Int},
         buf.priorities[idx] = abs(new_values[k] - old_val)
     end
 end
+
+"""Save buffer state to disk. Only saves the valid portion (buf.size samples)."""
+function save_buffer(buf::PERBuffer, path::String)
+    lock(buf.lock) do
+        n = buf.size
+        data = Dict{String, Any}(
+            "states"     => buf.states[:, 1:n],
+            "policies"   => buf.policies[:, 1:n],
+            "values"     => buf.values[1:n],
+            "equities"   => buf.equities[:, 1:n],
+            "has_equity"  => buf.has_equity[1:n],
+            "is_chance"   => buf.is_chance[1:n],
+            "is_contact"  => buf.is_contact[1:n],
+            "is_bearoff"  => buf.is_bearoff[1:n],
+            "priorities"  => buf.priorities[1:n],
+            "size"        => n,
+            "write_pos"   => buf.write_pos,
+            "beta"        => buf.beta,
+            "beta_init"   => buf.beta_init,
+            "beta_annealing_iters" => buf.beta_annealing_iters,
+            "current_iter" => buf.current_iter,
+        )
+        Serialization.serialize(path, data)
+    end
+    return nothing
+end
+
+"""Load buffer state from disk, restoring into an existing PERBuffer."""
+function load_buffer!(buf::PERBuffer, path::String)
+    data = Serialization.deserialize(path)
+    n = data["size"]::Int
+    @assert n <= buf.capacity "Saved buffer size ($n) exceeds capacity ($(buf.capacity))"
+
+    lock(buf.lock) do
+        buf.states[:, 1:n]    .= data["states"]
+        buf.policies[:, 1:n]  .= data["policies"]
+        buf.values[1:n]       .= data["values"]
+        buf.equities[:, 1:n]  .= data["equities"]
+        buf.has_equity[1:n]   .= data["has_equity"]
+        buf.is_chance[1:n]    .= data["is_chance"]
+        buf.is_contact[1:n]   .= data["is_contact"]
+        buf.is_bearoff[1:n]   .= data["is_bearoff"]
+        buf.priorities[1:n]   .= data["priorities"]
+        buf.size = n
+        buf.write_pos = data["write_pos"]::Int
+        buf.beta = data["beta"]
+        buf.beta_init = data["beta_init"]
+        buf.current_iter = data["current_iter"]
+        buf.beta_annealing_iters = data["beta_annealing_iters"]
+    end
+    @info "Loaded buffer: $n samples, write_pos=$(buf.write_pos), beta=$(buf.beta)"
+    return nothing
+end
