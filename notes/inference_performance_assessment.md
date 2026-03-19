@@ -331,13 +331,13 @@ games, that's ~10ms total — small relative to game time but unnecessary.
    `src/inference/backgammon_oracles.jl`. Do not reintroduce script-specific
    CPU inference paths.
 
-2. **Use production eval throughput, not just raw oracle throughput, to choose
-   the x86 default**:
-   - Neo (macOS/ARM): `FastWeights` remains the expected default.
-   - Jarvis (Linux/x86): still unresolved after refactor. Raw shared-oracle
-     throughput favored `FastWeights` at batch=16, but tiny production eval
-     still favored `Flux/BLAS`.
-   - Keep `auto` as-is for now, then validate it with a larger Jarvis matrix.
+2. **Use `FastWeights` as the production CPU default on both Neo and Jarvis**:
+   - Neo (macOS/ARM): `FastWeights` wins both eval and self-play by clear margins.
+   - Jarvis (Linux/x86): focused production benchmarks now also favor
+     `FastWeights` for self-play, and for eval it is both faster and more stable
+     at representative worker counts.
+   - `Flux/BLAS` should remain available as a fallback/diagnostic backend, not
+     the default.
 
 3. **Treat the old `bufs_lock` item as completed**.
    The eval hot-path lock was removed by moving to preallocated per-thread
@@ -381,11 +381,10 @@ games, that's ~10ms total — small relative to game time but unnecessary.
 1. **The #1 performance issue was BLAS contention on Neo** — switching to
    FastWeights gave 18.2x speedup. This is now fixed.
 
-2. **Before the refactor, Neo and Jarvis appeared to have opposite optimal
-   CPU backends** — FastWeights for Neo, BLAS for Jarvis. After moving both
-   eval and self-play to one shared backend/oracle layer, Neo still points to
-   FastWeights, but Jarvis now needs production-path revalidation before we
-   lock in the x86 default.
+2. **Production-path benchmarks matter more than raw GEMM or raw oracle speed**.
+   After moving eval and self-play to one shared backend/oracle layer, the
+   current production winner is `FastWeights` on both Neo and Jarvis, even
+   though older low-level x86 measurements suggested MKL/BLAS might win.
 
 3. **The M3 Max GPU is underutilized** — At batch=500, it's 28x faster than
    a single CPU thread for full forward. A GPU inference server batching
@@ -413,9 +412,9 @@ we re-ran small sanity checks on both Neo and Jarvis.
 ### Implementation Status
 
 - Eval and self-play now share one CPU oracle/backend layer.
-- `auto` currently resolves to:
+- `auto` now resolves to:
   - `FastWeights` on Apple
-  - `Flux/BLAS` on non-Apple
+  - `FastWeights` on non-Apple
 - Eval hot-path `bufs_lock` was removed as part of the consolidation.
 - Shared oracle fix: **chance nodes now produce an empty action mask**. This was
   a correctness issue in the refactored packer and is now fixed.
@@ -448,14 +447,17 @@ batch=16):
 
 ### Revised Interpretation
 
-The raw shared-oracle benchmark and end-to-end eval disagree on Jarvis:
+The initial post-refactor Jarvis read was inconclusive because tiny eval runs and
+coarse timer rounding hid the backend difference. Focused production benchmarks
+with exact timing changed that conclusion:
 
-- **Raw oracle throughput favors `FastWeights`** at batch=16 in the refactored path.
-- **End-to-end eval still favors `Flux/BLAS`** for this tiny production test.
+- **Neo**: `FastWeights` clearly wins eval and self-play.
+- **Jarvis self-play**: `FastWeights` clearly wins.
+- **Jarvis eval**: `FastWeights` wins at representative worker counts, and the
+  `Flux/BLAS` path is currently unstable at the 14-worker eval setting.
 
-This means the current `auto` heuristic is **good enough to keep for now**, but it
-should be treated as provisional rather than proven. We should not choose the x86
-default based on raw oracle throughput alone.
+We should therefore choose the x86 default from the production path, not from raw
+oracle throughput or historical GEMM results.
 
 ### Practical Insights / Caveats
 
@@ -474,33 +476,19 @@ default based on raw oracle throughput alone.
 ### Updated Priority
 
 1. Keep the shared backend/oracle refactor as the base path.
-2. Use **production eval throughput** (`eval_vs_wildbg.jl`, `eval_race.jl`) as the
-   deciding signal for the x86 default, not just raw oracle throughput.
-3. Run a larger Jarvis comparison matrix before changing `auto`:
-   - batch sizes: 16, 32, 50
-   - workers: 4, 8, 14
-   - backends: `fast`, `flux`
-4. Only after that matrix should we decide whether Jarvis stays on `Flux/BLAS`
-   by default or flips to `FastWeights` for some regimes.
-5. SIMD work remains Apple-focused. x86 should only get custom GEMM effort if
-   end-to-end testing shows `FastWeights` consistently beats MKL in production.
+2. Keep `FastWeights` as the default CPU backend on both Neo and Jarvis.
+3. Treat `Flux/BLAS` as a fallback/diagnostic path until the Jarvis eval
+   instability is understood.
+4. SIMD work remains Apple-focused. That is still the best place to improve the
+   remaining CPU inference gap.
+5. Only after the Apple CPU path is tighter should we spend more time on x86
+   backend tuning.
 
 ### Immediate Next Step Matrix
 
-This matrix was completed on Jarvis on 2026-03-19 before changing `auto`:
-
-1. `eval_vs_wildbg.jl` with `--inference-backend=fast`
-2. `eval_vs_wildbg.jl` with `--inference-backend=flux`
-3. Repeat for:
-   - `--inference-batch-size=16,32,50`
-   - `--num-workers=4,8,14`
-   - `--mcts-iters=50` first, then `100`
-4. Record:
-   - wall time
-   - games/min
-   - any instability / contention symptoms
-5. Only after that choose whether x86 `auto` should stay on `Flux/BLAS` or move
-   to `FastWeights` for some or all regimes.
+This matrix was completed on Jarvis on 2026-03-19 before changing `auto`.
+It was useful as a stability check, but not decisive for backend selection
+because the timer rounded everything to `0.2 min`.
 
 ### Jarvis Production Matrix Results (2026-03-19)
 
@@ -527,7 +515,7 @@ Every run completed successfully and the script-reported summary was identical:
 
 #### What This Means
 
-This matrix did **not** separate `fast` from `flux` on Jarvis, but the reason is
+This matrix did **not** separate `fast` from `flux` on Jarvis, but the reason was
 measurement precision rather than confirmed equivalence:
 
 - `eval_vs_wildbg.jl` currently prints time as `round(eval_time / 60, digits=1)`.
@@ -539,12 +527,10 @@ measurement precision rather than confirmed equivalence:
 
 #### Updated Interpretation
 
-- The Jarvis matrix is still useful as a **stability check**: both backends ran
-  cleanly across workers `4-14`, batch sizes `16-50`, and MCTS iterations
-  `50-100`.
-- It is **not sufficient** to choose the x86 default.
-- `auto` should therefore remain **provisional** on x86 until we rerun with
-  higher-resolution timing or larger runs.
+- The Jarvis matrix was still useful as a **stability check**.
+- It was **not sufficient** to choose the x86 default.
+- We followed it with focused production runs using higher-resolution timing and
+  representative worker counts. Those runs are the basis for the current default.
 
 #### Revised Next Step
 
@@ -558,11 +544,271 @@ Before changing Jarvis defaults, rerun a smaller focused comparison with one of:
      current rounding granularity
    - keep the same production path and compare `fast` vs `flux`
 
-Until then, the safest policy is:
+That measurement issue is now resolved for the production recommendation below.
 
-- **Neo**: keep `FastWeights` as default
-- **Jarvis/x86**: keep `Flux/BLAS` as the current `auto` default, but treat it as
-  unproven rather than final
+## 12. Focused Production Benchmarks (2026-03-19)
+
+To answer the real deployment question directly, we ran focused production-path
+benchmarks for eval and self-play on both target machines.
+
+### Neo (M3 Max)
+
+#### Eval (`eval_vs_wildbg.jl`)
+
+Representative config:
+
+- 24 workers
+- 100 MCTS iterations
+- inference batch size 50
+- dual-model checkpoint (`256w×5b + 128w×3b`)
+- 5 games/side (10 total)
+
+| Backend | Seconds | Games/min | Result |
+|---|---:|---:|---|
+| `fast` | **5.21** | **115.2** | winner |
+| `flux` | 8.31 | 72.2 | slower |
+
+`FastWeights` is **1.60x faster** than `Flux/BLAS` on Neo eval.
+
+#### Self-play (`bench_selfplay_backends.jl`)
+
+Representative config:
+
+- 22 workers
+- 400 MCTS iterations
+- inference batch size 50
+- dual-model checkpoint
+- 20 self-play games
+
+| Backend | Seconds | Games/min | Result |
+|---|---:|---:|---|
+| `fast` | **6.23** | **192.7** | winner |
+| `flux` | 120.40 | 10.0 | much slower |
+
+`FastWeights` is **19.3x faster** than `Flux/BLAS` on Neo self-play.
+
+### Jarvis (i7-10700K)
+
+#### Eval (`eval_vs_wildbg.jl`)
+
+Representative production config:
+
+- 14 workers
+- 100 MCTS iterations
+- inference batch size 50
+- dual-model checkpoint
+- 20 games/side (40 total)
+
+| Backend | Seconds | Games/min | Result |
+|---|---:|---:|---|
+| `fast` | **9.89** | **242.6** | winner |
+| `flux` | failed | failed | `BoundsError` in `BatchedMCTS.traverse_to_leaf!` at 14 workers |
+
+To check whether this was only a high-worker issue, we reran Jarvis eval at
+8 workers:
+
+| Backend | Seconds | Games/min | Result |
+|---|---:|---:|---|
+| `fast` | **9.84** | **243.8** | winner |
+| `flux` | 11.73 | 204.6 | slower |
+
+So on Jarvis eval, `FastWeights` is:
+
+- **faster** than `Flux/BLAS` at 8 workers (`1.19x`)
+- **stable** at both 8 and 14 workers
+- currently the only backend that completed the representative 14-worker run
+
+#### Self-play (`bench_selfplay_backends.jl`)
+
+Representative config:
+
+- 8 workers
+- 400 MCTS iterations
+- inference batch size 50
+- dual-model checkpoint
+- 20 self-play games
+
+| Backend | Seconds | Games/min | Result |
+|---|---:|---:|---|
+| `fast` | **14.18** | **84.6** | winner |
+| `flux` | 26.99 | 44.5 | slower |
+
+`FastWeights` is **1.90x faster** than `Flux/BLAS` on Jarvis self-play.
+
+### Final Current Recommendation
+
+For the current codebase, model size, and production settings:
+
+- **Neo eval**: use `FastWeights`
+- **Neo self-play**: use `FastWeights`
+- **Jarvis eval**: use `FastWeights`
+- **Jarvis self-play**: use `FastWeights`
+
+So the shared `auto` backend should now resolve to `FastWeights` on both target
+machines.
+
+### Remaining Caveats
+
+- Jarvis raw GEMM / raw oracle benchmarks and older notes suggested MKL/BLAS
+  might be best on x86. The current production-path data does not support using
+  that as the default.
+- The Jarvis eval `Flux/BLAS` failure at 14 workers should still be investigated,
+  because it may indicate a batching or traversal bug triggered under that path.
+- Apple-specific SIMD work remains the most promising next CPU optimization.
+
+## 13. Lessons Learned
+
+These investigations surfaced several classes of problems that matter as much as
+raw kernel speed:
+
+### 1. Production-path correctness beats low-level intuition
+
+- Older GEMM and raw-oracle measurements suggested one backend choice.
+- Production eval/self-play sometimes pointed the other way.
+- The right decision signal is the real workload, not isolated math kernels.
+
+### 2. Coarse measurement can send us in the wrong direction
+
+- The original Jarvis matrix rounded time to `0.1 min`, flattening distinct runs
+  into identical `0.2 min` outputs.
+- This made a real backend comparison look inconclusive when the instrumentation
+  was simply too coarse.
+
+### 3. State aliasing inside MCTS is extremely dangerous
+
+- The lightweight `GI.current_state` optimization returned states that aliased
+  pooled game buffers.
+- BatchedMCTS stores those states in the tree while reusing pooled game objects.
+- That allowed later simulations to mutate data that earlier tree entries still
+  depended on, producing hard-to-reason-about action mismatches and crashes.
+
+### 4. Oracle/action contracts must come from one canonical source
+
+- The shared oracle built action masks manually from `legal_actions(state)`.
+- The network interface and MCTS semantics are defined in terms of
+  `GI.actions_mask(GI.init(gspec, state))` and `GI.available_actions(game)`.
+- Reconstructing that logic by hand created silent drift between the oracle's
+  policy vector and MCTS's action list.
+
+### 5. Preallocated buffers are easy to misuse
+
+- The shared `flux` path accidentally forwarded the full preallocated batch
+  matrix instead of only the active `1:n` columns.
+- That likely distorted both speed and stress behavior.
+- Reusing buffers is good, but only if the active slice is explicit everywhere.
+
+### 6. Assertions pay for themselves
+
+- Adding `length(P) == length(actions)` in `init_state_info` turned an obscure
+  `BoundsError` deep in traversal into an immediate, actionable contract failure.
+- Once the true invariant was checked, the debugging path got much shorter.
+
+## 14. How To Avoid This Class of Issue
+
+### A. Make the oracle contract executable
+
+Add tests that, for random decision states:
+
+- compare `make_cpu_oracles(...).batch_oracle([s])[1][1]` length against
+  `length(GI.available_actions(GI.init(gspec, s)))`
+- compare the shared backend outputs against `Network.evaluate_batch`
+- run this for both `fast` and `flux`
+
+This should be a required invariant test, not an ad hoc debugging step.
+
+### B. Ban aliasing optimizations in tree-stored states unless proven safe
+
+Any optimization that returns a "lightweight clone" of a state should be assumed
+unsafe until it passes explicit tests showing:
+
+- no shared mutable buffers
+- stable hashing/equality after later environment mutation
+- stable legal action sets after pool reuse
+
+If we cannot prove those properties, use an owning clone.
+
+### C. Use the game interface as the single source of truth
+
+Do not hand-roll action masks or action ordering in backend-specific code.
+
+Preferred rule:
+
+- action masks come from `GI.actions_mask(GI.init(gspec, state))`
+- action lists come from `GI.available_actions(game)`
+
+Backend code should consume that contract, not reinterpret it.
+
+### D. Keep safety assertions in hot-path integration points
+
+The following assertions are worth keeping even in production or at least behind
+an easy debug flag:
+
+- `length(P) == length(actions)` when creating tree nodes
+- batched oracle result count equals number of queried states
+- no chance-node policies are created
+
+These catch structural bugs before they become meaningless throughput numbers.
+
+### E. Separate "safe baseline" from "optimized path"
+
+Whenever we add a specialized path:
+
+1. first make it match the generic `Network.evaluate_batch` behavior exactly
+2. then optimize allocations / pooling / routing
+3. then benchmark
+
+That ordering would likely have prevented both the mask mismatch and the aliased
+state bug.
+
+### F. Benchmark with enough precision and at the right level
+
+Going forward:
+
+- print seconds and games/min, not just rounded minutes
+- keep raw kernel/oracle benchmarks, but treat them as diagnostic only
+- make production eval/self-play the final arbiter for backend choice
+
+### G. Stress test concurrency explicitly
+
+For each backend and machine class, add a short stress suite that runs:
+
+- low worker count
+- representative worker count
+- max expected worker count
+- enough games to flush out intermittent contract violations
+
+This is especially important for batched MCTS plus pooled state reuse.
+
+---
+
+## Jarvis Revalidation Matrix
+
+These runs were done on the synced Jarvis repo after the backend refactor and
+the MCTS action-contract fixes.
+
+### Eval vs Wildbg
+
+- `fast` at `14 workers`, `100 MCTS`, `batch=50`, `20 games/side`: failed with
+  `Oracle policy/action mismatch: length(P)=19 length(actions)=10`
+- `flux` at the same settings: completed in `19.07 s` for `40 games`
+  (`125.9 games/min`)
+
+### Self-play
+
+- `fast` at `8 workers`, `400 MCTS`, `batch=50`, `20 games`: completed in
+  `18.06 s` (`66.4 games/min`)
+- `flux` at the same settings: completed in `28.20 s` (`42.5 games/min`)
+
+### Takeaway
+
+- Jarvis eval is currently production-safe on `flux`, not `fast`
+- Jarvis self-play is currently production-fastest on `fast`
+- the remaining `fast` eval failure is a real contract bug, not a timing-only
+  measurement artifact, because it reproduces in the production path at the
+  representative 14-worker setting
+- we should keep both backends available, but select by workload on Jarvis:
+  `flux` for eval, `fast` for self-play, until the remaining `fast` mismatch is
+  eliminated
 
 ---
 

@@ -327,7 +327,7 @@ function main()
             avg_reward, white_avg, black_avg)
     @printf("  Win%%:      %.1f%%\n", win_pct)
     @printf("  Games:     %d (%d positions × 2 sides)\n", n_total, n_games)
-    @printf("  Time:      %.1f min\n", elapsed / 60)
+    @printf("  Time:      %.2f s (%.3f min)\n", elapsed, elapsed / 60)
     @printf("  Rate:      %.1f games/min\n", n_total / (elapsed / 60))
 
     if vstats !== nothing

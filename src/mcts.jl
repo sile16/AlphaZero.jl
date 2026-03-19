@@ -211,6 +211,7 @@ end
 #####
 
 function init_state_info(P, V, prior_temperature, actions::Vector{Int})
+  length(P) == length(actions) || error("Oracle policy/action mismatch: length(P)=$(length(P)) length(actions)=$(length(actions))")
   P = Util.apply_temperature(P, prior_temperature)
   stats = [ActionStats(p, 0, 0) for p in P]
   return StateInfo(stats, actions, V)
@@ -296,8 +297,10 @@ function run_simulation_decision!(env::Env, game; η, root, depth)
     info = env.tree[state]
     actions = info.actions
   else
-    # New node: compute available actions and create tree entry
-    actions = GI.available_actions(game)
+    # New node: derive actions from the cloned state so the node/action
+    # contract stays aligned with the oracle input, even if the live env
+    # has been reused or its internal action cache was refreshed differently.
+    actions = GI.available_actions(GI.init(env.gspec, state))
     # Single-option states (e.g., forced PASS): create trivial tree entry
     # and continue traversal. No oracle evaluation needed since P=[1.0]
     # and the value will come from the child via backpropagation.

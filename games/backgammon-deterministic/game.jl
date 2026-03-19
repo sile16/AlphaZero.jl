@@ -151,19 +151,14 @@ function GI.clone_into!(dst::GameEnv, src::GameEnv)
 end
 
 function GI.current_state(g::GameEnv)
-  # Lightweight clone: shares internal buffers (actions_buf, sources).
-  # Safe because MCTS tree states are read-only (only used as Dict keys and
-  # for oracle evaluation). Eliminates ~3KB allocation per clone (~10K/game).
-  game = g.game
-  return BackgammonNet.BackgammonGame(
-    game.p0, game.p1, game.dice, game.remaining_actions,
-    game.current_player, game.terminated, game.reward,
-    game.doubles_only, game.obs_type,
-    game.cube_value, game.cube_owner, game.phase, game.cube_enabled,
-    game.my_away, game.opp_away, game.is_crawford, game.is_post_crawford,
-    game.jacoby_enabled, game.tavla,
-    game._actions_buffer, false, game._sources_buffer1, game._sources_buffer2
-  )
+  # Must return an owning clone.
+  #
+  # BatchedMCTS stores states in the search tree while reusing pooled GameEnv
+  # instances across simulations. If current_state aliases the pool's internal
+  # action/source buffers, later clone_into! calls can mutate states that are
+  # already in the tree, which breaks the oracle/action contract and can crash
+  # MCTS with policy/action-length mismatches.
+  return BackgammonNet.clone(g.game)
 end
 
 function GI.set_state!(g::GameEnv, state::BackgammonNet.BackgammonGame)

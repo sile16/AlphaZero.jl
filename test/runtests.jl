@@ -28,6 +28,10 @@ end
   include("test_reanalyze.jl")
 end
 
+@testset "Backgammon Inference Regressions" begin
+  include("test_backgammon_inference_regressions.jl")
+end
+
 @testset "Dummy Runs" begin
   dir = "sessions/test-tictactoe"
   @test dummy_run(experiments["tictactoe"], nostdout=false) == nothing

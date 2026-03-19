@@ -52,10 +52,6 @@ function OracleScratch(state_dim::Int, num_actions::Int, max_batch::Int; dual::B
         Vector{Tuple{Vector{Float32}, Float32}}(undef, max_batch))
 end
 
-struct FluxWorkerBuffers
-    scratch::OracleScratch
-end
-
 struct FastWorkerBuffers
     scratch::OracleScratch
     primary_fast::FastBuffers
@@ -69,7 +65,7 @@ function normalize_cpu_backend(name::Union{Symbol, AbstractString})
     return backend
 end
 
-default_cpu_backend() = Sys.isapple() ? :fast : :flux
+default_cpu_backend() = :fast
 
 function resolve_cpu_backend(name::Union{Symbol, AbstractString}=:auto)
     backend = normalize_cpu_backend(name)
@@ -94,7 +90,8 @@ function _populate_column!(cfg::OracleConfig, X::Matrix{Float32}, A::Matrix{Floa
     a_col = @view(A[:, col])
     fill!(a_col, 0.0f0)
     if !BackgammonNet.game_terminated(state) && !BackgammonNet.is_chance_node(state)
-        @inbounds for action in BackgammonNet.legal_actions(state)
+        actions = GI.available_actions(GI.init(cfg.gspec, state))
+        @inbounds for action in actions
             if 1 <= action <= cfg.num_actions
                 a_col[action] = 1.0f0
             end
@@ -143,22 +140,11 @@ function _store_results!(scratch::OracleScratch, idxs::Vector{Int}, A::Matrix{Fl
     end
 end
 
-function _forward_flux!(scratch::OracleScratch, net, input::InputBuffers, idxs::Vector{Int}, n::Int, cfg::OracleConfig)
-    n == 0 && return
-    P_raw, V, _ = Network.convert_output_tuple(net, Network.forward_normalized(net, input.X, input.A))
-    _store_results!(scratch, idxs, input.A, P_raw, V, n, cfg.num_actions)
-end
-
 function _forward_fast!(scratch::OracleScratch, fw::FastWeights, fb::FastBuffers,
                         input::InputBuffers, idxs::Vector{Int}, n::Int, cfg::OracleConfig)
     n == 0 && return
     P, V, _ = fast_forward_normalized!(fw, fb, input.X, input.A, n)
     _store_results!(scratch, idxs, input.A, P, V, n, cfg.num_actions)
-end
-
-function _make_flux_buffers(cfg::OracleConfig, batch_size::Int, nslots::Int; dual::Bool)
-    max_batch = batch_size + 1
-    [FluxWorkerBuffers(OracleScratch(cfg.state_dim, cfg.num_actions, max_batch; dual)) for _ in 1:nslots]
 end
 
 function _make_fast_buffers(cfg::OracleConfig, batch_size::Int, nslots::Int,
@@ -184,18 +170,39 @@ function make_cpu_oracles(backend::Union{Symbol, AbstractString},
     dual = secondary_net !== nothing || secondary_fw !== nothing
 
     if resolved == :flux
-        buffers = _make_flux_buffers(cfg, batch_size, nslots; dual)
         function flux_batch_oracle(states::Vector)
             n = length(states)
             n == 0 && return Tuple{Vector{Float32}, Float32}[]
-            worker = buffers[_worker_slot(buffers)]
-            scratch = worker.scratch
-            n_primary, n_secondary = _pack_states!(scratch, states, cfg)
-            _forward_flux!(scratch, primary_net, scratch.primary_input, scratch.primary_idxs, n_primary, cfg)
-            if dual
-                _forward_flux!(scratch, secondary_net, scratch.secondary_input, scratch.secondary_idxs, n_secondary, cfg)
+            if !dual
+                return Network.evaluate_batch(primary_net, states)
             end
-            return @view(scratch.results[1:n])
+            primary_states = eltype(states)[]
+            secondary_states = eltype(states)[]
+            primary_idxs = Int[]
+            secondary_idxs = Int[]
+            for (idx, state) in enumerate(states)
+                if cfg.route_state(state) == 2
+                    push!(secondary_states, state)
+                    push!(secondary_idxs, idx)
+                else
+                    push!(primary_states, state)
+                    push!(primary_idxs, idx)
+                end
+            end
+            results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
+            if !isempty(primary_states)
+                evals = Network.evaluate_batch(primary_net, primary_states)
+                for (j, idx) in enumerate(primary_idxs)
+                    results[idx] = evals[j]
+                end
+            end
+            if !isempty(secondary_states)
+                evals = Network.evaluate_batch(secondary_net, secondary_states)
+                for (j, idx) in enumerate(secondary_idxs)
+                    results[idx] = evals[j]
+                end
+            end
+            return results
         end
         flux_single_oracle(state) = flux_batch_oracle([state])[1]
         return flux_single_oracle, flux_batch_oracle

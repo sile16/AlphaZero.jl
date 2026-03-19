@@ -193,7 +193,9 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
         # Single Dict lookup (was: haskey + env.tree[state] = 2 lookups)
         info = get(env.tree, state, nothing)
         if info === nothing
-            leaf_actions = GI.available_actions(game)
+            # Derive leaf actions from the cloned state, not the pooled live
+            # env, so the stored node contract matches the oracle input exactly.
+            leaf_actions = GI.available_actions(GI.init(GI.spec(game), state))
 
             # Single-option states (e.g., forced PASS): create trivial tree entry
             # and continue traversal. No oracle evaluation needed since P=[1.0]
@@ -315,6 +317,8 @@ function batch_evaluate_pending!(benv::BatchedEnv{S}) where S
 
     # Batch evaluate
     results = batch_evaluate(benv, states_to_eval)
+    length(results) == length(states_to_eval) ||
+        error("Batched oracle result count mismatch: got $(length(results)) results for $(length(states_to_eval)) states")
 
     # Initialize tree nodes with results
     for (i, result_idx) in enumerate(eval_indices)
