@@ -1255,9 +1255,10 @@ function check_and_do_eval!()
         headers = auth_headers(client)
         resp = HTTP.get("$(SERVER_URL)/api/eval/status", headers;
                         status_exception=false, connect_timeout=10, readtimeout=30)
-        resp.status != 200 && return false
+        resp.status != 200 && (println("[EVAL] Status check returned $(resp.status)"); return false)
         eval_status = JSON.parse(String(resp.body))
-    catch
+    catch e
+        println("[EVAL] Status check failed: $e")
         return false
     end
 
@@ -1584,10 +1585,15 @@ function main_loop()
         if EVAL_CAPABLE && time() - last_eval_check > 30.0
             last_eval_check = time()
             try
+                println("[EVAL] Checking for eval work...")
+                flush(stdout)
                 check_and_do_eval!()
             catch e
                 println("[EVAL] Check error: $e")
-                @show e
+                for (exc, bt) in Base.catch_stack()
+                    showerror(stdout, exc, bt)
+                    println()
+                end
             end
             last_eval_check = time()  # reset after eval completes (may take a while)
         end
