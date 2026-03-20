@@ -61,6 +61,21 @@ function parse_args()
             help = "CPU inference backend: auto, fast, or flux"
             arg_type = String
             default = "auto"
+        "--eval-capable"
+            help = "Enable eval mode (client does eval when server has eval jobs)"
+            action = :store_true
+        "--eval-mcts-iters"
+            help = "MCTS iterations for eval games"
+            arg_type = Int
+            default = 600
+        "--wildbg-lib"
+            help = "Path to wildbg shared library (for eval)"
+            arg_type = String
+            default = ""
+        "--eval-positions-file"
+            help = "Path to fixed eval positions file (portable tuples)"
+            arg_type = String
+            default = "/homeshare/projects/AlphaZero.jl/eval_data/race_eval_2000.jls"
     end
 
     return ArgParse.parse_args(s)
@@ -71,6 +86,10 @@ const SERVER_URL = ARGS["server"]
 const NUM_WORKERS = ARGS["num_workers"]
 const GPU_WORKERS = ARGS["gpu_workers"]
 const USE_GPU = GPU_WORKERS > 0
+const EVAL_CAPABLE = ARGS["eval_capable"]
+const EVAL_MCTS_ITERS = ARGS["eval_mcts_iters"]
+const PAUSE_SELFPLAY = Threads.Atomic{Bool}(false)
+const ACTIVE_SELFPLAY_GAMES = Threads.Atomic{Int}(0)
 
 println("=" ^ 60)
 println("AlphaZero Self-Play Client")
@@ -90,6 +109,7 @@ println("Server: $SERVER_URL")
 println("Workers: $NUM_WORKERS CPU" * (GPU_WORKERS > 0 ? " + $GPU_WORKERS GPU" : ""))
 println("GPU: $(GPU_WORKERS > 0 ? "Metal ($GPU_WORKERS workers)" : "disabled")")
 println("CPU inference: $(AlphaZero.BackgammonInference.cpu_backend_summary(CPU_INFERENCE_BACKEND))")
+println("Eval capable: $EVAL_CAPABLE" * (EVAL_CAPABLE ? " ($(EVAL_MCTS_ITERS) MCTS iters)" : ""))
 println("=" ^ 60)
 flush(stdout)
 
@@ -1087,18 +1107,423 @@ function continuous_worker(worker_id::Int, rng::MersenneTwister)
     # Play games forever — one at a time, push samples immediately
     games_played = 0
     while true
-        # Use _play_games_loop with total_games=1 via atomic counter
-        games_claimed = Threads.Atomic{Int}(0)
-        result = _play_games_loop(worker_id, games_claimed, 1, sub_rng)
-        if !isempty(result.samples)
-            put!(SAMPLE_CHANNEL, result.samples)
+        # Check if self-play is paused (eval in progress)
+        if PAUSE_SELFPLAY[]
+            sleep(0.1)
+            continue
         end
-        games_played += 1
-        if games_played <= 3
-            println("  Worker $worker_id: game $games_played done, $(length(result.samples)) samples")
-            flush(stdout)
+        Threads.atomic_add!(ACTIVE_SELFPLAY_GAMES, 1)
+        try
+            # Use _play_games_loop with total_games=1 via atomic counter
+            games_claimed = Threads.Atomic{Int}(0)
+            result = _play_games_loop(worker_id, games_claimed, 1, sub_rng)
+            if !isempty(result.samples)
+                put!(SAMPLE_CHANNEL, result.samples)
+            end
+            games_played += 1
+            if games_played <= 3
+                println("  Worker $worker_id: game $games_played done, $(length(result.samples)) samples")
+                flush(stdout)
+            end
+        finally
+            Threads.atomic_sub!(ACTIVE_SELFPLAY_GAMES, 1)
         end
     end
+end
+
+#####
+##### Client-side eval mode
+#####
+
+# Eval weight state — separate from self-play weights
+mutable struct EvalWeightState
+    iter::Int
+    contact_fast_weights::Any
+    race_fast_weights::Any
+end
+const EVAL_WEIGHTS = EvalWeightState(0, nothing, nothing)
+
+# Load eval positions if eval-capable
+const EVAL_POSITIONS = if EVAL_CAPABLE
+    pos_file = ARGS["eval_positions_file"]
+    if isfile(pos_file)
+        pos = Serialization.deserialize(pos_file)
+        println("Eval: loaded $(length(pos)) positions from $pos_file")
+        pos
+    else
+        println("WARNING: Eval positions file not found: $pos_file — eval disabled")
+        nothing
+    end
+else
+    nothing
+end
+
+# Find wildbg library for eval
+function find_wildbg_lib_eval()
+    lib = ARGS["wildbg_lib"]
+    if !isempty(lib) && isfile(lib)
+        return lib
+    end
+    candidates = [
+        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg_main.dylib"),
+        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg_main.so"),
+        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg.dylib"),
+        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg.so"),
+    ]
+    for c in candidates
+        isfile(c) && return c
+    end
+    return ""
+end
+
+const WILDBG_LIB_EVAL = EVAL_CAPABLE ? find_wildbg_lib_eval() : ""
+if EVAL_CAPABLE
+    if isempty(WILDBG_LIB_EVAL)
+        println("WARNING: wildbg library not found — eval disabled")
+    else
+        println("Eval: wildbg lib = $WILDBG_LIB_EVAL")
+    end
+end
+
+# Eval agent struct (same pattern as training_server.jl / eval_race.jl)
+struct EvalAlphaZeroAgent <: BackgammonNet.AbstractAgent
+    single_oracle::Any
+    batch_oracle::Any
+    mcts_params::MctsParams
+    batch_size::Int
+    gspec_::Any
+end
+
+function BackgammonNet.agent_move(agent::EvalAlphaZeroAgent, g::BackgammonNet.BackgammonGame)
+    env = GI.init(agent.gspec_)
+    env.game = BackgammonNet.clone(g)
+    player = BatchedMCTS.BatchedMctsPlayer(
+        agent.gspec_, agent.single_oracle, agent.mcts_params;
+        batch_size=agent.batch_size, batch_oracle=agent.batch_oracle)
+    actions, policy = BatchedMCTS.think(player, env)
+    BatchedMCTS.reset_player!(player)
+    return actions[argmax(policy)]
+end
+
+struct PositionValueSample
+    nn_val::Float64
+    wb_val::Float64
+end
+
+"""Play a single eval game from a fixed position. Returns (reward, value_samples)."""
+function eval_game_from_position(az_agent::EvalAlphaZeroAgent,
+                                  wildbg_agent::BackgammonNet.BackendAgent,
+                                  position_data::Tuple,
+                                  value_batch_oracle;
+                                  seed::Int=1, az_is_white::Bool=true)
+    rng = MersenneTwister(seed)
+    p0, p1, cp = position_data
+    g = BackgammonNet.BackgammonGame(p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
+                                      obs_type=:minimal_flat)
+    value_samples = PositionValueSample[]
+
+    while !BackgammonNet.game_terminated(g)
+        if BackgammonNet.is_chance_node(g)
+            BackgammonNet.sample_chance!(g, rng)
+        else
+            is_p0_turn = g.current_player == 0
+            is_az_turn = is_p0_turn == az_is_white
+            if is_az_turn
+                nn_v = Float64(value_batch_oracle([g])[1][2])
+                wb_v = Float64(BackgammonNet.evaluate(wildbg_agent.backend, g))
+                push!(value_samples, PositionValueSample(nn_v, wb_v))
+            end
+            agent = is_az_turn ? az_agent : wildbg_agent
+            action = BackgammonNet.agent_move(agent, g)
+            BackgammonNet.apply_action!(g, action)
+        end
+    end
+
+    white_reward = Float64(g.reward)
+    az_reward = az_is_white ? white_reward : -white_reward
+    return (reward=az_reward, value_samples=value_samples)
+end
+
+"""Check for eval work from server. If available, pause self-play and run eval."""
+function check_and_do_eval!()
+    EVAL_POSITIONS === nothing && return false
+    isempty(WILDBG_LIB_EVAL) && return false
+
+    # Check eval status
+    local eval_status
+    try
+        headers = auth_headers(client)
+        resp = HTTP.get("$(SERVER_URL)/api/eval/status", headers;
+                        status_exception=false, connect_timeout=10, readtimeout=30)
+        resp.status != 200 && return false
+        eval_status = JSON.parse(String(resp.body))
+    catch
+        return false
+    end
+
+    eval_iter = get(eval_status, "eval_iter", 0)
+    eval_iter == 0 && return false
+    available = get(eval_status, "available", 0)
+    available == 0 && return false
+
+    println("\n[EVAL] Server has eval work: iter=$eval_iter, available=$available chunks")
+    flush(stdout)
+
+    # Pause self-play first, then download weights (avoids contention with self-play inference)
+    PAUSE_SELFPLAY[] = true
+    println("[EVAL] Pausing self-play, waiting for active games to finish...")
+    flush(stdout)
+    t_wait_start = time()
+    while ACTIVE_SELFPLAY_GAMES[] > 0
+        sleep(0.1)
+        if time() - t_wait_start > 60.0
+            println("[EVAL] WARNING: Timed out waiting for active games ($(ACTIVE_SELFPLAY_GAMES[]) still running)")
+            break
+        end
+    end
+    println("[EVAL] Self-play paused ($(round(time() - t_wait_start, digits=1))s wait)")
+    flush(stdout)
+
+    # Create eval networks and download weights (separate from self-play weights)
+    println("[EVAL] Setting up eval networks for iter $eval_iter...")
+    eval_contact_net = FluxLib.FCResNetMultiHead(
+        gspec, FluxLib.FCResNetMultiHeadHP(width=CONTACT_WIDTH, num_blocks=CONTACT_BLOCKS))
+    eval_race_net = FluxLib.FCResNetMultiHead(
+        gspec, FluxLib.FCResNetMultiHeadHP(width=RACE_WIDTH, num_blocks=RACE_BLOCKS))
+
+    result_c = download_weights(client, :contact)
+    result_r = download_weights(client, :race)
+    if result_c !== nothing
+        FluxLib.load_weights!(eval_contact_net, result_c[2])
+    end
+    if result_r !== nothing
+        FluxLib.load_weights!(eval_race_net, result_r[2])
+    end
+
+    # Create FastWeights for eval if using fast backend
+    eval_contact_fw = CPU_INFERENCE_BACKEND == :fast ?
+        AlphaZero.FastInference.extract_fast_weights(eval_contact_net) : nothing
+    eval_race_fw = CPU_INFERENCE_BACKEND == :fast ?
+        AlphaZero.FastInference.extract_fast_weights(eval_race_net) : nothing
+    EVAL_WEIGHTS.iter = eval_iter
+    EVAL_WEIGHTS.contact_fast_weights = eval_contact_fw
+    EVAL_WEIGHTS.race_fast_weights = eval_race_fw
+    println("[EVAL] Eval weights ready for iter $eval_iter")
+
+    # Set up eval oracles
+    eval_oracle_cfg = AlphaZero.BackgammonInference.OracleConfig(
+        _state_dim, NUM_ACTIONS, gspec;
+        vectorize_state! = vectorize_state_into!,
+        route_state = s -> (s isa BackgammonNet.BackgammonGame && !BackgammonNet.is_contact_position(s) ? 2 : 1))
+
+    eval_oracles = if CPU_INFERENCE_BACKEND == :fast && eval_contact_fw !== nothing
+        AlphaZero.BackgammonInference.make_cpu_oracles(
+            CPU_INFERENCE_BACKEND, eval_contact_net, eval_oracle_cfg;
+            secondary_net=eval_race_net, batch_size=INFERENCE_BATCH_SIZE,
+            primary_fw=eval_contact_fw, secondary_fw=eval_race_fw)
+    else
+        AlphaZero.BackgammonInference.make_cpu_oracles(
+            CPU_INFERENCE_BACKEND, eval_contact_net, eval_oracle_cfg;
+            secondary_net=eval_race_net, batch_size=INFERENCE_BATCH_SIZE)
+    end
+    eval_single_oracle = eval_oracles[1]
+    eval_batch_oracle = eval_oracles[2]
+
+    # Also create a value-only oracle for value comparison (Flux-based, batch=1)
+    value_oracles = AlphaZero.BackgammonInference.make_cpu_oracles(
+        :flux, eval_contact_net, eval_oracle_cfg;
+        secondary_net=eval_race_net, batch_size=1)
+    value_batch_oracle = value_oracles[2]
+
+    eval_mcts_params = MctsParams(
+        num_iters_per_turn=EVAL_MCTS_ITERS,
+        cpuct=1.5,
+        temperature=ConstSchedule(0.0),
+        dirichlet_noise_ϵ=0.0,
+        dirichlet_noise_α=1.0)
+
+    az_agent = EvalAlphaZeroAgent(eval_single_oracle, eval_batch_oracle,
+                                   eval_mcts_params, INFERENCE_BATCH_SIZE, gspec)
+
+    # Open wildbg backends (per-worker, not shared)
+    lib_size = filesize(WILDBG_LIB_EVAL)
+    nets_variant = lib_size > 10_000_000 ? :large : :small
+    if nets_variant == :large
+        BackgammonNet.wildbg_set_lib_path!(large=WILDBG_LIB_EVAL)
+    else
+        BackgammonNet.wildbg_set_lib_path!(small=WILDBG_LIB_EVAL)
+    end
+    println("[EVAL] wildbg: $nets_variant ($(round(lib_size/1e6, digits=1))MB)")
+
+    wildbg_backends = [begin
+        wb = BackgammonNet.WildbgBackend(nets=nets_variant)
+        BackgammonNet.open!(wb)
+        wb
+    end for _ in 1:NUM_WORKERS]
+
+    # Process eval chunks until none available
+    chunks_done = 0
+    t_eval_start = time()
+
+    try
+        while true
+            # Checkout a chunk
+            local chunk
+            try
+                headers = vcat(auth_headers(client), ["Content-Type" => "application/msgpack"])
+                body = MsgPack.pack(Dict("client_name" => client_name))
+                resp = HTTP.post("$(SERVER_URL)/api/eval/checkout", headers, body;
+                                 status_exception=false, connect_timeout=10, readtimeout=30)
+                resp.status != 200 && break
+                chunk = MsgPack.unpack(resp.body)
+            catch e
+                println("[EVAL] Checkout error: $e")
+                break
+            end
+
+            chunk_id = get(chunk, "chunk_id", 0)
+            chunk_id == 0 && break
+
+            pos_start = Int(chunk["position_range_start"])
+            pos_end = Int(chunk["position_range_end"])
+            az_is_white = Bool(chunk["az_is_white"])
+            n_games = pos_end - pos_start + 1
+
+            println("[EVAL] Chunk $chunk_id: positions $pos_start-$pos_end, az_is_white=$az_is_white ($n_games games)")
+            flush(stdout)
+
+            # Start heartbeat in background
+            chunk_done = Ref(false)
+            heartbeat_task = Threads.@spawn begin
+                while !chunk_done[]
+                    try
+                        hb_headers = vcat(auth_headers(client), ["Content-Type" => "application/msgpack"])
+                        hb_body = MsgPack.pack(Dict("chunk_id" => chunk_id, "client_name" => client_name))
+                        resp = HTTP.post("$(SERVER_URL)/api/eval/heartbeat", hb_headers, hb_body;
+                                         status_exception=false, connect_timeout=10, readtimeout=30)
+                        if resp.status == 200
+                            result = MsgPack.unpack(resp.body)
+                            if !get(result, "lease_extended", false)
+                                println("[EVAL] WARNING: Chunk $chunk_id lease lost")
+                                break
+                            end
+                        end
+                    catch; end
+                    sleep(60)
+                end
+            end
+
+            # Play games in parallel using work-stealing
+            rewards = Vector{Float64}(undef, n_games)
+            value_data = Vector{Vector{PositionValueSample}}(undef, n_games)
+            claimed = Threads.Atomic{Int}(0)
+            t_chunk_start = time()
+
+            Threads.@threads for tid in 1:min(NUM_WORKERS, n_games)
+                wb_agent = BackgammonNet.BackendAgent(wildbg_backends[tid])
+                while true
+                    job = Threads.atomic_add!(claimed, 1) + 1
+                    job > n_games && break
+                    pos_idx = pos_start + job - 1
+                    if pos_idx > length(EVAL_POSITIONS)
+                        rewards[job] = 0.0
+                        value_data[job] = PositionValueSample[]
+                        continue
+                    end
+                    result = eval_game_from_position(
+                        az_agent, wb_agent, EVAL_POSITIONS[pos_idx], value_batch_oracle;
+                        seed=chunk_id * 10000 + job, az_is_white=az_is_white)
+                    rewards[job] = result.reward
+                    value_data[job] = result.value_samples
+                end
+            end
+
+            chunk_done[] = true
+            t_chunk = time() - t_chunk_start
+
+            # Flatten value samples for submission
+            flat_value_samples = Float64[]
+            for vs in value_data
+                for s in vs
+                    push!(flat_value_samples, s.nn_val)
+                    push!(flat_value_samples, s.wb_val)
+                end
+            end
+
+            # Submit results with exponential backoff
+            submitted = false
+            backoff = 1.0
+            for attempt in 1:5
+                try
+                    sub_headers = vcat(auth_headers(client), ["Content-Type" => "application/msgpack"])
+                    sub_body = MsgPack.pack(Dict(
+                        "chunk_id" => chunk_id,
+                        "client_name" => client_name,
+                        "rewards" => collect(rewards),
+                        "value_samples" => flat_value_samples))
+                    resp = HTTP.post("$(SERVER_URL)/api/eval/submit", sub_headers, sub_body;
+                                     status_exception=false, connect_timeout=10, readtimeout=60)
+                    if resp.status == 200
+                        result = MsgPack.unpack(resp.body)
+                        eval_complete = get(result, "eval_complete", false)
+                        chunks_done += 1
+                        avg_reward = mean(rewards)
+                        win_pct = 100 * count(r -> r > 0, rewards) / n_games
+                        println("[EVAL] Chunk $chunk_id done: equity=$(round(avg_reward, digits=3)), win=$(round(win_pct, digits=1))%, $(round(t_chunk, digits=1))s" *
+                                (eval_complete ? " [EVAL COMPLETE]" : ""))
+                        flush(stdout)
+                        submitted = true
+                        if eval_complete
+                            @goto eval_finished
+                        end
+                        break
+                    else
+                        println("[EVAL] Submit failed (HTTP $(resp.status)), retry $attempt...")
+                    end
+                catch e
+                    println("[EVAL] Submit error: $e, retry $attempt...")
+                end
+                sleep(min(backoff, 30.0))
+                backoff *= 2
+            end
+            if !submitted
+                println("[EVAL] WARNING: Failed to submit chunk $chunk_id after 5 attempts")
+            end
+        end
+    catch e
+        println("[EVAL] Error during eval: $e")
+        @show e
+    end
+
+    @label eval_finished
+    t_eval = time() - t_eval_start
+    println("[EVAL] Eval session complete: $chunks_done chunks in $(round(t_eval, digits=1))s")
+    flush(stdout)
+
+    # Close wildbg backends
+    for wb in wildbg_backends
+        try
+            BackgammonNet.close(wb)
+        catch; end
+    end
+
+    # Resume self-play and sync weights
+    PAUSE_SELFPLAY[] = false
+    println("[EVAL] Self-play resumed")
+    flush(stdout)
+
+    # Force weight sync after eval to ensure self-play uses latest training weights
+    try
+        updated = sync_weights!(client, contact_network, race_network)
+        if updated
+            refresh_fast_weights!()
+            println("[EVAL] Weights re-synced after eval")
+        end
+    catch e
+        println("[EVAL] Weight sync after eval failed: $e")
+    end
+
+    return true
 end
 
 function main_loop()
@@ -1121,6 +1546,7 @@ function main_loop()
     batch_samples = []
     batch_games = 0
     t_batch_start = time()
+    last_eval_check = time()
 
     while true
         # Drain completed games from workers (blocking wait for first game)
@@ -1153,6 +1579,18 @@ function main_loop()
         batch = samples_to_batch(batch_samples)
         bytes = pack_samples(batch)
         put!(UPLOAD_CHANNEL, bytes)
+
+        # Periodic eval check (every 30 seconds)
+        if EVAL_CAPABLE && time() - last_eval_check > 30.0
+            last_eval_check = time()
+            try
+                check_and_do_eval!()
+            catch e
+                println("[EVAL] Check error: $e")
+                @show e
+            end
+            last_eval_check = time()  # reset after eval completes (may take a while)
+        end
 
         # Reset batch
         batch_samples = []
