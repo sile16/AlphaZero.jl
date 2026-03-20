@@ -81,6 +81,11 @@ module AlphaZero
   export TurnProgressiveSimParams, compute_turn_sim_budget, compute_ramp_turns
   export SamplesWeighingPolicy, CONSTANT_WEIGHT, LOG_WEIGHT, LINEAR_WEIGHT
 
+  # Unified game loop (replaces duplicate play loops in scripts)
+  include("game_loop.jl")
+  using .GameLoop
+  export GameLoop
+
   # Stats about training
   include("report.jl")
   export Report
