@@ -91,7 +91,7 @@ ssh $JARVIS "bash -l -c 'cd /home/sile/github/AlphaZero.jl && mkdir -p $V5_DATA_
   --start-positions-file /homeshare/projects/AlphaZero.jl/eval_data/race_starts_tuples.jls \
   --eval-positions-file /homeshare/projects/AlphaZero.jl/eval_data/race_eval_2000.jls \
   --bootstrap-file /homeshare/projects/AlphaZero.jl/eval_data/bootstrap_race_samples.jls \
-  > /tmp/training_server_race_v5.log 2>&1 &'"
+  >> /tmp/training_server_race_v5.log 2>&1 &'"
 echo "Waiting for server to start..."
 sleep 30
 
@@ -107,7 +107,7 @@ done
 
 # Launch Jarvis client
 echo "Starting Jarvis selfplay client..."
-ssh $JARVIS "bash -l -c 'cd /home/sile/github/AlphaZero.jl && nohup julia --threads 16 --project scripts/selfplay_client.jl --server http://127.0.0.1:9090 --api-key alphazero-dev-key --num-workers 8 --client-name jarvis-cpu > /tmp/selfplay_jarvis_cpu_v5.log 2>&1 &'"
+ssh $JARVIS "bash -l -c 'cd /home/sile/github/AlphaZero.jl && nohup julia --threads 16 --project scripts/selfplay_client.jl --server http://127.0.0.1:9090 --api-key alphazero-dev-key --num-workers 8 --client-name jarvis-cpu >> /tmp/selfplay_jarvis_cpu_v5.log 2>&1 &'"
 echo "Waiting for Jarvis client to connect..."
 sleep 30
 
@@ -119,7 +119,7 @@ nohup julia --threads 30 --project scripts/selfplay_client.jl \
   --api-key alphazero-dev-key \
   --num-workers 22 \
   --client-name neo-cpu \
-  > /tmp/selfplay_neo_cpu_v5.log 2>&1 &
+  >> /tmp/selfplay_neo_cpu_v5.log 2>&1 &
 echo "Neo client launched (PID: $!)"
 
 echo ""

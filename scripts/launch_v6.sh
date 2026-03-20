@@ -38,14 +38,14 @@ ssh $JARVIS "bash -l -c 'cd /home/sile/github/AlphaZero.jl && mkdir -p $V6_DATA_
   --buffer-checkpoint-interval 50 \
   --eval-mcts-iters 600 \
   --eval-games 1000 \
-  --eval-workers 14 \
+  --eval-workers 12 \
   --seed 42 \
   --lr-schedule cosine \
   --lr-min 0.0001 \
   --start-positions-file /homeshare/projects/AlphaZero.jl/eval_data/race_starts_tuples.jls \
   --eval-positions-file /homeshare/projects/AlphaZero.jl/eval_data/race_eval_2000.jls \
   --bootstrap-file /homeshare/projects/AlphaZero.jl/eval_data/bootstrap_race_samples.jls \
-  > /tmp/training_server_race_v6.log 2>&1 &'"
+  >> /tmp/training_server_race_v6.log 2>&1 &'"
 echo "Waiting for server to start..."
 sleep 30
 
@@ -61,7 +61,7 @@ done
 
 # Launch Jarvis client
 echo "Starting Jarvis selfplay client..."
-ssh $JARVIS "bash -l -c 'cd /home/sile/github/AlphaZero.jl && nohup julia --threads 16 --project scripts/selfplay_client.jl --server http://127.0.0.1:9090 --api-key alphazero-dev-key --num-workers 14 --client-name jarvis-cpu > /tmp/selfplay_jarvis_cpu_v6.log 2>&1 &'"
+ssh $JARVIS "bash -l -c 'cd /home/sile/github/AlphaZero.jl && nohup julia --threads 16 --project scripts/selfplay_client.jl --server http://127.0.0.1:9090 --api-key alphazero-dev-key --num-workers 12 --client-name jarvis-cpu >> /tmp/selfplay_jarvis_cpu_v6.log 2>&1 &'"
 echo "Waiting for Jarvis client to connect..."
 sleep 30
 
@@ -71,14 +71,14 @@ cd /Users/sile/github/AlphaZero.jl
 nohup julia --threads 30 --project scripts/selfplay_client.jl \
   --server http://127.0.0.1:9090 \
   --api-key alphazero-dev-key \
-  --num-workers 26 \
+  --num-workers 32 \
   --client-name neo-cpu \
-  > /tmp/selfplay_neo_cpu_v6.log 2>&1 &
+  >> /tmp/selfplay_neo_cpu_v6.log 2>&1 &
 echo "Neo client launched (PID: $!)"
 
 echo ""
 echo "=== v6 launched! ==="
-echo "Config: cosine LR, PER, 4000 gradient steps/iter (10x v5), 2000-game eval, 14 eval workers, 26+14 selfplay workers"
+echo "Config: cosine LR, PER, 4000 gradient steps/iter (10x v5), 2000-game eval, 14 eval workers, 32+12 selfplay workers"
 echo "Server data: $V6_DATA_DIR"
 echo "Logs: /tmp/training_server_race_v6.log, /tmp/selfplay_neo_cpu_v6.log, /tmp/selfplay_jarvis_cpu_v6.log"
 echo ""
