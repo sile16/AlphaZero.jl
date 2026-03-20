@@ -101,7 +101,7 @@ struct GameResult
     value_samples::Vector{PositionValueSample}         # Value comparisons (empty if not recorded)
     num_moves::Int                                     # Number of decision moves played
     bearoff_truncated::Bool                            # Whether game was truncated at bear-off
-    first_bearoff_equity::Union{Nothing, Float64}      # Equity at first bear-off position
+    first_bearoff_result::Any                           # Full bear-off result (NamedTuple with .value and .equity) or nothing
     first_bearoff_white_playing::Union{Nothing, Bool}  # Who was moving at first bear-off
 end
 
@@ -264,7 +264,7 @@ function play_game(white::GameAgent, black::GameAgent, env;
     value_samples = PositionValueSample[]
     num_moves = 0
     bearoff_truncated = false
-    first_bearoff_equity = nothing
+    first_bearoff_result = nothing
     first_bearoff_wp = nothing
 
     try
@@ -276,8 +276,8 @@ function play_game(white::GameAgent, black::GameAgent, env;
                     bo = bearoff_lookup(env.game)
                     if bo !== nothing
                         # Track first bear-off position
-                        if first_bearoff_equity === nothing
-                            first_bearoff_equity = Float64(bo.value)
+                        if first_bearoff_result === nothing
+                            first_bearoff_result = bo  # Store full result (value + equity vector)
                             first_bearoff_wp = GI.white_playing(env)
                         end
                         # Optionally truncate at bear-off
@@ -365,9 +365,9 @@ function play_game(white::GameAgent, black::GameAgent, env;
     end
 
     # Compute reward
-    reward = if bearoff_truncated && first_bearoff_equity !== nothing
+    reward = if bearoff_truncated && first_bearoff_result !== nothing
         # Use bear-off equity as the reward
-        first_bearoff_wp ? first_bearoff_equity : -first_bearoff_equity
+        first_bearoff_wp ? Float64(first_bearoff_result.value) : -Float64(first_bearoff_result.value)
     elseif GI.game_terminated(env)
         Float64(GI.white_reward(env))
     else
@@ -380,7 +380,7 @@ function play_game(white::GameAgent, black::GameAgent, env;
         value_samples,
         num_moves,
         bearoff_truncated,
-        first_bearoff_equity,
+        first_bearoff_result,
         first_bearoff_wp)
 end
 

@@ -67,7 +67,7 @@ using AlphaZero: GameLoop, MctsParams, ConstSchedule
             GameLoop.PositionValueSample[],         # value_samples
             42,                                     # num_moves
             false,                                  # bearoff_truncated
-            nothing,                                # first_bearoff_equity
+            nothing,                                # first_bearoff_result
             nothing)                                # first_bearoff_white_playing
 
         @test result.reward == 1.0
@@ -75,17 +75,19 @@ using AlphaZero: GameLoop, MctsParams, ConstSchedule
         @test isempty(result.value_samples)
         @test result.num_moves == 42
         @test result.bearoff_truncated == false
-        @test result.first_bearoff_equity === nothing
+        @test result.first_bearoff_result === nothing
         @test result.first_bearoff_white_playing === nothing
     end
 
     @testset "GameResult with bearoff data" begin
+        bo_result = (value=0.75, equity=Float32[0.8, 0.1, 0.0, 0.05, 0.0])
         result = GameLoop.GameResult(
             0.5, GameLoop.TraceEntry[], GameLoop.PositionValueSample[],
-            10, true, 0.75, true)
+            10, true, bo_result, true)
 
         @test result.bearoff_truncated == true
-        @test result.first_bearoff_equity == 0.75
+        @test result.first_bearoff_result.value == 0.75
+        @test length(result.first_bearoff_result.equity) == 5
         @test result.first_bearoff_white_playing == true
     end
 
