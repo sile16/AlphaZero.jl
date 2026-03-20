@@ -372,10 +372,8 @@ else
     end
 end
 
-struct PositionValueSample
-    nn_val::Float64
-    wb_val::Float64
-end
+# PositionValueSample is now provided by GameLoop module
+const PositionValueSample = AlphaZero.GameLoop.PositionValueSample
 
 function _eval_forward_network(net, states)
     n = length(states)
@@ -402,51 +400,48 @@ function _eval_forward_network(net, states)
     return results
 end
 
-struct EvalAlphaZeroAgent <: BackgammonNet.AbstractAgent
-    single_oracle::Any
-    batch_oracle::Any
-    mcts_params::MctsParams
-    batch_size::Int
-    gspec_::Any
-end
+function eval_race_game_server(single_oracle, batch_oracle, wildbg_backend,
+                               position_data::Tuple, eval_net;
+                               seed::Int=1, az_is_white::Bool=true,
+                               eval_mcts_iters::Int=EVAL_MCTS_ITERS)
+    eval_mcts_params = MctsParams(
+        num_iters_per_turn=eval_mcts_iters,
+        cpuct=1.5,
+        temperature=ConstSchedule(0.0),
+        dirichlet_noise_ϵ=0.0,
+        dirichlet_noise_α=1.0)
 
-function BackgammonNet.agent_move(agent::EvalAlphaZeroAgent, g::BackgammonGame)
-    env = GI.init(agent.gspec_)
-    env.game = BackgammonNet.clone(g)
-    player = BatchedMCTS.BatchedMctsPlayer(
-        agent.gspec_, agent.single_oracle, agent.mcts_params;
-        batch_size=agent.batch_size, batch_oracle=agent.batch_oracle)
-    actions, policy = BatchedMCTS.think(player, env)
-    BatchedMCTS.reset_player!(player)
-    return actions[argmax(policy)]
-end
+    az = AlphaZero.GameLoop.MctsAgent(single_oracle, batch_oracle, eval_mcts_params, 50, gspec)
+    wb = AlphaZero.GameLoop.ExternalAgent(wildbg_backend)
 
-function eval_race_game_server(az_agent::EvalAlphaZeroAgent, wildbg_agent::BackgammonNet.BackendAgent,
-                               position_data::Tuple, net; seed::Int=1, az_is_white::Bool=true)
-    rng = MersenneTwister(seed)
+    value_oracle_fn = function(env)
+        result = _eval_forward_network(eval_net, [env.game])
+        return Float64(result[1][2])  # value head output
+    end
+    wildbg_value_fn = function(env)
+        return Float64(BackgammonNet.evaluate(wildbg_backend, env.game))
+    end
+
+    w, b = az_is_white ? (az, wb) : (wb, az)
+
+    # Initialize game from position tuple
     p0, p1, cp = position_data
     g = BackgammonGame(p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
                        obs_type=:minimal_flat)
-    value_samples = PositionValueSample[]
-    while !BackgammonNet.game_terminated(g)
-        if BackgammonNet.is_chance_node(g)
-            BackgammonNet.sample_chance!(g, rng)
-        else
-            is_p0_turn = g.current_player == 0
-            is_az_turn = is_p0_turn == az_is_white
-            if is_az_turn
-                r = _eval_forward_network(net, [g])
-                nn_v = Float64(r[1][2])
-                wb_v = Float64(BackgammonNet.evaluate(wildbg_agent.backend, g))
-                push!(value_samples, PositionValueSample(nn_v, wb_v))
-            end
-            agent = is_az_turn ? az_agent : wildbg_agent
-            action = BackgammonNet.agent_move(agent, g)
-            BackgammonNet.apply_action!(g, action)
-        end
-    end
-    white_reward = Float64(g.reward)
-    az_reward = az_is_white ? white_reward : -white_reward
+    env = GI.init(gspec)
+    env.game = g
+
+    rng = MersenneTwister(seed)
+    result = AlphaZero.GameLoop.play_game(w, b, env;
+        record_value_comparison=true,
+        value_oracle=value_oracle_fn,
+        opponent_value_fn=wildbg_value_fn,
+        rng=rng)
+
+    # Convert to expected return format (map opponent_val -> wb_val field name)
+    value_samples = result.value_samples
+    az_reward = az_is_white ? result.reward : -result.reward
+
     return (reward=az_reward, value_samples=value_samples)
 end
 
@@ -462,15 +457,6 @@ function run_eval!(network_to_eval, iter::Int)
     batch_oracle(states::Vector) = _eval_forward_network(eval_net, states)
     single_oracle(s) = batch_oracle([s])[1]
 
-    eval_mcts_params = MctsParams(
-        num_iters_per_turn=EVAL_MCTS_ITERS,
-        cpuct=1.5,
-        temperature=ConstSchedule(0.0),
-        dirichlet_noise_ϵ=0.0,
-        dirichlet_noise_α=1.0)
-
-    az_agent = EvalAlphaZeroAgent(single_oracle, batch_oracle, eval_mcts_params, 50, gspec)
-
     n_pos = length(EVAL_POSITIONS)
     n_total = 2 * n_pos  # both sides
     rewards = Vector{Float64}(undef, n_total)
@@ -480,17 +466,17 @@ function run_eval!(network_to_eval, iter::Int)
     n_workers = min(EVAL_WORKERS, Threads.nthreads() - 1)
     n_workers = max(1, n_workers)
 
-    wildbg_agents = [begin
+    wildbg_backends = [begin
         wb = BackgammonNet.WildbgBackend(nets=nets_variant)
         BackgammonNet.open!(wb)
-        BackgammonNet.BackendAgent(wb)
+        wb
     end for _ in 1:n_workers]
 
     t_start = time()
     claimed = Threads.Atomic{Int}(0)
 
     Threads.@threads for tid in 1:n_workers
-        wa = wildbg_agents[tid]
+        wb = wildbg_backends[tid]
         while true
             job = Threads.atomic_add!(claimed, 1) + 1
             job > n_total && break
@@ -501,7 +487,8 @@ function run_eval!(network_to_eval, iter::Int)
                 pos_idx = job - n_pos
                 az_white = false
             end
-            result = eval_race_game_server(az_agent, wa, EVAL_POSITIONS[pos_idx], eval_net;
+            result = eval_race_game_server(single_oracle, batch_oracle, wb,
+                                           EVAL_POSITIONS[pos_idx], eval_net;
                                            seed=job + iter * 10000, az_is_white=az_white)
             rewards[job] = result.reward
             vsamples[job] = result.value_samples
@@ -510,8 +497,8 @@ function run_eval!(network_to_eval, iter::Int)
 
     elapsed = time() - t_start
 
-    for wa in wildbg_agents
-        BackgammonNet.close(wa.backend)
+    for wb in wildbg_backends
+        BackgammonNet.close(wb)
     end
 
     # Compute stats
@@ -526,7 +513,7 @@ function run_eval!(network_to_eval, iter::Int)
     value_corr = NaN
     if length(all_vs) >= 3
         nn = [s.nn_val for s in all_vs]
-        wb = [s.wb_val for s in all_vs]
+        wb = [s.opponent_val for s in all_vs]
         value_mse = mean((nn .- wb) .^ 2)
         value_corr = cor(nn, wb)
     end
