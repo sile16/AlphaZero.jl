@@ -1050,6 +1050,29 @@ function collect_server_stats()
     return stats
 end
 
+# Background task: expire stale eval checkouts and abandoned eval jobs
+@async begin
+    while true
+        sleep(60)
+        lock(EVAL_LOCK) do
+            job = EVAL_JOB[]
+            job === nothing && return
+            expired = EvalManager.expire_stale_checkouts!(job; lease_seconds=EVAL_CHECKOUT_LEASE)
+            if expired > 0
+                println("Eval: expired $expired stale checkout(s) for iter $(job.iter)")
+            end
+            if time() - job.created_at > EVAL_JOB_TIMEOUT
+                n_done = count(c -> c.completed, job.chunks)
+                n_total = length(job.chunks)
+                if n_done < n_total
+                    println("WARNING: Eval job iter $(job.iter) timed out ($n_done/$n_total chunks). Abandoning.")
+                    EVAL_JOB[] = nothing
+                end
+            end
+        end
+    end
+end
+
 # Samples threshold for one iteration
 const SAMPLES_PER_ITERATION = ARGS["games_per_iteration"] * 200  # ~200 samples per game
 
@@ -1186,24 +1209,32 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         @info "Buffer checkpoint saved" path=buf_path elapsed=round(time()-t0, digits=1)
     end
 
-    # Eval vs wildbg (CPU threads, parallel with self-play sample ingestion)
+    # Distributed eval: create a non-blocking eval job for clients to work on
     if EVAL_ENABLED && iter % EVAL_INTERVAL == 0
-        t0 = time()
-        eval_net = ARGS["training_mode"] == "race" ? race_network : contact_network
-        eval_result = run_eval!(eval_net, iter)
-        t_eval = time() - t0
+        lock(EVAL_LOCK) do
+            wv = ARGS["training_mode"] == "race" ? server_state.race_version[] : server_state.contact_version[]
+            n_pos = length(EVAL_POSITIONS)
+            EVAL_JOB[] = EvalManager.create_eval_job(iter, n_pos, wv; chunk_size=EVAL_CHUNK_SIZE)
+            println("Eval job created for iter $iter: $(length(EVAL_JOB[].chunks)) chunks, $n_pos positions × 2 sides")
+        end
+    end
 
-        if eval_result !== nothing
+    # Check if a previous eval job completed — finalize and log results
+    lock(EVAL_LOCK) do
+        job = EVAL_JOB[]
+        if job !== nothing && EvalManager.is_complete(job)
+            result = EvalManager.finalize_eval(job)
+            @info "Eval completed iter $(job.iter)" equity=round(result.equity, digits=3) win_pct=round(result.win_pct * 100, digits=1) games=result.num_games
             with_logger(TB_LOGGER) do
-                @info "eval/equity" value=eval_result.equity log_step_increment=0
-                @info "eval/win_pct" value=eval_result.win_pct log_step_increment=0
-                @info "eval/white_equity" value=eval_result.white_equity log_step_increment=0
-                @info "eval/black_equity" value=eval_result.black_equity log_step_increment=0
-                @info "eval/value_mse" value=eval_result.value_mse log_step_increment=0
-                @info "eval/value_corr" value=eval_result.value_corr log_step_increment=0
-                @info "eval/games" value=eval_result.n_games log_step_increment=0
-                @info "perf/eval_s" value=t_eval log_step_increment=0
+                @info "eval/equity" value=result.equity log_step_increment=0
+                @info "eval/win_pct" value=result.win_pct * 100 log_step_increment=0
+                @info "eval/white_equity" value=result.white_equity log_step_increment=0
+                @info "eval/black_equity" value=result.black_equity log_step_increment=0
+                @info "eval/value_mse" value=result.value_mse log_step_increment=0
+                @info "eval/value_corr" value=result.value_corr log_step_increment=0
+                @info "eval/games" value=result.num_games log_step_increment=0
             end
+            EVAL_JOB[] = nothing
         end
     end
 end

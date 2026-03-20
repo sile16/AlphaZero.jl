@@ -14,6 +14,9 @@ using JSON
 using MsgPack
 using Dates
 
+include(joinpath(@__DIR__, "eval_manager.jl"))
+using .EvalManager
+
 # Client tracking
 mutable struct ClientStats
     client_id::String
@@ -276,6 +279,116 @@ function get_cluster_stats(state::ServerState)
     end
 end
 
+# --- Distributed Eval State ---
+
+const EVAL_JOB = Ref{Union{Nothing, EvalManager.EvalJob}}(nothing)
+const EVAL_LOCK = ReentrantLock()
+const EVAL_CHUNK_SIZE = 50
+const EVAL_CHECKOUT_LEASE = 300.0  # 5 minutes
+const EVAL_JOB_TIMEOUT = 1800.0   # 30 minutes
+
+# --- Distributed Eval Handlers ---
+
+function handle_eval_status(req::HTTP.Request, state::ServerState)
+    check_auth(req, state) || return HTTP.Response(401, "Unauthorized")
+    resp = lock(EVAL_LOCK) do
+        job = EVAL_JOB[]
+        if job === nothing
+            Dict("eval_iter" => 0)
+        else
+            s = EvalManager.status(job)
+            Dict("eval_iter" => s.eval_iter,
+                 "total_chunks" => s.total_chunks,
+                 "completed" => s.completed,
+                 "checked_out" => s.checked_out,
+                 "available" => s.available,
+                 "weights_version" => job.weights_version)
+        end
+    end
+    return HTTP.Response(200, ["Content-Type" => "application/json"], JSON.json(resp))
+end
+
+function handle_eval_checkout(req::HTTP.Request, state::ServerState)
+    check_auth(req, state) || return HTTP.Response(401, "Unauthorized")
+    try
+        body = MsgPack.unpack(req.body)
+        client_name = get(body, "client_name", "unknown")
+
+        resp = lock(EVAL_LOCK) do
+            job = EVAL_JOB[]
+            if job === nothing
+                return Dict("chunk_id" => 0)
+            end
+            chunk = EvalManager.checkout_chunk!(job, client_name)
+            if chunk === nothing
+                return Dict("chunk_id" => 0)
+            end
+            Dict("chunk_id" => chunk.chunk_id,
+                 "position_range_start" => first(chunk.position_range),
+                 "position_range_end" => last(chunk.position_range),
+                 "az_is_white" => chunk.az_is_white,
+                 "weights_version" => job.weights_version,
+                 "eval_iter" => job.iter)
+        end
+        return HTTP.Response(200, ["Content-Type" => "application/json"], JSON.json(resp))
+    catch e
+        @warn "Error handling eval checkout" exception=(e, catch_backtrace())
+        return HTTP.Response(400, "Bad request: $e")
+    end
+end
+
+function handle_eval_submit(req::HTTP.Request, state::ServerState)
+    check_auth(req, state) || return HTTP.Response(401, "Unauthorized")
+    try
+        body = MsgPack.unpack(req.body)
+        chunk_id = Int(body["chunk_id"])
+        az_is_white = Bool(body["az_is_white"])
+        rewards = Float64.(body["rewards"])
+        value_nn = Float64.(get(body, "value_nn", Float64[]))
+        value_opp = Float64.(get(body, "value_opp", Float64[]))
+        value_is_contact = Bool.(get(body, "value_is_contact", Bool[]))
+
+        result = EvalManager.EvalChunkResult(chunk_id, az_is_white,
+                                              rewards, value_nn, value_opp, value_is_contact)
+
+        eval_complete = false
+        lock(EVAL_LOCK) do
+            job = EVAL_JOB[]
+            job === nothing && return
+            EvalManager.submit_chunk!(job, result)
+            if EvalManager.is_complete(job)
+                eval_complete = true
+            end
+        end
+
+        resp = Dict("accepted" => true, "eval_complete" => eval_complete)
+        return HTTP.Response(200, ["Content-Type" => "application/json"], JSON.json(resp))
+    catch e
+        @warn "Error handling eval submit" exception=(e, catch_backtrace())
+        return HTTP.Response(400, "Bad request: $e")
+    end
+end
+
+function handle_eval_heartbeat(req::HTTP.Request, state::ServerState)
+    check_auth(req, state) || return HTTP.Response(401, "Unauthorized")
+    try
+        body = MsgPack.unpack(req.body)
+        chunk_id = Int(body["chunk_id"])
+        client_name = get(body, "client_name", "unknown")
+
+        extended = lock(EVAL_LOCK) do
+            job = EVAL_JOB[]
+            job === nothing && return false
+            EvalManager.extend_lease!(job, chunk_id, client_name)
+        end
+
+        return HTTP.Response(200, ["Content-Type" => "application/json"],
+                             JSON.json(Dict("lease_extended" => extended)))
+    catch e
+        return HTTP.Response(400, "Bad request: $e")
+    end
+end
+
 # --- Router ---
 
 function create_router(state::ServerState, buffer::PERBuffer)
@@ -292,6 +405,12 @@ function create_router(state::ServerState, buffer::PERBuffer)
     HTTP.register!(router, "GET", "/api/status", req -> handle_status(req, state, buffer))
     HTTP.register!(router, "GET", "/api/clients", req -> handle_clients(req, state))
     HTTP.register!(router, "POST", "/api/client_stats", req -> handle_client_stats(req, state))
+
+    # Distributed eval endpoints
+    HTTP.register!(router, "GET", "/api/eval/status", req -> handle_eval_status(req, state))
+    HTTP.register!(router, "POST", "/api/eval/checkout", req -> handle_eval_checkout(req, state))
+    HTTP.register!(router, "POST", "/api/eval/submit", req -> handle_eval_submit(req, state))
+    HTTP.register!(router, "POST", "/api/eval/heartbeat", req -> handle_eval_heartbeat(req, state))
 
     return router
 end
