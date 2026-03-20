@@ -113,7 +113,7 @@ const ARGS = parse_eval_args()
 
 # Load packages
 using AlphaZero
-using AlphaZero: GI, MCTS, Network, FluxLib, MctsParams, ConstSchedule, BatchedMCTS
+using AlphaZero: GI, MCTS, Network, FluxLib, MctsParams, ConstSchedule, BatchedMCTS, GameLoop
 using AlphaZero.NetLib
 import Flux
 using Random
@@ -168,40 +168,6 @@ end
 
 const GPU_LOCK = ReentrantLock()
 
-# ── Raw NN Value (for value error tracking, always CPU) ──────────────────
-
-"""Get raw NN value prediction for a position. Returns (value, is_race).
-Uses Flux forward (not FastWeights) — called once per move, not performance-critical."""
-function nn_raw_value(value_batch_oracle, g)
-    is_race = g isa BackgammonNet.BackgammonGame && !BackgammonNet.is_contact_position(g)
-    _, v = value_batch_oracle([g])[1]
-    return Float64(v), is_race
-end
-
-# ── AlphaZero Agent ──────────────────────────────────────────────────────
-
-struct AlphaZeroAgent <: BackgammonNet.AbstractAgent
-    single_oracle::Any
-    batch_oracle::Any
-    mcts_params::MctsParams
-    batch_size::Int
-    gspec::Any
-end
-
-function BackgammonNet.agent_move(agent::AlphaZeroAgent, g::BackgammonGame)
-    env = GI.init(agent.gspec)
-    env.game = BackgammonNet.clone(g)
-
-    player = BatchedMCTS.BatchedMctsPlayer(
-        agent.gspec, agent.single_oracle, agent.mcts_params;
-        batch_size=agent.batch_size, batch_oracle=agent.batch_oracle)
-
-    actions, policy = BatchedMCTS.think(player, env)
-    BatchedMCTS.reset_player!(player)
-
-    return actions[argmax(policy)]
-end
-
 # ── Value Stats ──────────────────────────────────────────────────────────
 
 struct PositionValueSample
@@ -234,37 +200,38 @@ end
 
 # ── Game Play ────────────────────────────────────────────────────────────
 
-"""Play a single eval game. Returns (reward, value_samples)."""
-function eval_game(az_agent::AlphaZeroAgent, wildbg_agent::BackgammonNet.BackendAgent,
+"""Play a single eval game using GameLoop.play_game(). Returns (reward, value_samples)."""
+function eval_game(single_oracle, batch_oracle, wildbg_backend,
                    az_is_white::Bool; seed::Int=1,
-                   value_batch_oracle=nothing)
+                   value_batch_oracle=nothing,
+                   gspec=nothing, mcts_params=nothing, batch_size::Int=50)
     rng = MersenneTwister(seed)
-    g = BackgammonNet.initial_state()
-    value_samples = PositionValueSample[]
 
-    while !BackgammonNet.game_terminated(g)
-        if BackgammonNet.is_chance_node(g)
-            BackgammonNet.sample_chance!(g, rng)
-        else
-            cp = Int(g.current_player)
-            is_az_turn = (cp == 0) == az_is_white
+    # Initialize game from opening position
+    env = GI.init(gspec)
 
-            # Collect value comparison at AZ decision points
-            if is_az_turn && value_batch_oracle !== nothing
-                nn_v, is_race = nn_raw_value(value_batch_oracle, g)
-                wb_v = Float64(BackgammonNet.evaluate(wildbg_agent.backend, g))
-                # Both nn_v and wb_v are from current player's perspective
-                push!(value_samples, PositionValueSample(nn_v, wb_v, !is_race))
-            end
+    az = GameLoop.MctsAgent(single_oracle, batch_oracle, mcts_params, batch_size, gspec)
+    wb = GameLoop.ExternalAgent(wildbg_backend)
 
-            agent = is_az_turn ? az_agent : wildbg_agent
-            action = BackgammonNet.agent_move(agent, g)
-            BackgammonNet.apply_action!(g, action)
-        end
+    # Value comparison functions (only if value_batch_oracle provided)
+    value_oracle_fn = nothing
+    wildbg_value_fn = nothing
+    if value_batch_oracle !== nothing
+        value_oracle_fn = env -> Float64(value_batch_oracle([env.game])[1][2])
+        wildbg_value_fn = env -> Float64(BackgammonNet.evaluate(wildbg_backend, env.game))
     end
 
-    white_reward = Float64(g.reward)
-    az_reward = az_is_white ? white_reward : -white_reward
+    w, b = az_is_white ? (az, wb) : (wb, az)
+    result = GameLoop.play_game(w, b, env;
+        record_value_comparison=(value_batch_oracle !== nothing),
+        value_oracle=value_oracle_fn,
+        opponent_value_fn=wildbg_value_fn,
+        rng=rng,
+        temperature_fn=_ -> 0.0)
+
+    az_reward = az_is_white ? result.reward : -result.reward
+    value_samples = [PositionValueSample(s.nn_val, s.opponent_val, s.is_contact)
+                     for s in result.value_samples]
     return (reward=az_reward, value_samples=value_samples)
 end
 
@@ -305,13 +272,13 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
     cpu_single, cpu_batch = AlphaZero.BackgammonInference.make_cpu_oracles(
         backend, contact_network, ORACLE_CFG;
         secondary_net=race_network, batch_size=batch_size)
-    cpu_agent = AlphaZeroAgent(cpu_single, cpu_batch, mcts_params, batch_size, gspec)
     _, value_batch_oracle = AlphaZero.BackgammonInference.make_cpu_oracles(
         :flux, contact_network, ORACLE_CFG;
         secondary_net=race_network, batch_size=1)
 
-    # Create GPU oracles and agent (if requested and available)
-    gpu_agent = nothing
+    # Create GPU oracles (if requested and available)
+    gpu_single = nothing
+    gpu_batch = nothing
     gpu_server = nothing
     if gpu_workers > 0
         if !HAS_METAL
@@ -337,7 +304,6 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
                 gpu_array_fn=Metal.MtlArray,
                 sync_fn=Metal.synchronize,
                 gpu_lock=GPU_LOCK)
-            gpu_agent = AlphaZeroAgent(gpu_single, gpu_batch, mcts_params, batch_size, gspec)
         end
     end
 
@@ -353,10 +319,10 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
     end
     println("  wildbg nets: $nets_variant (lib $(round(lib_size/1e6, digits=1))MB)")
     println("  Workers: $num_workers CPU" * (gpu_workers > 0 ? " + $gpu_workers GPU" : ""))
-    wildbg_agents = [begin
+    wildbg_backends = [begin
         wb = BackgammonNet.WildbgBackend(nets=nets_variant)
         BackgammonNet.open!(wb)
-        BackgammonNet.BackendAgent(wb)
+        wb
     end for _ in 1:total_workers]
 
     games_per_side = num_games
@@ -372,12 +338,16 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
     flush(stdout)
     white_claimed = Threads.Atomic{Int}(0)
     Threads.@threads for tid in 1:total_workers
-        wa = wildbg_agents[tid]
-        agent = (gpu_agent !== nothing && tid > num_workers) ? gpu_agent : cpu_agent
+        wb = wildbg_backends[tid]
+        use_gpu = gpu_single !== nothing && tid > num_workers
+        so = use_gpu ? gpu_single : cpu_single
+        bo = use_gpu ? gpu_batch : cpu_batch
         while true
             i = Threads.atomic_add!(white_claimed, 1) + 1
             i > games_per_side && break
-            result = eval_game(agent, wa, true; seed=i, value_batch_oracle=value_batch_oracle)
+            result = eval_game(so, bo, wb, true; seed=i,
+                               value_batch_oracle=value_batch_oracle,
+                               gspec=gspec, mcts_params=mcts_params, batch_size=batch_size)
             white_rewards[i] = result.reward
             white_vsamples[i] = result.value_samples
         end
@@ -388,22 +358,25 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
     flush(stdout)
     black_claimed = Threads.Atomic{Int}(0)
     Threads.@threads for tid in 1:total_workers
-        wa = wildbg_agents[tid]
-        agent = (gpu_agent !== nothing && tid > num_workers) ? gpu_agent : cpu_agent
+        wb = wildbg_backends[tid]
+        use_gpu = gpu_single !== nothing && tid > num_workers
+        so = use_gpu ? gpu_single : cpu_single
+        bo = use_gpu ? gpu_batch : cpu_batch
         while true
             i = Threads.atomic_add!(black_claimed, 1) + 1
             i > games_per_side && break
-            result = eval_game(agent, wa, false; seed=i + games_per_side,
-                               value_batch_oracle=value_batch_oracle)
+            result = eval_game(so, bo, wb, false; seed=i + games_per_side,
+                               value_batch_oracle=value_batch_oracle,
+                               gspec=gspec, mcts_params=mcts_params, batch_size=batch_size)
             black_rewards[i] = result.reward
             black_vsamples[i] = result.value_samples
         end
     end
 
-    for wa in wildbg_agents
-        BackgammonNet.close(wa.backend)
+    for wb in wildbg_backends
+        BackgammonNet.close(wb)
     end
-    gpu_agent !== nothing && close(gpu_server)
+    gpu_single !== nothing && close(gpu_server)
 
     # Aggregate game results
     white_avg = mean(white_rewards)

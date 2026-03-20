@@ -64,7 +64,7 @@ const ARGS = parse_args_eval()
 
 # Load packages
 using AlphaZero
-using AlphaZero: GI, MCTS, Network, FluxLib, MctsParams, ConstSchedule, BatchedMCTS
+using AlphaZero: GI, MCTS, Network, FluxLib, MctsParams, ConstSchedule, BatchedMCTS, GameLoop
 using AlphaZero.NetLib
 import Flux
 using Random
@@ -104,27 +104,6 @@ function find_wildbg_lib()
     error("libwildbg not found. Pass --wildbg-lib=/path/to/libwildbg")
 end
 
-# ── AlphaZero Agent ─────────────────────────────────────────────────────
-
-struct AlphaZeroAgent <: BackgammonNet.AbstractAgent
-    single_oracle::Any
-    batch_oracle::Any
-    mcts_params::MctsParams
-    batch_size::Int
-    gspec::Any
-end
-
-function BackgammonNet.agent_move(agent::AlphaZeroAgent, g::BackgammonGame)
-    env = GI.init(agent.gspec)
-    env.game = BackgammonNet.clone(g)
-    player = BatchedMCTS.BatchedMctsPlayer(
-        agent.gspec, agent.single_oracle, agent.mcts_params;
-        batch_size=agent.batch_size, batch_oracle=agent.batch_oracle)
-    actions, policy = BatchedMCTS.think(player, env)
-    BatchedMCTS.reset_player!(player)
-    return actions[argmax(policy)]
-end
-
 # ── Value Stats ─────────────────────────────────────────────────────────
 
 struct PositionValueSample
@@ -148,40 +127,39 @@ end
 
 """Play a game starting from a fixed race position. Returns (reward, value_samples).
 
-`az_is_white`: if true, AZ plays as P0 (white); if false, AZ plays as P1 (black)."""
-function eval_race_game(az_agent::AlphaZeroAgent, wildbg_agent::BackgammonNet.BackendAgent,
-                        position_data::Tuple, value_batch_oracle; seed::Int=1, az_is_white::Bool=true)
+`az_is_white`: if true, AZ plays as P0 (white); if false, AZ plays as P1 (black).
+
+Uses GameLoop.play_game() for the game loop."""
+function eval_race_game(single_oracle, batch_oracle, wildbg_backend, position_data::Tuple,
+                        value_batch_oracle; seed::Int=1, az_is_white::Bool=true,
+                        gspec=nothing, mcts_params=nothing, batch_size::Int=50)
     rng = MersenneTwister(seed)
     p0, p1, cp = position_data
 
     # Create game at chance node (needs dice roll first)
-    g = BackgammonGame(p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
-                       obs_type=:minimal_flat)
+    game = BackgammonGame(p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
+                          obs_type=:minimal_flat)
+    env = GameEnv(game, rng)
 
-    value_samples = PositionValueSample[]
+    az = GameLoop.MctsAgent(single_oracle, batch_oracle, mcts_params, batch_size, gspec)
+    wb = GameLoop.ExternalAgent(wildbg_backend)
 
-    while !BackgammonNet.game_terminated(g)
-        if BackgammonNet.is_chance_node(g)
-            BackgammonNet.sample_chance!(g, rng)
-        else
-            is_p0_turn = g.current_player == 0
-            is_az_turn = is_p0_turn == az_is_white
-
-            # Collect value comparison at AZ decision points
-            if is_az_turn
-                nn_v = Float64(value_batch_oracle([g])[1][2])
-                wb_v = Float64(BackgammonNet.evaluate(wildbg_agent.backend, g))
-                push!(value_samples, PositionValueSample(nn_v, wb_v))
-            end
-
-            agent = is_az_turn ? az_agent : wildbg_agent
-            action = BackgammonNet.agent_move(agent, g)
-            BackgammonNet.apply_action!(g, action)
-        end
+    # Value comparison functions
+    value_oracle_fn = env -> begin
+        Float64(value_batch_oracle([env.game])[1][2])
     end
+    wildbg_value_fn = env -> Float64(BackgammonNet.evaluate(wildbg_backend, env.game))
 
-    white_reward = Float64(g.reward)
-    az_reward = az_is_white ? white_reward : -white_reward
+    w, b = az_is_white ? (az, wb) : (wb, az)
+    result = GameLoop.play_game(w, b, env;
+        record_value_comparison=true,
+        value_oracle=value_oracle_fn,
+        opponent_value_fn=wildbg_value_fn,
+        rng=rng,
+        temperature_fn=_ -> 0.0)
+
+    az_reward = az_is_white ? result.reward : -result.reward
+    value_samples = [PositionValueSample(s.nn_val, s.opponent_val) for s in result.value_samples]
     return (reward=az_reward, value_samples=value_samples)
 end
 
@@ -240,8 +218,6 @@ function main()
         backend, network, ORACLE_CFG; batch_size=batch_size)
     _, value_batch_oracle = AlphaZero.BackgammonInference.make_cpu_oracles(
         :flux, network, ORACLE_CFG; batch_size=1)
-    agent = AlphaZeroAgent(single_oracle, batch_oracle, mcts_params, batch_size, gspec)
-
     # Wildbg setup
     wildbg_lib = find_wildbg_lib()
     lib_size = filesize(wildbg_lib)
@@ -253,10 +229,10 @@ function main()
     end
     println("wildbg: $nets_variant ($(round(lib_size/1e6, digits=1))MB)")
 
-    wildbg_agents = [begin
+    wildbg_backends = [begin
         wb = BackgammonNet.WildbgBackend(nets=nets_variant)
         BackgammonNet.open!(wb)
-        BackgammonNet.BackendAgent(wb)
+        wb
     end for _ in 1:num_workers]
 
     println("=" ^ 70)
@@ -273,7 +249,7 @@ function main()
     done = Threads.Atomic{Int}(0)
 
     Threads.@threads for tid in 1:num_workers
-        wa = wildbg_agents[tid]
+        wb = wildbg_backends[tid]
         while true
             job = Threads.atomic_add!(claimed, 1) + 1
             job > n_total && break
@@ -286,8 +262,9 @@ function main()
                 az_white = false
                 seed = job  # different seed than white game
             end
-            result = eval_race_game(agent, wa, positions[pos_idx], value_batch_oracle;
-                                    seed=seed, az_is_white=az_white)
+            result = eval_race_game(single_oracle, batch_oracle, wb, positions[pos_idx],
+                                    value_batch_oracle; seed=seed, az_is_white=az_white,
+                                    gspec=gspec, mcts_params=mcts_params, batch_size=batch_size)
             rewards[job] = result.reward
             vsamples[job] = result.value_samples
             d = Threads.atomic_add!(done, 1) + 1
@@ -303,8 +280,8 @@ function main()
 
     elapsed = time() - t_start
 
-    for wa in wildbg_agents
-        BackgammonNet.close(wa.backend)
+    for wb in wildbg_backends
+        BackgammonNet.close(wb)
     end
 
     # Split results by side
