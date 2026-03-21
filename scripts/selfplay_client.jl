@@ -1256,7 +1256,14 @@ function check_and_do_eval!()
         resp = HTTP.get("$(SERVER_URL)/api/eval/status", headers;
                         status_exception=false, connect_timeout=10, readtimeout=30)
         resp.status != 200 && (println("[EVAL] Status check returned $(resp.status)"); return false)
-        eval_status = JSON.parse(String(resp.body))
+        # Parse JSON response (eval/status returns JSON, not MsgPack)
+        body_str = String(resp.body)
+        eval_status = Dict{String,Any}()
+        for m in eachmatch(r"\"(\w+)\"\s*:\s*(-?[\d.]+)", body_str)
+            k = m.captures[1]
+            v = m.captures[2]
+            eval_status[k] = contains(v, ".") ? parse(Float64, v) : parse(Int, v)
+        end
     catch e
         println("[EVAL] Status check failed: $e")
         return false
