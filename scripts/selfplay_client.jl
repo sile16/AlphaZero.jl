@@ -1383,7 +1383,22 @@ function check_and_do_eval!()
                 resp = HTTP.post("$(SERVER_URL)/api/eval/checkout", headers, body;
                                  status_exception=false, connect_timeout=10, readtimeout=30)
                 resp.status != 200 && break
-                chunk = MsgPack.unpack(resp.body)
+                # Parse JSON response
+                body_str = String(resp.body)
+                chunk = Dict{String,Any}()
+                for m in eachmatch(r"\"(\w+)\"\s*:\s*(-?[\d.]+|true|false)", body_str)
+                    k = m.captures[1]
+                    v = m.captures[2]
+                    if v == "true"
+                        chunk[k] = true
+                    elseif v == "false"
+                        chunk[k] = false
+                    elseif contains(v, ".")
+                        chunk[k] = parse(Float64, v)
+                    else
+                        chunk[k] = parse(Int, v)
+                    end
+                end
             catch e
                 println("[EVAL] Checkout error: $e")
                 break
@@ -1410,8 +1425,8 @@ function check_and_do_eval!()
                         resp = HTTP.post("$(SERVER_URL)/api/eval/heartbeat", hb_headers, hb_body;
                                          status_exception=false, connect_timeout=10, readtimeout=30)
                         if resp.status == 200
-                            result = MsgPack.unpack(resp.body)
-                            if !get(result, "lease_extended", false)
+                            hb_str = String(resp.body)
+                            if !contains(hb_str, "true")
                                 println("[EVAL] WARNING: Chunk $chunk_id lease lost")
                                 break
                             end
@@ -1472,8 +1487,8 @@ function check_and_do_eval!()
                     resp = HTTP.post("$(SERVER_URL)/api/eval/submit", sub_headers, sub_body;
                                      status_exception=false, connect_timeout=10, readtimeout=60)
                     if resp.status == 200
-                        result = MsgPack.unpack(resp.body)
-                        eval_complete = get(result, "eval_complete", false)
+                        sub_str = String(resp.body)
+                        eval_complete = contains(sub_str, "\"eval_complete\":true")
                         chunks_done += 1
                         avg_reward = mean(rewards)
                         win_pct = 100 * count(r -> r > 0, rewards) / n_games
