@@ -342,19 +342,21 @@ function handle_eval_submit(req::HTTP.Request, state::ServerState)
     try
         body = MsgPack.unpack(req.body)
         chunk_id = Int(body["chunk_id"])
-        az_is_white = Bool(body["az_is_white"])
         rewards = Float64.(body["rewards"])
         value_nn = Float64.(get(body, "value_nn", Float64[]))
         value_opp = Float64.(get(body, "value_opp", Float64[]))
         value_is_contact = Bool.(get(body, "value_is_contact", Bool[]))
 
-        result = EvalManager.EvalChunkResult(chunk_id, az_is_white,
-                                              rewards, value_nn, value_opp, value_is_contact)
-
         eval_complete = false
         lock(EVAL_LOCK) do
             job = EVAL_JOB[]
             job === nothing && return
+            # Get az_is_white from chunk metadata (not request body)
+            chunk_idx = findfirst(c -> c.chunk_id == chunk_id, job.chunks)
+            chunk_idx === nothing && return
+            az_is_white = job.chunks[chunk_idx].az_is_white
+            result = EvalManager.EvalChunkResult(chunk_id, az_is_white,
+                                                  rewards, value_nn, value_opp, value_is_contact)
             EvalManager.submit_chunk!(job, result)
             if EvalManager.is_complete(job)
                 eval_complete = true
