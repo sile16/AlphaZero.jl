@@ -55,6 +55,13 @@ Note: P(bg|win) is additive on top of P(gammon|win), so:
 - p_gammon=1, p_bg=1 → 3 points (backgammon)
 
 Returns a value in approximately [-3, +3] range.
+
+This function is intentionally paired with the masked training logic in
+`AlphaZero._equity_head_weights`. The network is not supposed to learn joint
+probabilities like `P(win ∧ gammon)` here; instead it learns:
+- `p_win`
+- `P(gammon | win)` / `P(backgammon | win)` on winning samples only
+- `P(gammon | loss)` / `P(backgammon | loss)` on losing samples only
 """
 function compute_equity(e::EquityOutput)
   p_loss = 1f0 - e.p_win
@@ -117,6 +124,14 @@ These are combined to compute the expected game equity.
 
 Based on the TD-Gammon/gnubg approach where conditional probabilities
 are more stable training targets than raw outcome probabilities.
+
+The implementation relies on a simple contract:
+1. training stores the opposite-side auxiliary targets as `0.0`
+2. loss masking removes those inapplicable targets from BCE
+3. `compute_equity` combines the resulting conditional probabilities
+
+If step 2 were removed, this architecture would become mathematically
+inconsistent, which is why the masking regression test exists.
 """
 mutable struct FCResNetMultiHead <: FluxNetwork
   gspec

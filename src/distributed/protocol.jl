@@ -203,7 +203,7 @@ function deserialize_weights_with_header(bytes::Vector{UInt8})
 
     weight_bytes = read(io)  # Remaining bytes
     actual_checksum = _weights_checksum(weight_bytes)
-    if header.checksum != 0 && header.checksum != actual_checksum
+    if header.checksum != actual_checksum
         error("Weight checksum mismatch: expected $(header.checksum), got $actual_checksum")
     end
     weights = FluxLib.deserialize_weights(weight_bytes)

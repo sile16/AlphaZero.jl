@@ -37,7 +37,16 @@ function convert_sample(
   v = [e.z]
   is_chance = [e.is_chance ? 1f0 : 0f0]  # Convert to float for batching
 
-  # Multi-head equity targets (if available)
+  # Multi-head equity targets (if available).
+  #
+  # Important semantic note:
+  # - `eq_win` is an unconditional Bernoulli target P(win)
+  # - the four auxiliary heads are stored in conditional form
+  #   (`P(gammon|win)`, `P(bg|win)`, `P(gammon|loss)`, `P(bg|loss)`)
+  #
+  # For batching convenience, the "wrong-side" conditional targets are stored as
+  # 0.0 here and later masked out in `_equity_head_weights`. That masking step is
+  # what keeps training aligned with `FluxLib.compute_equity`.
   if !isnothing(e.equity)
     eq = e.equity
     eq_win = [eq.p_win]
@@ -83,6 +92,43 @@ function convert_samples(
   return map(f32, (; W, X, A, P, V, IsChance, EqWin, EqGW, EqBGW, EqGL, EqBGL, HasEquity))
 end
 
+"""
+    split_equity_targets(equities, has_equity)
+
+Split packed 5-head equity vectors into the learner's columnar batch layout.
+
+`equities` must be shaped `(5, n)` in canonical head order:
+`[P(win), P(gammon|win), P(bg|win), P(gammon|loss), P(bg|loss)]`
+
+Samples with `has_equity[i] == false` are zeroed in the returned arrays and rely
+on `HasEquity` to mask the multi-head BCE losses later in the training pipeline.
+"""
+function split_equity_targets(equities::AbstractMatrix{<:Real}, has_equity)
+  size(equities, 1) == 5 || throw(ArgumentError("expected equities to have 5 rows, got $(size(equities, 1))"))
+  n = size(equities, 2)
+  length(has_equity) == n || throw(ArgumentError("has_equity length $(length(has_equity)) does not match n=$n"))
+
+  EqWin = zeros(Float32, 1, n)
+  EqGW = zeros(Float32, 1, n)
+  EqBGW = zeros(Float32, 1, n)
+  EqGL = zeros(Float32, 1, n)
+  EqBGL = zeros(Float32, 1, n)
+  HasEquity = zeros(Float32, 1, n)
+
+  @inbounds for i in 1:n
+    if has_equity[i]
+      EqWin[1, i] = equities[1, i]
+      EqGW[1, i] = equities[2, i]
+      EqBGW[1, i] = equities[3, i]
+      EqGL[1, i] = equities[4, i]
+      EqBGL[1, i] = equities[5, i]
+      HasEquity[1, i] = 1.0f0
+    end
+  end
+
+  return (; EqWin, EqGW, EqBGW, EqGL, EqBGL, HasEquity)
+end
+
 #####
 ##### Loss Function
 #####
@@ -101,9 +147,19 @@ wmean(x, w) = sum(x .* w) / sum(w)
 bce_wmean(ŷ, y, w) = -sum((y .* log.(ŷ .+ eps(eltype(y))) .+
                            (1f0 .- y) .* log.(1f0 .- ŷ .+ eps(eltype(y)))) .* w) / sum(w)
 
-# For conditional equity heads, only train the winning-side heads on won games
-# and the losing-side heads on lost games. The p_win head is trained on all
-# equity samples.
+"""
+    _equity_head_weights(W, EqWin, HasEquity)
+
+Build per-head sample weights for the multi-head equity loss.
+
+`EqWin` acts as the routing signal:
+- if `EqWin == 1`, the sample contributes to `p_win`, `p_gammon_win`, `p_bg_win`
+- if `EqWin == 0`, the sample contributes to `p_win`, `p_gammon_loss`, `p_bg_loss`
+
+This is the key step that makes the auxiliary heads conditional rather than
+joint probabilities. Without this masking, storing `0.0` on the opposite side
+would incorrectly train the network toward `P(win ∧ gammon)`-style targets.
+"""
 function _equity_head_weights(W, EqWin, HasEquity)
   W_equity = W .* HasEquity
   W_win = W_equity .* EqWin
@@ -146,8 +202,9 @@ function losses(nn, params, Wmean, Hp, batch)
     EqWin, EqGW, EqBGW, EqGL, EqBGL, HasEquity =
       batch.EqWin, batch.EqGW, batch.EqBGW, batch.EqGL, batch.EqBGL, batch.HasEquity
 
-    # Weight for samples that have equity targets. Conditional heads are only
-    # trained on the subset of samples where they are semantically defined.
+    # Weight for samples that have equity targets. The auxiliary heads are
+    # conditional probabilities, so they are only trained on the subset of
+    # samples where their conditioning event is true.
     W_equity, W_win, W_loss = _equity_head_weights(W, EqWin, HasEquity)
 
     # Multi-head value losses (binary cross-entropy for each head)

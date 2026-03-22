@@ -625,6 +625,15 @@ if !isempty(ARGS["bootstrap_file"])
         println("\nLoading bootstrap data from: $bootstrap_path")
         flush(stdout)
         bootstrap_samples = Serialization.deserialize(bootstrap_path)
+
+        # Production bootstrap artifacts currently deserialize to
+        # `Vector{NamedTuple}` with fields:
+        #   state, policy, value, equity, has_equity, is_chance, is_contact, is_bearoff
+        #
+        # `value` is already in the same player-relative convention used by the
+        # learner, while `equity` follows the same five-head conditional contract
+        # as the self-play sample path. The loader below preserves that layout and
+        # only repacks it into columnar arrays for the replay buffer.
         n_bootstrap = length(bootstrap_samples)
         max_load = ARGS["bootstrap_max_samples"] > 0 ?
             min(ARGS["bootstrap_max_samples"], BUFFER_CAPACITY) : min(n_bootstrap, BUFFER_CAPACITY)
@@ -694,7 +703,15 @@ end
 """Prepare training batch from columnar buffer extract.
 
 Accepts the NamedTuple from extract_batch (columnar matrices) instead of
-a Vector of NamedTuples — avoids per-sample allocation entirely."""
+a Vector of NamedTuples — avoids per-sample allocation entirely.
+
+The returned batch matches the same learner-side contract as
+`AlphaZero.convert_samples`:
+- `V` is the scalar player-relative target used by the single-head fallback and
+  for TD error computation
+- `EqWin/EqGW/EqBGW/EqGL/EqBGL` are the five conditional equity heads
+- `HasEquity` gates whether the multi-head BCE losses apply to that sample
+"""
 function prepare_batch_columnar(col_data, num_actions, use_gpu_flag, net)
     n = size(col_data.states, 2)
     W = ones(Float32, 1, n)
@@ -715,22 +732,9 @@ function prepare_batch_columnar(col_data, num_actions, use_gpu_flag, net)
         end
     end
 
-    EqWin = zeros(Float32, 1, n)
-    EqGW = zeros(Float32, 1, n)
-    EqBGW = zeros(Float32, 1, n)
-    EqGL = zeros(Float32, 1, n)
-    EqBGL = zeros(Float32, 1, n)
-    HasEquity = zeros(Float32, 1, n)
-    @inbounds for i in 1:n
-        if col_data.has_equity[i]
-            EqWin[1, i] = col_data.equities[1, i]
-            EqGW[1, i] = col_data.equities[2, i]
-            EqBGW[1, i] = col_data.equities[3, i]
-            EqGL[1, i] = col_data.equities[4, i]
-            EqBGL[1, i] = col_data.equities[5, i]
-            HasEquity[1, i] = 1.0f0
-        end
-    end
+    eq_heads = AlphaZero.split_equity_targets(col_data.equities, col_data.has_equity)
+    EqWin, EqGW, EqBGW, EqGL, EqBGL, HasEquity =
+        eq_heads.EqWin, eq_heads.EqGW, eq_heads.EqBGW, eq_heads.EqGL, eq_heads.EqBGL, eq_heads.HasEquity
 
     batch_data = (; W, X, A, P, V, IsChance, EqWin, EqGW, EqBGW, EqGL, EqBGL, HasEquity)
 

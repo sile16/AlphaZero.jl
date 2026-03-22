@@ -66,12 +66,12 @@ end
 
 Wrapper around MCTS.Env that enables batched evaluation.
 """
-mutable struct BatchedEnv{S, O, BO, BE}
+mutable struct BatchedEnv{S, O, BO, BE, G}
     env::MCTS.Env{S, O}     # Underlying MCTS environment
     batch_size::Int          # Number of simulations to batch
     pending::Vector{PendingSimulation{S}}  # Simulations waiting for evaluation
     batch_oracle::BO         # Optional: (Vector{S}) -> Vector{(P,V)} for batched GPU eval
-    game_pool::Vector{Any}   # Pre-allocated game clones (filled lazily on first use)
+    game_pool::Vector{G}     # Pre-allocated game clones (filled lazily on first use)
     sim_pool::Vector{PendingSimulation{S}}  # Pre-allocated sim objects (reuse vectors)
     # Pre-allocated buffers for batch_evaluate_pending! (avoid per-call allocation)
     _eval_states::Vector{S}
@@ -81,11 +81,12 @@ mutable struct BatchedEnv{S, O, BO, BE}
 end
 
 function BatchedEnv(env::MCTS.Env{S, O}, batch_size::Int; batch_oracle::BO=nothing, bearoff_evaluator::BE=nothing) where {S, O, BO, BE}
+    game_type = typeof(GI.init(env.gspec))
     eval_states = S[]; sizehint!(eval_states, batch_size)
     eval_indices = Int[]; sizehint!(eval_indices, batch_size)
-    BatchedEnv{S, O, BO, BE}(env, batch_size, PendingSimulation{S}[], batch_oracle, Any[],
-                              PendingSimulation{S}[], eval_states, eval_indices,
-                              bearoff_evaluator)
+    BatchedEnv{S, O, BO, BE, game_type}(env, batch_size, PendingSimulation{S}[], batch_oracle,
+                              game_type[], PendingSimulation{S}[], eval_states,
+                              eval_indices, bearoff_evaluator)
 end
 
 """Pre-allocate sim pool with sizehinted vectors (called once, reused forever)."""
@@ -344,6 +345,16 @@ Combined remove_virtual_loss + update_state_info into single Dict lookup per nod
 (was: 3 lookups per node = haskey + index for remove_VL + index for update).
 
 Chance nodes use passthrough (no tree entries, not in backprop path).
+
+Value/sign convention:
+- `sim.terminal_value` is player-relative at the leaf
+- each stored `reward` is player-relative at the parent state
+- `player_switches[i]` says whether the side to move changed across edge `i`
+
+So reverse-time backup is:
+1. flip the child value if control passed to the opponent
+2. add the immediate parent-frame reward
+3. discount
 """
 function backpropagate!(benv::BatchedEnv, sim::PendingSimulation)
     env = benv.env

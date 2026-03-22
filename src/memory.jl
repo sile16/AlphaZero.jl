@@ -71,6 +71,59 @@ function equity_targets_from_outcome(outcome::GI.GameOutcome, white_perspective:
 end
 
 """
+    equity_vector(targets::EquityTargets, [T=Float32]) -> Vector{T}
+
+Materialize an `EquityTargets` struct into the canonical 5-head vector order:
+
+`[P(win), P(gammon|win), P(bg|win), P(gammon|loss), P(bg|loss)]`
+"""
+function equity_vector(targets::EquityTargets, ::Type{T}=Float32) where T <: AbstractFloat
+  return T[
+    targets.p_win,
+    targets.p_gammon_win,
+    targets.p_bg_win,
+    targets.p_gammon_loss,
+    targets.p_bg_loss,
+  ]
+end
+
+"""
+    equity_vector_from_outcome(outcome, white_perspective, [T=Float32]) -> Vector{T}
+
+Convenience wrapper around `equity_targets_from_outcome` for callers that need
+the packed 5-head vector rather than the struct representation.
+"""
+function equity_vector_from_outcome(
+    outcome::GI.GameOutcome,
+    white_perspective::Bool,
+    ::Type{T}=Float32) where T <: AbstractFloat
+  return equity_vector(equity_targets_from_outcome(outcome, white_perspective), T)
+end
+
+"""
+    flip_equity_perspective(eq::AbstractVector{<:Real}) -> Vector
+
+Flip a canonical 5-head equity vector to the opponent's perspective while
+preserving the same conditional semantics.
+
+If `eq` is:
+`[P(win), P(gammon|win), P(bg|win), P(gammon|loss), P(bg|loss)]`
+
+then the returned vector is:
+`[P(loss), P(gammon|loss), P(bg|loss), P(gammon|win), P(bg|win)]`
+"""
+function flip_equity_perspective(eq::AbstractVector{T}) where T <: Real
+  length(eq) == 5 || throw(ArgumentError("expected 5 equity heads, got $(length(eq))"))
+  return T[
+    one(T) - eq[1],
+    eq[4],
+    eq[5],
+    eq[2],
+    eq[3],
+  ]
+end
+
+"""
     TrainingSample{State}
 
 Type of a training sample. A sample features the following fields:

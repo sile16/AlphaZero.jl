@@ -31,9 +31,15 @@ export async_explore!, async_self_play
 ##### Request/Response Types
 #####
 
-struct InferenceRequest
+"""
+Typed inference request passed from CPU workers to the shared GPU server.
+
+Keeping `state` concrete here avoids repeated dynamic dispatch in the batched
+`Network.evaluate_batch` path when all workers are exploring the same game.
+"""
+struct InferenceRequest{S}
     id::Int
-    state::Any
+    state::S
     worker_id::Int
 end
 
@@ -53,11 +59,18 @@ end
 ##### Pending Simulation (in-flight, waiting for NN result)
 #####
 
-mutable struct PendingSimulation
+"""
+In-flight simulation state waiting on a neural-network evaluation.
+
+`S` is the concrete game-state type. Making `leaf_state` and `path` concrete is
+important because these objects are created and consumed in the hottest part of
+async tree traversal.
+"""
+mutable struct PendingSimulation{S}
     request_id::Int
-    leaf_state::Any
+    leaf_state::S
     leaf_actions::Vector{Int}       # Available actions at leaf node
-    path::Vector{Tuple{Any, Int}}  # (state, action_id) pairs
+    path::Vector{Tuple{S, Int}}     # (state, action_id) pairs
     rewards::Vector{Float64}
     player_switches::Vector{Bool}
 end
@@ -66,9 +79,16 @@ end
 ##### Async Pipeline
 #####
 
-mutable struct AsyncPipeline{N}
+"""
+Shared async inference pipeline.
+
+`S` is the concrete game-state type and `N` is the network/oracle object type.
+The pipeline is specialized once per game/network pair so request enqueue,
+batch collection, and response dispatch stay type-stable.
+"""
+mutable struct AsyncPipeline{S, N}
     # Queues
-    request_queue::Channel{InferenceRequest}
+    request_queue::Channel{InferenceRequest{S}}
     response_queues::Dict{Int, Channel{InferenceResponse}}
 
     # GPU server
@@ -84,8 +104,9 @@ mutable struct AsyncPipeline{N}
     total_requests::Ref{Int}
     total_batches::Ref{Int}
 
-    function AsyncPipeline(network::N; batch_size=64, max_wait_ms=5.0, num_workers=64) where N
-        request_queue = Channel{InferenceRequest}(batch_size * 4)
+    function AsyncPipeline(network::N, gspec; batch_size=64, max_wait_ms=5.0, num_workers=64) where N
+        state_type = GI.state_type(gspec)
+        request_queue = Channel{InferenceRequest{state_type}}(batch_size * 4)
         response_queues = Dict{Int, Channel{InferenceResponse}}()
 
         # Response queue must be large enough to hold all responses from a full batch
@@ -95,7 +116,7 @@ mutable struct AsyncPipeline{N}
             response_queues[i] = Channel{InferenceResponse}(response_queue_size)
         end
 
-        new{N}(
+        new{state_type, N}(
             request_queue,
             response_queues,
             network,
@@ -113,8 +134,8 @@ end
 ##### GPU Inference Server
 #####
 
-function gpu_server_loop!(pipeline::AsyncPipeline)
-    pending = InferenceRequest[]
+function gpu_server_loop!(pipeline::AsyncPipeline{S}) where S
+    pending = InferenceRequest{S}[]
     last_batch_time = time()
     debug_iter = 0
 
@@ -202,14 +223,20 @@ end
 ##### Async Worker
 #####
 
-mutable struct AsyncWorker{G, N}
+"""
+Per-thread async MCTS worker.
+
+The worker carries the same concrete state type `S` as the pipeline so pending
+simulations, tree paths, and inference requests remain specialized end-to-end.
+"""
+mutable struct AsyncWorker{S, G, N}
     id::Int
-    pipeline::AsyncPipeline{N}
+    pipeline::AsyncPipeline{S, N}
     gspec::G
     mcts_env::MCTS.Env
 
     # In-flight simulations
-    pending_sims::Dict{Int, PendingSimulation}
+    pending_sims::Dict{Int, PendingSimulation{S}}
     next_request_id::Int
 
     # MCTS params
@@ -220,7 +247,7 @@ mutable struct AsyncWorker{G, N}
     gamma::Float64
 end
 
-function AsyncWorker(id::Int, pipeline::AsyncPipeline{N}, gspec::G, mcts_params) where {G, N}
+function AsyncWorker(id::Int, pipeline::AsyncPipeline{S, N}, gspec::G, mcts_params) where {S, G, N}
     # Create a dummy oracle (we'll use async submission instead)
     dummy_oracle = state -> error("Should not be called directly")
 
@@ -235,7 +262,7 @@ function AsyncWorker(id::Int, pipeline::AsyncPipeline{N}, gspec::G, mcts_params)
 
     AsyncWorker(
         id, pipeline, gspec, mcts_env,
-        Dict{Int, PendingSimulation}(),
+        Dict{Int, PendingSimulation{S}}(),
         1,
         mcts_params.num_iters_per_turn,
         mcts_params.dirichlet_noise_α,
@@ -278,7 +305,10 @@ Does NOT call the oracle - just submits to queue.
 """
 function traverse_to_leaf!(worker::AsyncWorker, game, η)
     env = worker.mcts_env
-    path = Tuple{Any, Int}[]
+    S = typeof(GI.current_state(game))
+    # Keep the backpropagation path concrete to avoid dynamic dispatch during
+    # repeated `remove_virtual_loss!` / `update_state_info!` updates.
+    path = Tuple{S, Int}[]
     rewards = Float64[]
     player_switches = Bool[]
 

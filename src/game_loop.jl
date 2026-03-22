@@ -314,17 +314,17 @@ function play_game(white::GameAgent, black::GameAgent, env;
                 state = GI.current_state(env)
                 wp = GI.white_playing(env)
                 agent = wp ? white : black
+                is_contact = (record_value_comparison || record_trace) ?
+                    _is_contact_position(state) : true
 
                 if record_value_comparison && agent isa MctsAgent &&
                         value_oracle !== nothing && opponent_value_fn !== nothing
                     nn_v = Float64(value_oracle(env))
                     opp_v = Float64(opponent_value_fn(env))
-                    is_contact = _is_contact_position(state)
                     push!(value_samples, PositionValueSample(nn_v, opp_v, is_contact))
                 end
 
                 if record_trace
-                    is_contact = _is_contact_position(state)
                     push!(trace, TraceEntry(state, wp ? 0 : 1, avail[1], avail,
                                             Float32[1.0], false, false, is_contact))
                 end
@@ -401,7 +401,9 @@ function play_game(white::GameAgent, black::GameAgent, env;
 
     # Compute reward
     reward = if bearoff_truncated && first_bearoff_result !== nothing
-        # Use bear-off equity as the reward
+        # Truncated games report the exact bear-off scalar value in the same
+        # white-relative convention as `GI.white_reward(env)`. Sample builders
+        # later convert this to side-to-move values per position.
         first_bearoff_wp ? Float64(first_bearoff_result.value) : -Float64(first_bearoff_result.value)
     elseif GI.game_terminated(env)
         Float64(GI.white_reward(env))

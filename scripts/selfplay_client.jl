@@ -256,7 +256,20 @@ const BEAROFF_TABLE = let
     t
 end
 
-"""Look up exact bear-off equity from precomputed table (pre-dice, valid at chance nodes)."""
+"""
+Look up exact bear-off equity from the precomputed table.
+
+The returned `equity` vector follows the same five-head convention as the
+network and training samples:
+- `p_win`
+- `p_gammon_win = P(gammon | win)`
+- `p_bg_win = P(backgammon | win)`
+- `p_gammon_loss = P(gammon | loss)`
+- `p_bg_loss = P(backgammon | loss)`
+
+That alignment is what allows exact bear-off targets to plug directly into the
+multi-head loss and `compute_equity` without any semantic conversion.
+"""
 function bearoff_table_equity(game::BackgammonNet.BackgammonGame)
     r = BearoffK6.lookup(BEAROFF_TABLE, game)
     eq = Float32[r.p_win, r.p_gammon_win, r.p_bg_win, r.p_gammon_loss, r.p_bg_loss]
@@ -272,8 +285,9 @@ resulting position in the bear-off table, and return the best (max) value.
 This gives the exact Q(board, dice) = max_move V(result(board, dice, move)),
 where V is the opponent's pre-dice table value (negated for perspective flip).
 
-Returns (value, equity) where value is white-relative scalar equity and
-equity is the 5-element probability vector, or nothing if not a bear-off position.
+Returns `(value, equity)` where `value` is white-relative scalar equity and
+`equity` is the 5-element conditional-probability vector used throughout the
+multi-head stack, or `nothing` if not a bear-off position.
 """
 function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
     if !BearoffK6.is_bearoff_position(game.p0, game.p1)
@@ -289,7 +303,7 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
             return (value=mover_val, equity=mover_eq)
         else
             return (value=-mover_val,
-                    equity=Float32[1.0f0 - mover_eq[1], mover_eq[4], mover_eq[5], mover_eq[2], mover_eq[3]])
+                    equity=AlphaZero.flip_equity_perspective(mover_eq))
         end
     end
 
@@ -320,11 +334,12 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
             # After move, opponent's turn at a chance node.
             # lookup() returns from bg_copy.current_player's perspective (the opponent).
             r_opp = BearoffK6.lookup(table, bg_copy)
-            # Negate for mover's perspective
+            # Negate for mover's perspective.
             mover_val = -BearoffK6.compute_equity(r_opp)
-            # Flip probabilities: mover's P(win) = opponent's P(loss), etc.
-            mover_eq = Float32[1.0f0 - r_opp.p_win, r_opp.p_gammon_loss, r_opp.p_bg_loss,
-                               r_opp.p_gammon_win, r_opp.p_bg_win]
+            # Flip the conditional heads, not joint probabilities:
+            # mover's `P(gammon|win)` is the opponent's `P(gammon|loss)`, etc.
+            mover_eq = AlphaZero.flip_equity_perspective(
+                Float32[r_opp.p_win, r_opp.p_gammon_win, r_opp.p_bg_win, r_opp.p_gammon_loss, r_opp.p_bg_loss])
         else
             continue
         end
@@ -344,10 +359,10 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
         # Mover is white — already white-relative
         return (value=best_mover_value, equity=best_mover_equity)
     else
-        # Mover is black — flip to white perspective
+        # Mover is black — flip to white perspective while preserving the same
+        # conditional-head convention expected by training/inference.
         white_value = -best_mover_value
-        white_eq = Float32[1.0f0 - best_mover_equity[1], best_mover_equity[4], best_mover_equity[5],
-                           best_mover_equity[2], best_mover_equity[3]]
+        white_eq = AlphaZero.flip_equity_perspective(best_mover_equity)
         return (value=white_value, equity=white_eq)
     end
 end
@@ -558,6 +573,25 @@ function _sample_chance(rng, outcomes)
     return length(outcomes)
 end
 
+"""
+Convert a recorded rollout into per-position training samples.
+
+This is the main junction where self-play rewards, exact bear-off overrides, and
+multi-head equity targets are aligned.
+
+Per sample:
+- `value` is always stored from the side-to-move perspective at that sample
+- `equity` always follows the five-head conditional contract used by the network:
+  `[P(win), P(gammon|win), P(bg|win), P(gammon|loss), P(bg|loss)]`
+
+Target precedence is intentionally:
+1. exact bear-off truncation target captured earlier in the game, if present
+2. exact post-dice bear-off value for the current state, if available
+3. final game outcome as a hard 0/1 target
+
+Whenever perspective flips are needed, the code swaps the win-conditioned and
+loss-conditioned heads. It does not reinterpret them as joint probabilities.
+"""
 function convert_trace_to_samples(gspec, states, policies, trace_actions, rewards, is_chance, final_reward, outcome; rng=nothing,
         bearoff_equity=nothing, bearoff_wp=nothing,
         first_bearoff_equity=nothing, first_bearoff_wp=nothing)
@@ -569,8 +603,7 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
         if bearoff_wp
             copy(bearoff_equity)
         else
-            Float32[1.0f0 - bearoff_equity[1], bearoff_equity[4], bearoff_equity[5],
-                    bearoff_equity[2], bearoff_equity[3]]
+            AlphaZero.flip_equity_perspective(bearoff_equity)
         end
     else
         nothing
@@ -580,8 +613,7 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
         if first_bearoff_wp
             copy(first_bearoff_equity)
         else
-            Float32[1.0f0 - first_bearoff_equity[1], first_bearoff_equity[4], first_bearoff_equity[5],
-                    first_bearoff_equity[2], first_bearoff_equity[3]]
+            AlphaZero.flip_equity_perspective(first_bearoff_equity)
         end
     else
         nothing
@@ -594,41 +626,44 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
         is_ch = is_chance[i]
         wp = GI.white_playing(gspec, state)
 
+        # `final_reward` is white-relative at the game level. Convert it to the
+        # side-to-move view for this sample so training targets match the policy
+        # and MCTS convention used elsewhere in the stack.
         z = wp ? final_reward : -final_reward
         eq = zeros(Float32, 5)
         has_eq = false
 
         if bearoff_equity !== nothing
+            # Truncated rollouts reuse the exact first bear-off target for every
+            # earlier position in the prefix. This keeps the scalar bootstrap
+            # value and five-head equity target synchronized.
             has_eq = true
             if wp
                 eq = copy(probs_white)
             else
-                eq = Float32[1.0f0 - probs_white[1], probs_white[4], probs_white[5],
-                             probs_white[2], probs_white[3]]
+                eq = AlphaZero.flip_equity_perspective(probs_white)
             end
         elseif !isnothing(outcome)
+            # Hard terminal supervision. The opposite-side conditional heads stay
+            # at 0 here by construction; masked BCE in `src/learning.jl` ensures
+            # those placeholders do not turn the auxiliary heads into joint-event
+            # targets during training.
             has_eq = true
-            won = outcome.white_won == wp
-            if won
-                eq[1] = 1.0f0
-                eq[2] = outcome.is_gammon ? 1.0f0 : 0.0f0
-                eq[3] = outcome.is_backgammon ? 1.0f0 : 0.0f0
-            else
-                eq[4] = outcome.is_gammon ? 1.0f0 : 0.0f0
-                eq[5] = outcome.is_backgammon ? 1.0f0 : 0.0f0
-            end
+            eq = AlphaZero.equity_vector_from_outcome(outcome, wp)
         end
 
         is_bearoff_pos = false
         if bearoff_equity === nothing && state isa BackgammonNet.BackgammonGame &&
                 BearoffK6.is_bearoff_position(state.p0, state.p1)
             # Use post-dice move enumeration for exact Q(board, dice) values
+            # and the matching five-head conditional target for this specific
+            # state. Override both together so `value` and `equity` stay aligned.
             bo = bearoff_post_dice_equity(state, BEAROFF_TABLE)
             if bo !== nothing
                 z = wp ? bo.value : -bo.value
                 eq = copy(bo.equity)
                 if !wp
-                    eq = Float32[1.0f0 - bo.equity[1], bo.equity[4], bo.equity[5], bo.equity[2], bo.equity[3]]
+                    eq = AlphaZero.flip_equity_perspective(bo.equity)
                 end
                 has_eq = true
                 is_bearoff_pos = true
@@ -636,12 +671,14 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
         end
 
         if !is_bearoff_pos && first_bo_probs_white !== nothing
+            # Earlier prefix states in a truncated rollout inherit the same exact
+            # first-bearoff target. This is a TD-style bootstrap target, not a
+            # terminal outcome label.
             has_eq = true
             if wp
                 eq = copy(first_bo_probs_white)
             else
-                eq = Float32[1.0f0 - first_bo_probs_white[1], first_bo_probs_white[4], first_bo_probs_white[5],
-                             first_bo_probs_white[2], first_bo_probs_white[3]]
+                eq = AlphaZero.flip_equity_perspective(first_bo_probs_white)
             end
         end
 
@@ -1311,12 +1348,8 @@ function check_and_do_eval!()
         flush(stdout)
         return false
     end
-    if result_c !== nothing
-        FluxLib.load_weights!(eval_contact_net, result_c[2])
-    end
-    if result_r !== nothing
-        FluxLib.load_weights!(eval_race_net, result_r[2])
-    end
+    FluxLib.load_weights!(eval_contact_net, result_c[2])
+    FluxLib.load_weights!(eval_race_net, result_r[2])
 
     # Create FastWeights for eval if using fast backend
     eval_contact_fw = CPU_INFERENCE_BACKEND == :fast ?

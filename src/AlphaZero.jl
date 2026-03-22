@@ -115,6 +115,8 @@ module AlphaZero
   # Memory buffer to hold samples generated during self-play
   include("memory.jl")
   export MemoryBuffer, get_experience
+  export EquityTargets, equity_targets_from_outcome
+  export equity_vector, equity_vector_from_outcome, flip_equity_perspective
 
   # MuZero-style reanalysis for improved sample efficiency
   include("reanalyze.jl")
@@ -124,6 +126,7 @@ module AlphaZero
 
   # Utilities to train the neural network based on collected samples
   include("learning.jl")
+  export split_equity_targets
 
   # Legacy training algorithm (used by session.jl/benchmark.jl)
   include("training.jl")

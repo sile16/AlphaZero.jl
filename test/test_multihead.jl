@@ -149,6 +149,22 @@ end
     @test targets.p_bg_loss ≈ 1.0
   end
 
+  @testset "Equity vector helpers" begin
+    outcome = GI.GameOutcome(true, true, false)
+    vec_white = AlphaZero.equity_vector_from_outcome(outcome, true)
+    vec_black = AlphaZero.equity_vector_from_outcome(outcome, false)
+
+    @test vec_white == Float32[1, 1, 0, 0, 0]
+    @test vec_black == Float32[0, 0, 0, 1, 0]
+    @test AlphaZero.flip_equity_perspective(vec_white) == vec_black
+    @test AlphaZero.flip_equity_perspective(vec_black) == vec_white
+
+    soft = Float32[0.62, 0.25, 0.05, 0.4, 0.1]
+    flipped = AlphaZero.flip_equity_perspective(soft)
+    @test flipped == Float32[0.38, 0.4, 0.1, 0.25, 0.05]
+    @test AlphaZero.flip_equity_perspective(flipped) == soft
+  end
+
   @testset "Conditional head masking regression" begin
     W = Float32[1 1]
     EqWin = Float32[1 0]
@@ -166,6 +182,25 @@ end
 
     @test masked_loss ≈ 0f0 atol=1f-6
     @test unmasked_loss > masked_loss
+  end
+
+  @testset "Split equity targets preserves head order and masking" begin
+    equities = Float32[
+      1 0 0.7;
+      0 0 0.3;
+      0 0 0.1;
+      0 1 0.2;
+      0 0 0.05
+    ]
+    has_equity = Bool[true, false, true]
+
+    split = AlphaZero.split_equity_targets(equities, has_equity)
+    @test split.EqWin == Float32[1 0 0.7]
+    @test split.EqGW == Float32[0 0 0.3]
+    @test split.EqBGW == Float32[0 0 0.1]
+    @test split.EqGL == Float32[0 0 0.2]
+    @test split.EqBGL == Float32[0 0 0.05]
+    @test split.HasEquity == Float32[1 0 1]
   end
 
   @testset "TrainingSample with equity" begin
@@ -276,6 +311,9 @@ end
     @test haskey(data, :EqWin)
     @test haskey(data, :HasEquity)
     @test all(data.HasEquity .== 1.0f0)  # All samples have equity
+    @test data.EqWin[1, 1] in Float32[0, 1]
+    @test data.EqGW[1, 1] == 0f0
+    @test data.EqGL[1, 1] == 0f0
 
     # Test that learning params work (with all required fields)
     lparams = LearningParams(
