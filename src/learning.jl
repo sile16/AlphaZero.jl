@@ -101,6 +101,16 @@ wmean(x, w) = sum(x .* w) / sum(w)
 bce_wmean(ŷ, y, w) = -sum((y .* log.(ŷ .+ eps(eltype(y))) .+
                            (1f0 .- y) .* log.(1f0 .- ŷ .+ eps(eltype(y)))) .* w) / sum(w)
 
+# For conditional equity heads, only train the winning-side heads on won games
+# and the losing-side heads on lost games. The p_win head is trained on all
+# equity samples.
+function _equity_head_weights(W, EqWin, HasEquity)
+  W_equity = W .* HasEquity
+  W_win = W_equity .* EqWin
+  W_loss = W_equity .* (1f0 .- EqWin)
+  return W_equity, W_win, W_loss
+end
+
 """
     losses(nn, params, Wmean, Hp, batch)
 
@@ -136,16 +146,17 @@ function losses(nn, params, Wmean, Hp, batch)
     EqWin, EqGW, EqBGW, EqGL, EqBGL, HasEquity =
       batch.EqWin, batch.EqGW, batch.EqBGW, batch.EqGL, batch.EqBGL, batch.HasEquity
 
-    # Weight for samples that have equity targets
-    W_equity = W .* HasEquity
+    # Weight for samples that have equity targets. Conditional heads are only
+    # trained on the subset of samples where they are semantically defined.
+    W_equity, W_win, W_loss = _equity_head_weights(W, EqWin, HasEquity)
 
     # Multi-head value losses (binary cross-entropy for each head)
     if sum(W_equity) > 0
       Lv_win = bce_wmean(V̂_win, EqWin, W_equity)
-      Lv_gw = bce_wmean(V̂_gw, EqGW, W_equity)
-      Lv_bgw = bce_wmean(V̂_bgw, EqBGW, W_equity)
-      Lv_gl = bce_wmean(V̂_gl, EqGL, W_equity)
-      Lv_bgl = bce_wmean(V̂_bgl, EqBGL, W_equity)
+      Lv_gw = sum(W_win) > 0 ? bce_wmean(V̂_gw, EqGW, W_win) : zero(Lv_win)
+      Lv_bgw = sum(W_win) > 0 ? bce_wmean(V̂_bgw, EqBGW, W_win) : zero(Lv_win)
+      Lv_gl = sum(W_loss) > 0 ? bce_wmean(V̂_gl, EqGL, W_loss) : zero(Lv_win)
+      Lv_bgl = sum(W_loss) > 0 ? bce_wmean(V̂_bgl, EqBGL, W_loss) : zero(Lv_win)
       Lv = Lv_win + Lv_gw + Lv_bgw + Lv_gl + Lv_bgl
     else
       # Fallback: use standard value loss if no equity targets

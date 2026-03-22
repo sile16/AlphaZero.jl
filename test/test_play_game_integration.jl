@@ -5,8 +5,10 @@ using AlphaZero: GI, GameLoop, MctsParams, ConstSchedule, BatchedMCTS
 
 # Use tictactoe as a simple deterministic game for testing
 include(joinpath(@__DIR__, "..", "games", "tictactoe", "game.jl"))
+include(joinpath(@__DIR__, "..", "games", "pig", "main.jl"))
 
 const TTT = GameSpec()
+const PIG = Pig.GameSpec()
 
 # Oracle: returns uniform policy over LEGAL actions + 0 value
 # MCTS expects policy length == number of available actions
@@ -216,5 +218,62 @@ end
         # Verify parametric types are inferred (not Any)
         @test !(typeof(agent).parameters[1] === Any)  # oracle type
         @test typeof(agent).parameters[3] <: Any       # gspec type (GameSpec)
+    end
+
+    @testset "forced moves still record value comparisons" begin
+        params = MctsParams(
+            num_iters_per_turn=5,
+            cpuct=1.5,
+            temperature=ConstSchedule(0.0),
+            dirichlet_noise_ϵ=0.0,
+            dirichlet_noise_α=1.0)
+
+        agent = GameLoop.MctsAgent(
+            dummy_oracle, nothing, params, 5, TTT;
+            bearoff_eval=nothing)
+
+        forced_state = (
+            board=(true, false, true,
+                   true, false, false,
+                   false, true, nothing),
+            curplayer=true
+        )
+        env = GI.init(TTT, forced_state)
+
+        result = GameLoop.play_game(agent, agent, env;
+            record_trace=true,
+            record_value_comparison=true,
+            value_oracle=_ -> 0.75,
+            opponent_value_fn=_ -> 0.25,
+            rng=Random.MersenneTwister(7))
+
+        @test result.num_moves == 1
+        @test length(result.trace) == 1
+        @test length(result.value_samples) == 1
+        @test result.value_samples[1].nn_val == 0.75
+        @test result.value_samples[1].opponent_val == 0.25
+    end
+
+    @testset "advanced chance modes fall back to classic MCTS player" begin
+        oracle = AlphaZero.MCTS.RolloutOracle(PIG)
+        params = MctsParams(
+            num_iters_per_turn=8,
+            cpuct=1.5,
+            temperature=ConstSchedule(0.0),
+            dirichlet_noise_ϵ=0.0,
+            dirichlet_noise_α=1.0,
+            chance_mode=:stratified)
+
+        agent = GameLoop.MctsAgent(
+            oracle, nothing, params, 8, PIG;
+            bearoff_eval=nothing)
+
+        player = GameLoop.create_player(agent)
+        @test player isa AlphaZero.MctsPlayer
+
+        env = GI.init(PIG)
+        result = GameLoop.play_game(agent, agent, env;
+            rng=Random.MersenneTwister(11))
+        @test result.num_moves > 0
     end
 end

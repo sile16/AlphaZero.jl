@@ -32,6 +32,12 @@ end
 
 Compute the expected game value from equity output components.
 
+This formula assumes the auxiliary heads are conditional probabilities:
+- `p_gammon_win = P(gammon | win)`
+- `p_bg_win = P(backgammon | win)`
+- `p_gammon_loss = P(gammon | loss)`
+- `p_bg_loss = P(backgammon | loss)`
+
 The formula is:
 ```
 E = P(win) * (1 + P(gammon|win) + P(bg|win))

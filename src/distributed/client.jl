@@ -97,7 +97,7 @@ function check_weight_version(client::SelfPlayClient)
 end
 
 """Download weights for a model. Returns (header, weight_arrays) or nothing."""
-function download_weights(client::SelfPlayClient, model::Symbol)
+function download_weights(client::SelfPlayClient, model::Symbol; expected_version::Union{Nothing, Int}=nothing)
     endpoint = model == :contact ? "contact" : "race"
     resp = HTTP.get("$(client.server_url)/api/weights/$endpoint",
                     auth_headers(client);
@@ -106,6 +106,14 @@ function download_weights(client::SelfPlayClient, model::Symbol)
     if resp.status != 200
         @warn "Weight download failed" model status=resp.status
         return nothing
+    end
+    downloaded_version = try
+        parse(Int, HTTP.header(resp, "X-Version", "0"))
+    catch
+        0
+    end
+    if !isnothing(expected_version) && downloaded_version != expected_version
+        error("Weight version mismatch for $model: expected $expected_version, got $downloaded_version")
     end
     return deserialize_weights_with_header(resp.body)
 end
@@ -118,7 +126,7 @@ function sync_weights!(client::SelfPlayClient, contact_network, race_network)
     updated = false
 
     if version["contact_version"] > client.contact_version
-        result = download_weights(client, :contact)
+        result = download_weights(client, :contact; expected_version=version["contact_version"])
         if result !== nothing
             header, weights = result
             FluxLib.load_weights!(contact_network, weights)
@@ -129,7 +137,7 @@ function sync_weights!(client::SelfPlayClient, contact_network, race_network)
     end
 
     if version["race_version"] > client.race_version
-        result = download_weights(client, :race)
+        result = download_weights(client, :race; expected_version=version["race_version"])
         if result !== nothing
             header, weights = result
             FluxLib.load_weights!(race_network, weights)

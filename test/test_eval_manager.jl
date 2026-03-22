@@ -96,6 +96,17 @@ end
     @test job.chunks[1].checked_out_by === nothing
     @test haskey(job.results, chunk.chunk_id)
 
+    # Duplicate completion should be rejected and must not overwrite
+    replacement = EvalChunkResult(
+        chunk.chunk_id, true,
+        [99.0],
+        [99.0],
+        [99.0],
+        [false]
+    )
+    @test submit_chunk!(job, replacement) == false
+    @test job.results[chunk.chunk_id].rewards == [1.0, -1.0, 2.0]
+
     # Invalid chunk_id
     bad_result = EvalChunkResult(999, true, [], [], [], Bool[])
     @test submit_chunk!(job, bad_result) == false

@@ -91,12 +91,13 @@ end
     submit_chunk!(job, result) -> Bool
 
 Store a completed chunk result and mark the chunk as done. Returns true on
-success, false if the chunk_id is invalid.
+success, false if the chunk_id is invalid or the chunk was already completed.
 """
 function submit_chunk!(job::EvalJob, result::EvalChunkResult)
     idx = findfirst(c -> c.chunk_id == result.chunk_id, job.chunks)
     idx === nothing && return false
     chunk = job.chunks[idx]
+    chunk.completed && return false
     chunk.completed = true
     chunk.checked_out_by = nothing
     job.results[result.chunk_id] = result

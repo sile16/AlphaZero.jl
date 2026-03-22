@@ -9,6 +9,7 @@ Supports MsgPack (Julia clients) and JSON (web clients) via content-type negotia
 
 using MsgPack
 using JSON
+using SHA
 
 """Columnar batch of self-play samples for efficient serialization."""
 struct SampleBatch
@@ -159,10 +160,20 @@ struct WeightHeader
     checksum::UInt64
 end
 
+function _weights_checksum(weight_bytes::Vector{UInt8})::UInt64
+    digest = sha256(weight_bytes)
+    checksum = UInt64(0)
+    @inbounds for i in 1:8
+        checksum = (checksum << 8) | UInt64(digest[i])
+    end
+    return checksum
+end
+
 """Serialize network weights with metadata header.
 Uses existing FluxLib.serialize_weights format with a prepended header."""
 function serialize_weights_with_header(nn, header::WeightHeader)::Vector{UInt8}
     weight_bytes = FluxLib.serialize_weights(nn)
+    checksum = _weights_checksum(weight_bytes)
 
     buf = IOBuffer()
     write(buf, WEIGHT_MAGIC)
@@ -170,7 +181,7 @@ function serialize_weights_with_header(nn, header::WeightHeader)::Vector{UInt8}
     write(buf, header.iteration)
     write(buf, header.width)
     write(buf, header.blocks)
-    write(buf, header.checksum)
+    write(buf, checksum)
     write(buf, weight_bytes)
     take!(buf)
 end
@@ -191,6 +202,10 @@ function deserialize_weights_with_header(bytes::Vector{UInt8})
     )
 
     weight_bytes = read(io)  # Remaining bytes
+    actual_checksum = _weights_checksum(weight_bytes)
+    if header.checksum != 0 && header.checksum != actual_checksum
+        error("Weight checksum mismatch: expected $(header.checksum), got $actual_checksum")
+    end
     weights = FluxLib.deserialize_weights(weight_bytes)
     return (header, weights)
 end

@@ -349,21 +349,37 @@ function handle_eval_submit(req::HTTP.Request, state::ServerState)
         value_is_contact = Bool.(get(body, "value_is_contact", Bool[]))
 
         eval_complete = false
+        accepted = false
+        error_status = 409
+        error_message = "Eval submit rejected"
         lock(EVAL_LOCK) do
             job = EVAL_JOB[]
-            job === nothing && return
+            if job === nothing
+                error_message = "No active eval job"
+                return
+            end
             chunk_idx = findfirst(c -> c.chunk_id == chunk_id, job.chunks)
-            chunk_idx === nothing && return
+            if chunk_idx === nothing
+                error_status = 404
+                error_message = "Unknown eval chunk $chunk_id"
+                return
+            end
             chunk = job.chunks[chunk_idx]
-            # Validate ownership: only the client that checked out can submit
-            if chunk.checked_out_by !== nothing && chunk.checked_out_by != client_name
-                @warn "Eval submit rejected: chunk $chunk_id owned by $(chunk.checked_out_by), not $client_name"
+            if chunk.completed
+                error_message = "Eval chunk $chunk_id is already complete"
+                return
+            end
+            if chunk.checked_out_by != client_name
+                owner = something(chunk.checked_out_by, "nobody")
+                error_message = "Eval chunk $chunk_id is owned by $owner, not $client_name"
+                @warn "Eval submit rejected" chunk_id client_name owner
                 return
             end
             az_is_white = chunk.az_is_white
             result = EvalManager.EvalChunkResult(chunk_id, az_is_white,
                                                   rewards, value_nn, value_opp, value_is_contact)
             EvalManager.submit_chunk!(job, result)
+            accepted = true
             n_done = count(c -> c.completed, job.chunks)
             n_total = length(job.chunks)
             if n_done % 10 == 0 || n_done == n_total
@@ -390,6 +406,11 @@ function handle_eval_submit(req::HTTP.Request, state::ServerState)
                 end
                 EVAL_JOB[] = nothing
             end
+        end
+
+        if !accepted
+            resp = Dict("accepted" => false, "error" => error_message, "eval_complete" => false)
+            return HTTP.Response(error_status, ["Content-Type" => "application/json"], JSON.json(resp))
         end
 
         resp = Dict("accepted" => true, "eval_complete" => eval_complete)

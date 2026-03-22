@@ -37,6 +37,12 @@ struct InferenceRequest
     worker_id::Int
 end
 
+function _response_queue!(pipeline::AsyncPipeline, worker_id::Int)
+    return get!(pipeline.response_queues, worker_id) do
+        Channel{InferenceResponse}(pipeline.batch_size * 2)
+    end
+end
+
 struct InferenceResponse
     id::Int
     policy::Vector{Float32}
@@ -153,15 +159,11 @@ function gpu_server_loop!(pipeline::AsyncPipeline)
                     P, V = results[i]
                     response = InferenceResponse(req.id, P, V)
 
-                    if haskey(pipeline.response_queues, req.worker_id)
-                        try
-                            put!(pipeline.response_queues[req.worker_id], response)
-                            responses_sent += 1
-                        catch e
-                            @warn "Failed to send response to worker $(req.worker_id)" exception=e
-                        end
-                    else
-                        @warn "No response queue for worker $(req.worker_id)"
+                    try
+                        put!(_response_queue!(pipeline, req.worker_id), response)
+                        responses_sent += 1
+                    catch e
+                        @warn "Failed to send response to worker $(req.worker_id)" exception=e
                     end
                 end
 
@@ -228,6 +230,8 @@ function AsyncWorker(id::Int, pipeline::AsyncPipeline{N}, gspec::G, mcts_params)
         noise_ϵ=mcts_params.dirichlet_noise_ϵ,
         noise_α=mcts_params.dirichlet_noise_α,
         prior_temperature=mcts_params.prior_temperature)
+
+    _response_queue!(pipeline, id)
 
     AsyncWorker(
         id, pipeline, gspec, mcts_env,
@@ -356,7 +360,7 @@ Check for completed evaluations and backpropagate.
 """
 function process_completed!(worker::AsyncWorker)
     env = worker.mcts_env
-    response_queue = worker.pipeline.response_queues[worker.id]
+    response_queue = _response_queue!(worker.pipeline, worker.id)
     completed = 0
 
     while isready(response_queue)
@@ -450,7 +454,7 @@ function async_explore!(worker::AsyncWorker, game, num_sims=nothing)
         put!(worker.pipeline.request_queue, request)
 
         # Wait for root evaluation
-        response_queue = worker.pipeline.response_queues[worker.id]
+        response_queue = _response_queue!(worker.pipeline, worker.id)
         while true
             if isready(response_queue)
                 response = take!(response_queue)
@@ -501,7 +505,7 @@ function async_explore!(worker::AsyncWorker, game, num_sims=nothing)
         sims_completed += completed
 
         # Wait for responses if we have pending simulations but no responses ready
-        if !isempty(worker.pending_sims) && !isready(worker.pipeline.response_queues[worker.id])
+        if !isempty(worker.pending_sims) && !isready(_response_queue!(worker.pipeline, worker.id))
             # Small sleep to allow GPU server thread to process and respond
             sleep(0.001)  # 1ms
             # Try to process again after sleep

@@ -149,6 +149,25 @@ end
     @test targets.p_bg_loss ≈ 1.0
   end
 
+  @testset "Conditional head masking regression" begin
+    W = Float32[1 1]
+    EqWin = Float32[1 0]
+    HasEquity = Float32[1 1]
+
+    W_equity, W_win, W_loss = AlphaZero._equity_head_weights(W, EqWin, HasEquity)
+    @test W_equity == Float32[1 1]
+    @test W_win == Float32[1 0]
+    @test W_loss == Float32[0 1]
+
+    pred_gw = Float32[1 1]
+    targ_gw = Float32[1 0]
+    masked_loss = AlphaZero.bce_wmean(pred_gw, targ_gw, W_win)
+    unmasked_loss = AlphaZero.bce_wmean(pred_gw, targ_gw, W_equity)
+
+    @test masked_loss ≈ 0f0 atol=1f-6
+    @test unmasked_loss > masked_loss
+  end
+
   @testset "TrainingSample with equity" begin
     # Create sample without equity
     s = "dummy_state"

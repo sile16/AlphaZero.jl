@@ -61,7 +61,9 @@ using .Pig
     game = GI.init(gspec)
 
     # Manually set state close to winning
-    winning_state = (p1_score=99, p2_score=50, turn_total=0, curplayer=true, awaiting_dice=false)
+    winning_state = (
+      p1_score=99, p2_score=50, turn_total=0,
+      curplayer=true, awaiting_dice=false, turn_count=0)
     GI.set_state!(game, winning_state)
 
     # Roll and get 2+

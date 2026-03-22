@@ -112,14 +112,19 @@ end
 """
     create_player(agent::MctsAgent)
 
-Create a `BatchedMctsPlayer` for the game. Should be created once per game,
-reset after the game ends.
+Create an MCTS player for the game. Uses `BatchedMctsPlayer` for the fast
+passthrough chance-mode path and falls back to the classic `MctsPlayer` when
+advanced stochastic chance handling is requested.
 """
 function create_player(agent::MctsAgent)
-    return BatchedMCTS.BatchedMctsPlayer(
-        agent.gspec, agent.oracle, agent.mcts_params;
-        batch_size=agent.batch_size, batch_oracle=agent.batch_oracle,
-        bearoff_evaluator=agent.bearoff_eval)
+    if agent.mcts_params.chance_mode == :passthrough
+        return BatchedMCTS.BatchedMctsPlayer(
+            agent.gspec, agent.oracle, agent.mcts_params;
+            batch_size=agent.batch_size, batch_oracle=agent.batch_oracle,
+            bearoff_evaluator=agent.bearoff_eval)
+    end
+    MctsPlayer = getfield(parentmodule(@__MODULE__), :MctsPlayer)
+    return MctsPlayer(agent.gspec, agent.oracle, agent.mcts_params)
 end
 
 """
@@ -137,7 +142,12 @@ end
 Run MCTS and return the selected action, policy distribution, and legal actions.
 """
 function select_action(agent::MctsAgent, player, env)
-    actions, policy = BatchedMCTS.think(player, env)
+    actions, policy = if player isa BatchedMCTS.BatchedMctsPlayer
+        BatchedMCTS.think(player, env)
+    else
+        think = getfield(parentmodule(@__MODULE__), :think)
+        think(player, env)
+    end
     return (actions, Float32.(policy), actions)
 end
 
@@ -301,9 +311,19 @@ function play_game(white::GameAgent, black::GameAgent, env;
 
             # Single-action bypass: skip MCTS for forced moves
             if length(avail) == 1
+                state = GI.current_state(env)
+                wp = GI.white_playing(env)
+                agent = wp ? white : black
+
+                if record_value_comparison && agent isa MctsAgent &&
+                        value_oracle !== nothing && opponent_value_fn !== nothing
+                    nn_v = Float64(value_oracle(env))
+                    opp_v = Float64(opponent_value_fn(env))
+                    is_contact = _is_contact_position(state)
+                    push!(value_samples, PositionValueSample(nn_v, opp_v, is_contact))
+                end
+
                 if record_trace
-                    state = GI.current_state(env)
-                    wp = GI.white_playing(env)
                     is_contact = _is_contact_position(state)
                     push!(trace, TraceEntry(state, wp ? 0 : 1, avail[1], avail,
                                             Float32[1.0], false, false, is_contact))
@@ -362,10 +382,20 @@ function play_game(white::GameAgent, black::GameAgent, env;
     finally
         # Always reset MCTS players to free tree memory
         if white_player !== nothing
-            BatchedMCTS.reset_player!(white_player)
+            if white_player isa BatchedMCTS.BatchedMctsPlayer
+                BatchedMCTS.reset_player!(white_player)
+            else
+                reset_player! = getfield(parentmodule(@__MODULE__), :reset_player!)
+                reset_player!(white_player)
+            end
         end
         if black_player !== nothing
-            BatchedMCTS.reset_player!(black_player)
+            if black_player isa BatchedMCTS.BatchedMctsPlayer
+                BatchedMCTS.reset_player!(black_player)
+            else
+                reset_player! = getfield(parentmodule(@__MODULE__), :reset_player!)
+                reset_player!(black_player)
+            end
         end
     end
 

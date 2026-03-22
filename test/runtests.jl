@@ -32,6 +32,18 @@ end
   include("test_backgammon_inference_regressions.jl")
 end
 
+@testset "Multihead Regressions" begin
+  include("test_multihead.jl")
+end
+
+@testset "Game Loop Integration" begin
+  include("test_play_game_integration.jl")
+end
+
+@testset "Distributed Protocol" begin
+  include("test_distributed_protocol.jl")
+end
+
 @testset "Dummy Runs" begin
   dir = "sessions/test-tictactoe"
   @test dummy_run(experiments["tictactoe"], nostdout=false) == nothing

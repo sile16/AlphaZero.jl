@@ -15,6 +15,13 @@ Targets for multi-head equity training (backgammon-style games).
 | `p_bg_win` | Target for P(backgammon|win) - 1.0 if won by backgammon |
 | `p_gammon_loss` | Target for P(gammon|loss) - 1.0 if lost by gammon |
 | `p_bg_loss` | Target for P(backgammon|loss) - 1.0 if lost by backgammon |
+
+The conditional heads are only trained on samples where they are defined:
+- `p_gammon_win` / `p_bg_win` on won games
+- `p_gammon_loss` / `p_bg_loss` on lost games
+
+The opposite-side targets are stored as `0.0` for batching convenience and are
+masked out in the loss function.
 """
 struct EquityTargets
   p_win :: Float64
@@ -33,13 +40,13 @@ For a won game:
 - p_win = 1.0
 - p_gammon_win = 1.0 if gammon, 0.0 otherwise
 - p_bg_win = 1.0 if backgammon, 0.0 otherwise
-- p_gammon_loss = N/A (but set to 0.0)
-- p_bg_loss = N/A (but set to 0.0)
+- p_gammon_loss = N/A (stored as 0.0, masked during training)
+- p_bg_loss = N/A (stored as 0.0, masked during training)
 
 For a lost game:
 - p_win = 0.0
-- p_gammon_win = N/A (but set to 0.0)
-- p_bg_win = N/A (but set to 0.0)
+- p_gammon_win = N/A (stored as 0.0, masked during training)
+- p_bg_win = N/A (stored as 0.0, masked during training)
 - p_gammon_loss = 1.0 if opponent won by gammon, 0.0 otherwise
 - p_bg_loss = 1.0 if opponent won by backgammon, 0.0 otherwise
 """

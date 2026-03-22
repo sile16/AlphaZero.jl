@@ -1294,8 +1294,23 @@ function check_and_do_eval!()
     eval_race_net = FluxLib.FCResNetMultiHead(
         gspec, FluxLib.FCResNetMultiHeadHP(width=RACE_WIDTH, num_blocks=RACE_BLOCKS))
 
-    result_c = download_weights(client, :contact)
-    result_r = download_weights(client, :race)
+    expected_version = expected_weights_version > 0 ? Int(expected_weights_version) : nothing
+    local result_c, result_r
+    try
+        result_c = download_weights(client, :contact; expected_version=expected_version)
+        result_r = download_weights(client, :race; expected_version=expected_version)
+    catch e
+        println("[EVAL] Failed to download eval weights: $e")
+        PAUSE_SELFPLAY[] = false
+        flush(stdout)
+        return false
+    end
+    if result_c === nothing || result_r === nothing
+        println("[EVAL] Failed to download eval weights for iter $eval_iter")
+        PAUSE_SELFPLAY[] = false
+        flush(stdout)
+        return false
+    end
     if result_c !== nothing
         FluxLib.load_weights!(eval_contact_net, result_c[2])
     end
@@ -1405,6 +1420,7 @@ function check_and_do_eval!()
 
             # Start heartbeat in background
             chunk_done = Ref(false)
+            lease_lost = Threads.Atomic{Bool}(false)
             heartbeat_task = Threads.@spawn begin
                 while !chunk_done[]
                     try
@@ -1415,6 +1431,7 @@ function check_and_do_eval!()
                         if resp.status == 200
                             hb_result = JSON3.read(String(resp.body), Dict{String,Any})
                             if !get(hb_result, "lease_extended", false)
+                                lease_lost[] = true
                                 println("[EVAL] WARNING: Chunk $chunk_id lease lost")
                                 break
                             end
@@ -1452,6 +1469,12 @@ function check_and_do_eval!()
             chunk_done[] = true
             t_chunk = time() - t_chunk_start
 
+            if lease_lost[]
+                println("[EVAL] Skipping stale chunk $chunk_id after lease loss")
+                flush(stdout)
+                continue
+            end
+
             # Extract value samples into separate arrays for server
             val_nn = Float64[]
             val_opp = Float64[]
@@ -1481,6 +1504,11 @@ function check_and_do_eval!()
                                      status_exception=false, connect_timeout=10, readtimeout=60)
                     if resp.status == 200
                         sub_result = JSON3.read(String(resp.body), Dict{String,Any})
+                        if !get(sub_result, "accepted", false)
+                            println("[EVAL] Chunk $chunk_id rejected: $(get(sub_result, "error", "unknown error"))")
+                            flush(stdout)
+                            break
+                        end
                         eval_complete = get(sub_result, "eval_complete", false)
                         chunks_done += 1
                         avg_reward = mean(rewards)
@@ -1492,6 +1520,16 @@ function check_and_do_eval!()
                         if eval_complete
                             @goto eval_finished
                         end
+                        break
+                    elseif resp.status == 404 || resp.status == 409
+                        error_msg = "HTTP $(resp.status)"
+                        try
+                            sub_result = JSON3.read(String(resp.body), Dict{String,Any})
+                            error_msg = get(sub_result, "error", error_msg)
+                        catch
+                        end
+                        println("[EVAL] Chunk $chunk_id rejected: $error_msg")
+                        flush(stdout)
                         break
                     else
                         println("[EVAL] Submit failed (HTTP $(resp.status)), retry $attempt...")
