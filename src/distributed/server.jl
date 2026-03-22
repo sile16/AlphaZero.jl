@@ -358,6 +358,11 @@ function handle_eval_submit(req::HTTP.Request, state::ServerState)
             result = EvalManager.EvalChunkResult(chunk_id, az_is_white,
                                                   rewards, value_nn, value_opp, value_is_contact)
             EvalManager.submit_chunk!(job, result)
+            n_done = count(c -> c.completed, job.chunks)
+            n_total = length(job.chunks)
+            if n_done % 10 == 0 || n_done == n_total
+                println("Eval iter $(job.iter): $n_done/$n_total chunks submitted")
+            end
             if EvalManager.is_complete(job)
                 eval_complete = true
                 # Finalize: aggregate results and log to TensorBoard
