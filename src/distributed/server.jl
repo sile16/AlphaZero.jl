@@ -342,6 +342,7 @@ function handle_eval_submit(req::HTTP.Request, state::ServerState)
     try
         body = MsgPack.unpack(req.body)
         chunk_id = Int(body["chunk_id"])
+        client_name = get(body, "client_name", "unknown")
         rewards = Float64.(body["rewards"])
         value_nn = Float64.(get(body, "value_nn", Float64[]))
         value_opp = Float64.(get(body, "value_opp", Float64[]))
@@ -351,10 +352,15 @@ function handle_eval_submit(req::HTTP.Request, state::ServerState)
         lock(EVAL_LOCK) do
             job = EVAL_JOB[]
             job === nothing && return
-            # Get az_is_white from chunk metadata (not request body)
             chunk_idx = findfirst(c -> c.chunk_id == chunk_id, job.chunks)
             chunk_idx === nothing && return
-            az_is_white = job.chunks[chunk_idx].az_is_white
+            chunk = job.chunks[chunk_idx]
+            # Validate ownership: only the client that checked out can submit
+            if chunk.checked_out_by !== nothing && chunk.checked_out_by != client_name
+                @warn "Eval submit rejected: chunk $chunk_id owned by $(chunk.checked_out_by), not $client_name"
+                return
+            end
+            az_is_white = chunk.az_is_white
             result = EvalManager.EvalChunkResult(chunk_id, az_is_white,
                                                   rewards, value_nn, value_opp, value_is_contact)
             EvalManager.submit_chunk!(job, result)

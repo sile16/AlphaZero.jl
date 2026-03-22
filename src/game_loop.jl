@@ -305,6 +305,7 @@ function play_game(white::GameAgent, black::GameAgent, env;
                                             Float32[1.0], false, false, is_contact))
                 end
                 GI.play!(env, avail[1])
+                num_moves += 1
                 continue
             end
 

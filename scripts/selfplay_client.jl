@@ -103,6 +103,7 @@ using AlphaZero: ConstSchedule
 using AlphaZero: GameLoop
 import Flux
 import BackgammonNet
+import JSON3
 const CPU_INFERENCE_BACKEND = AlphaZero.BackgammonInference.resolve_cpu_backend(ARGS["inference_backend"])
 
 println("Server: $SERVER_URL")
@@ -1256,14 +1257,7 @@ function check_and_do_eval!()
         resp = HTTP.get("$(SERVER_URL)/api/eval/status", headers;
                         status_exception=false, connect_timeout=10, readtimeout=30)
         resp.status != 200 && (println("[EVAL] Status check returned $(resp.status)"); return false)
-        # Parse JSON response (eval/status returns JSON, not MsgPack)
-        body_str = String(resp.body)
-        eval_status = Dict{String,Any}()
-        for m in eachmatch(r"\"(\w+)\"\s*:\s*(-?[\d.]+)", body_str)
-            k = m.captures[1]
-            v = m.captures[2]
-            eval_status[k] = contains(v, ".") ? parse(Float64, v) : parse(Int, v)
-        end
+        eval_status = JSON3.read(String(resp.body), Dict{String,Any})
     catch e
         println("[EVAL] Status check failed: $e")
         return false
@@ -1273,8 +1267,9 @@ function check_and_do_eval!()
     eval_iter == 0 && return false
     available = get(eval_status, "available", 0)
     available == 0 && return false
+    expected_weights_version = get(eval_status, "weights_version", 0)
 
-    println("\n[EVAL] Server has eval work: iter=$eval_iter, available=$available chunks")
+    println("\n[EVAL] Server has eval work: iter=$eval_iter, available=$available chunks, weights_version=$expected_weights_version")
     flush(stdout)
 
     # Pause self-play first, then download weights (avoids contention with self-play inference)
@@ -1384,21 +1379,7 @@ function check_and_do_eval!()
                                  status_exception=false, connect_timeout=10, readtimeout=30)
                 resp.status != 200 && break
                 # Parse JSON response
-                body_str = String(resp.body)
-                chunk = Dict{String,Any}()
-                for m in eachmatch(r"\"(\w+)\"\s*:\s*(-?[\d.]+|true|false)", body_str)
-                    k = m.captures[1]
-                    v = m.captures[2]
-                    if v == "true"
-                        chunk[k] = true
-                    elseif v == "false"
-                        chunk[k] = false
-                    elseif contains(v, ".")
-                        chunk[k] = parse(Float64, v)
-                    else
-                        chunk[k] = parse(Int, v)
-                    end
-                end
+                chunk = JSON3.read(String(resp.body), Dict{String,Any})
             catch e
                 println("[EVAL] Checkout error: $e")
                 break
@@ -1406,6 +1387,13 @@ function check_and_do_eval!()
 
             chunk_id = get(chunk, "chunk_id", 0)
             chunk_id == 0 && break
+
+            # Validate weights version matches what we downloaded
+            chunk_weights_version = get(chunk, "weights_version", 0)
+            if expected_weights_version > 0 && chunk_weights_version > 0 && chunk_weights_version != expected_weights_version
+                println("[EVAL] WARNING: weights version mismatch (expected $expected_weights_version, got $chunk_weights_version). Aborting eval.")
+                break
+            end
 
             pos_start = Int(chunk["position_range_start"])
             pos_end = Int(chunk["position_range_end"])
@@ -1425,8 +1413,8 @@ function check_and_do_eval!()
                         resp = HTTP.post("$(SERVER_URL)/api/eval/heartbeat", hb_headers, hb_body;
                                          status_exception=false, connect_timeout=10, readtimeout=30)
                         if resp.status == 200
-                            hb_str = String(resp.body)
-                            if !contains(hb_str, "true")
+                            hb_result = JSON3.read(String(resp.body), Dict{String,Any})
+                            if !get(hb_result, "lease_extended", false)
                                 println("[EVAL] WARNING: Chunk $chunk_id lease lost")
                                 break
                             end
@@ -1464,12 +1452,15 @@ function check_and_do_eval!()
             chunk_done[] = true
             t_chunk = time() - t_chunk_start
 
-            # Flatten value samples for submission
-            flat_value_samples = Float64[]
+            # Extract value samples into separate arrays for server
+            val_nn = Float64[]
+            val_opp = Float64[]
+            val_is_contact = Bool[]
             for vs in value_data
                 for s in vs
-                    push!(flat_value_samples, s.nn_val)
-                    push!(flat_value_samples, s.wb_val)
+                    push!(val_nn, s.nn_val)
+                    push!(val_opp, s.wb_val)
+                    push!(val_is_contact, false)  # Race-only model — no contact positions
                 end
             end
 
@@ -1483,12 +1474,14 @@ function check_and_do_eval!()
                         "chunk_id" => chunk_id,
                         "client_name" => client_name,
                         "rewards" => collect(rewards),
-                        "value_samples" => flat_value_samples))
+                        "value_nn" => val_nn,
+                        "value_opp" => val_opp,
+                        "value_is_contact" => val_is_contact))
                     resp = HTTP.post("$(SERVER_URL)/api/eval/submit", sub_headers, sub_body;
                                      status_exception=false, connect_timeout=10, readtimeout=60)
                     if resp.status == 200
-                        sub_str = String(resp.body)
-                        eval_complete = contains(sub_str, "\"eval_complete\":true")
+                        sub_result = JSON3.read(String(resp.body), Dict{String,Any})
+                        eval_complete = get(sub_result, "eval_complete", false)
                         chunks_done += 1
                         avg_reward = mean(rewards)
                         win_pct = 100 * count(r -> r > 0, rewards) / n_games
