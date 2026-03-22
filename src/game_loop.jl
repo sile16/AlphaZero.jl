@@ -169,9 +169,13 @@ function _agent_move(bg_agent, game)
 end
 
 function _is_contact_position(state)
-    BackgammonNet = _get_backgammonnet()
-    if state isa BackgammonNet.BackgammonGame
-        return BackgammonNet.is_contact_position(state)
+    try
+        BackgammonNet = _get_backgammonnet()
+        if state isa BackgammonNet.BackgammonGame
+            return BackgammonNet.is_contact_position(state)
+        end
+    catch
+        # BackgammonNet not available — default to contact
     end
     return true  # Default: assume contact
 end
@@ -181,7 +185,7 @@ function _get_backgammonnet()
     if mod !== nothing
         return mod
     end
-    # Direct import fallback
+    # Direct import fallback (may error if not loaded)
     return Main.BackgammonNet
 end
 
