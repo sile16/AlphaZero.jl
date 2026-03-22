@@ -1061,26 +1061,7 @@ end
             if expired > 0
                 println("Eval: expired $expired stale checkout(s) for iter $(job.iter)")
             end
-            # Fallback finalize: if all chunks complete but job wasn't finalized in submit handler
-            if EvalManager.is_complete(job)
-                println("Eval iter $(job.iter): all chunks complete, finalizing (fallback)...")
-                try
-                    stats = EvalManager.finalize_eval(job)
-                    println("Eval iter $(job.iter) complete: equity=$(round(stats.equity, digits=4)), win%=$(round(stats.win_pct * 100, digits=1)), $(stats.n_games) games")
-                    with_logger(TB_LOGGER) do
-                        @info "eval/equity" value=stats.equity log_step_increment=0
-                        @info "eval/win_pct" value=stats.win_pct * 100 log_step_increment=0
-                        @info "eval/white_equity" value=stats.white_equity log_step_increment=0
-                        @info "eval/black_equity" value=stats.black_equity log_step_increment=0
-                        @info "eval/value_mse" value=stats.value_mse log_step_increment=0
-                        @info "eval/value_corr" value=stats.value_corr log_step_increment=0
-                        @info "eval/games" value=stats.n_games log_step_increment=0
-                    end
-                catch e
-                    @warn "Fallback finalize failed" exception=e
-                end
-                EVAL_JOB[] = nothing
-            elseif time() - job.created_at > EVAL_JOB_TIMEOUT
+            if time() - job.created_at > EVAL_JOB_TIMEOUT
                 n_done = count(c -> c.completed, job.chunks)
                 n_total = length(job.chunks)
                 if n_done < n_total
