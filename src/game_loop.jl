@@ -38,18 +38,18 @@ Fields:
 - `gspec`: Game specification
 - `bearoff_eval`: Optional bear-off evaluator `(game_env) -> Union{Float64, Nothing}`
 """
-struct MctsAgent <: GameAgent
-    oracle::Any
-    batch_oracle::Any
+struct MctsAgent{O, BO, G, BE} <: GameAgent
+    oracle::O
+    batch_oracle::BO
     mcts_params::MctsParams
     batch_size::Int
-    gspec::Any
-    bearoff_eval::Any  # Union{Nothing, Function}
+    gspec::G
+    bearoff_eval::BE  # Union{Nothing, Function}
 end
 
-function MctsAgent(oracle, batch_oracle, mcts_params::MctsParams, batch_size::Int, gspec;
-                   bearoff_eval=nothing)
-    return MctsAgent(oracle, batch_oracle, mcts_params, batch_size, gspec, bearoff_eval)
+function MctsAgent(oracle::O, batch_oracle::BO, mcts_params::MctsParams, batch_size::Int, gspec::G;
+                   bearoff_eval::BE=nothing) where {O, BO, G, BE}
+    return MctsAgent{O, BO, G, BE}(oracle, batch_oracle, mcts_params, batch_size, gspec, bearoff_eval)
 end
 
 """

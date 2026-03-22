@@ -60,13 +60,13 @@ end
 ##### Async Pipeline
 #####
 
-mutable struct AsyncPipeline
+mutable struct AsyncPipeline{N}
     # Queues
     request_queue::Channel{InferenceRequest}
     response_queues::Dict{Int, Channel{InferenceResponse}}
 
     # GPU server
-    network::Any
+    network::N
     batch_size::Int
     max_wait_ms::Float64
 
@@ -78,7 +78,7 @@ mutable struct AsyncPipeline
     total_requests::Ref{Int}
     total_batches::Ref{Int}
 
-    function AsyncPipeline(network; batch_size=64, max_wait_ms=5.0, num_workers=64)
+    function AsyncPipeline(network::N; batch_size=64, max_wait_ms=5.0, num_workers=64) where N
         request_queue = Channel{InferenceRequest}(batch_size * 4)
         response_queues = Dict{Int, Channel{InferenceResponse}}()
 
@@ -89,7 +89,7 @@ mutable struct AsyncPipeline
             response_queues[i] = Channel{InferenceResponse}(response_queue_size)
         end
 
-        new(
+        new{N}(
             request_queue,
             response_queues,
             network,
@@ -200,10 +200,10 @@ end
 ##### Async Worker
 #####
 
-mutable struct AsyncWorker
+mutable struct AsyncWorker{G, N}
     id::Int
-    pipeline::AsyncPipeline
-    gspec::Any
+    pipeline::AsyncPipeline{N}
+    gspec::G
     mcts_env::MCTS.Env
 
     # In-flight simulations
@@ -218,7 +218,7 @@ mutable struct AsyncWorker
     gamma::Float64
 end
 
-function AsyncWorker(id::Int, pipeline::AsyncPipeline, gspec, mcts_params)
+function AsyncWorker(id::Int, pipeline::AsyncPipeline{N}, gspec::G, mcts_params) where {G, N}
     # Create a dummy oracle (we'll use async submission instead)
     dummy_oracle = state -> error("Should not be called directly")
 

@@ -66,26 +66,26 @@ end
 
 Wrapper around MCTS.Env that enables batched evaluation.
 """
-mutable struct BatchedEnv{S, O}
+mutable struct BatchedEnv{S, O, BO, BE}
     env::MCTS.Env{S, O}     # Underlying MCTS environment
     batch_size::Int          # Number of simulations to batch
     pending::Vector{PendingSimulation{S}}  # Simulations waiting for evaluation
-    batch_oracle::Any        # Optional: (Vector{S}) -> Vector{(P,V)} for batched GPU eval
-    game_pool::Vector{Any}   # Pre-allocated game clones for zero-alloc traversal
+    batch_oracle::BO         # Optional: (Vector{S}) -> Vector{(P,V)} for batched GPU eval
+    game_pool::Vector{Any}   # Pre-allocated game clones (filled lazily on first use)
     sim_pool::Vector{PendingSimulation{S}}  # Pre-allocated sim objects (reuse vectors)
     # Pre-allocated buffers for batch_evaluate_pending! (avoid per-call allocation)
     _eval_states::Vector{S}
     _eval_indices::Vector{Int}
     # Bear-off evaluator: (game) -> Union{Float64, Nothing}
-    bearoff_evaluator::Any
+    bearoff_evaluator::BE
 end
 
-function BatchedEnv(env::MCTS.Env{S, O}, batch_size::Int; batch_oracle=nothing, bearoff_evaluator=nothing) where {S, O}
+function BatchedEnv(env::MCTS.Env{S, O}, batch_size::Int; batch_oracle::BO=nothing, bearoff_evaluator::BE=nothing) where {S, O, BO, BE}
     eval_states = S[]; sizehint!(eval_states, batch_size)
     eval_indices = Int[]; sizehint!(eval_indices, batch_size)
-    BatchedEnv{S, O}(env, batch_size, PendingSimulation{S}[], batch_oracle, [],
-                     PendingSimulation{S}[], eval_states, eval_indices,
-                     bearoff_evaluator)
+    BatchedEnv{S, O, BO, BE}(env, batch_size, PendingSimulation{S}[], batch_oracle, Any[],
+                              PendingSimulation{S}[], eval_states, eval_indices,
+                              bearoff_evaluator)
 end
 
 """Pre-allocate sim pool with sizehinted vectors (called once, reused forever)."""
@@ -506,11 +506,11 @@ end
 A player that uses batched MCTS for improved GPU utilization.
 Similar to MctsPlayer but batches neural network evaluations.
 """
-struct BatchedMctsPlayer{B} <: Function
+struct BatchedMctsPlayer{B, T} <: Function
     benv::B
     niters::Int
     batch_size::Int
-    τ::Any  # Temperature schedule
+    τ::T  # Temperature schedule (AbstractSchedule{Float64})
 end
 
 """
