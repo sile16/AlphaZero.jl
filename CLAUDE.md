@@ -124,10 +124,17 @@ Full results (28 checkpoints): `/homeshare/projects/AlphaZero.jl/sessions/wildbg
 - `src/game.jl` - Game interface (`game_outcome()` for win types)
 - `src/params.jl` - MctsParams, LearningParams
 
-### Distributed Training
+### Unified Game Loop (v7, 2026-03-22)
+- `src/game_loop.jl` - GameLoop module: `play_game()`, MctsAgent, ExternalAgent, GameResult, TraceEntry
+  - Single function replaces 5 duplicate game loops across selfplay/eval scripts
+  - Handles self-play (trace recording) and eval (value comparison) via kwargs
+  - Bear-off truncation, chance node passthrough, temperature scheduling
+
+### Distributed Training + Eval
 - `scripts/training_server.jl` - **Training server** (Jarvis, port 9090) — training loop, PER sampling, loss, checkpoints
-- `scripts/selfplay_client.jl` - **Self-play client** (Neo) — MCTS self-play, sample upload, weight sync
-- `src/distributed/server.jl` - HTTP server + routes + client tracking
+- `scripts/selfplay_client.jl` - **Self-play client** (Neo) — MCTS self-play, sample upload, weight sync + **distributed eval** (--eval-capable)
+- `src/distributed/server.jl` - HTTP server + routes + client tracking + **4 eval endpoints** (status/checkout/submit/heartbeat)
+- `src/distributed/eval_manager.jl` - **Eval job manager**: chunked work queue (50 games/chunk), lease-based checkout, expiry, result aggregation
 - `src/distributed/client.jl` - HTTP client for self-play workers
 - `src/distributed/buffer.jl` - Thread-safe PER buffer with `per_sample_partition()` for dual-model
 - `src/distributed/protocol.jl` - Wire format (MsgPack + JSON)
@@ -282,6 +289,31 @@ All under `/homeshare/projects/AlphaZero.jl/sessions/`:
 ### Scaling (after efficiency gains proven)
 
 14. **Scale up model + iterations** -- 256w×10b + PER for 500+ iterations, using Phase 1-2 efficiency improvements.
+
+### v7 Distributed Eval (2026-03-22)
+
+**Architecture**: Eval moved from server to clients via chunked work queue. Server creates eval jobs (non-blocking), clients claim 50-game chunks, play vs wildbg, submit results. Server aggregates and logs to TB.
+
+**Key results**:
+- Eval takes ~2min (vs 17-34min in v6) — 10x faster
+- Server never blocks during eval — always responsive
+- Play strength consistent: +0.007 equity, ~50% wins vs wildbg
+
+**Active training**: `race_v7_distributed_eval` on Jarvis
+- 256w×5b race, 4000 gradient steps/iter, PER, cosine LR, bootstrap
+- Jarvis: 12 workers (eval-capable), Neo: 32 workers (self-play only)
+- Data dir: `/home/sile/alphazero-server-race-v7/`
+- Checkpoint interval: 5 iters
+
+### v6 10x Replay Ratio Results (2026-03-20)
+
+v6 tested `--training-steps 4000` (10x v5's ~390). Key finding: play strength holds steady at even with wildbg despite rising training loss.
+
+| Iter | Equity | Win% |
+|------|--------|------|
+| 10 | +0.015 | 50.1% |
+| 20 | +0.007 | 50.0% |
+| 30 | +0.016 | 50.1% |
 
 ### Future
 15. Web-based workers (WASM + WebGPU) via sibling project `/home/sile/github/tavlatalk/`
