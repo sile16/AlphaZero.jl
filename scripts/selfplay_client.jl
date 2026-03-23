@@ -1297,23 +1297,28 @@ if EVAL_CAPABLE
     end
 end
 
-# Eval agent struct (same pattern as training_server.jl / eval_race.jl)
-struct EvalAlphaZeroAgent <: BackgammonNet.AbstractAgent
+# Eval agent struct — holds a reusable MCTS player to avoid per-move allocation
+mutable struct EvalAlphaZeroAgent <: BackgammonNet.AbstractAgent
     single_oracle::Any
     batch_oracle::Any
     mcts_params::MctsParams
     batch_size::Int
     gspec_::Any
+    player::Any  # BatchedMctsPlayer, created once and reused
+end
+
+function EvalAlphaZeroAgent(single_oracle, batch_oracle, mcts_params, batch_size, gspec)
+    player = BatchedMCTS.BatchedMctsPlayer(
+        gspec, single_oracle, mcts_params;
+        batch_size=batch_size, batch_oracle=batch_oracle)
+    EvalAlphaZeroAgent(single_oracle, batch_oracle, mcts_params, batch_size, gspec, player)
 end
 
 function BackgammonNet.agent_move(agent::EvalAlphaZeroAgent, g::BackgammonNet.BackgammonGame)
     env = GI.init(agent.gspec_)
     env.game = BackgammonNet.clone(g)
-    player = BatchedMCTS.BatchedMctsPlayer(
-        agent.gspec_, agent.single_oracle, agent.mcts_params;
-        batch_size=agent.batch_size, batch_oracle=agent.batch_oracle)
-    actions, policy = BatchedMCTS.think(player, env)
-    BatchedMCTS.reset_player!(player)
+    actions, policy = BatchedMCTS.think(agent.player, env)
+    BatchedMCTS.reset_player!(agent.player)
     return actions[argmax(policy)]
 end
 

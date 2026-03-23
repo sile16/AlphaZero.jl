@@ -50,6 +50,7 @@ ssh jarvis "bash -l -c 'cd /home/sile/github/AlphaZero.jl && mkdir -p $V8_DATA_D
   --checkpoint-interval 5 \
   --buffer-checkpoint-interval 50 \
   --eval-mcts-iters 600 \
+  --eval-interval 5 \
   --eval-games 1000 \
   --eval-workers 0 \
   --seed 42 \
