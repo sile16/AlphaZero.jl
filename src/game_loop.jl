@@ -117,12 +117,14 @@ passthrough chance-mode path and falls back to the classic `MctsPlayer` when
 advanced stochastic chance handling is requested.
 """
 function create_player(agent::MctsAgent)
-    if agent.mcts_params.chance_mode == :passthrough
+    cm = agent.mcts_params.chance_mode
+    if cm == :passthrough || cm == :full
         return BatchedMCTS.BatchedMctsPlayer(
             agent.gspec, agent.oracle, agent.mcts_params;
             batch_size=agent.batch_size, batch_oracle=agent.batch_oracle,
             bearoff_evaluator=agent.bearoff_eval)
     end
+    # Exotic chance modes (stratified, progressive) need classic MctsPlayer
     MctsPlayer = getfield(parentmodule(@__MODULE__), :MctsPlayer)
     return MctsPlayer(agent.gspec, agent.oracle, agent.mcts_params)
 end
