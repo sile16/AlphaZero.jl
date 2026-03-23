@@ -98,7 +98,13 @@ struct StateInfo
   Vest  :: Float32 # Value estimate given by the oracle
 end
 
-Ntot(b::StateInfo) = sum(s.N for s in b.stats)
+function Ntot(b::StateInfo)
+  n = 0
+  @inbounds for s in b.stats
+    n += s.N
+  end
+  return n
+end
 
 #####
 ##### Chance Node Statistics (for stochastic games)

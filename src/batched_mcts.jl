@@ -36,6 +36,8 @@ using ..AlphaZero: GI, Util, MCTS
 
 export BatchedEnv, batched_explore!, BatchedMctsPlayer, think, reset_player!, player_temperature
 
+const EMPTY_INT_VEC = Int[]  # Shared empty vector for terminal/bearoff leaf_actions
+
 #####
 ##### Pending simulation state
 #####
@@ -150,7 +152,7 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
     while depth < max_depth
         if GI.game_terminated(game)
             sim.leaf_state = GI.current_state(game)
-            sim.leaf_actions = Int[]
+            sim.leaf_actions = EMPTY_INT_VEC
             sim.is_new_node = false
             sim.terminal_value = 0.0
             return sim
@@ -305,7 +307,7 @@ function batch_evaluate_pending!(benv::BatchedEnv{S}) where S
     empty!(states_to_eval)
     empty!(eval_indices)
 
-    for (i, sim) in enumerate(benv.pending)
+    @inbounds for (i, sim) in enumerate(benv.pending)
         if sim.is_new_node
             push!(states_to_eval, sim.leaf_state)
             push!(eval_indices, i)
@@ -322,7 +324,7 @@ function batch_evaluate_pending!(benv::BatchedEnv{S}) where S
         error("Batched oracle result count mismatch: got $(length(results)) results for $(length(states_to_eval)) states")
 
     # Initialize tree nodes with results
-    for (i, result_idx) in enumerate(eval_indices)
+    @inbounds for (i, result_idx) in enumerate(eval_indices)
         sim = benv.pending[result_idx]
         P, V = results[i]
         if length(P) != length(sim.leaf_actions)
@@ -368,7 +370,7 @@ function backpropagate!(benv::BatchedEnv, sim::PendingSimulation)
     end
 
     # Backpropagate through path in reverse
-    for i in length(sim.path):-1:1
+    @inbounds for i in length(sim.path):-1:1
         state, action_id = sim.path[i]
         reward = sim.rewards[i]
         pswitch = sim.player_switches[i]
@@ -381,10 +383,8 @@ function backpropagate!(benv::BatchedEnv, sim::PendingSimulation)
         # VL removal: W += VL, N -= 1; Update: W += q, N += 1; Net: W += (VL + q), N unchanged
         info = get(env.tree, state, nothing)
         if info !== nothing
-            @inbounds begin
-                astats = info.stats[action_id]
-                info.stats[action_id] = MCTS.ActionStats(astats.P, astats.W + VIRTUAL_LOSS + q, astats.N)
-            end
+            astats = info.stats[action_id]
+            info.stats[action_id] = MCTS.ActionStats(astats.P, astats.W + VIRTUAL_LOSS + q, astats.N)
         end
     end
 end
@@ -459,7 +459,7 @@ function batched_explore!(benv::BatchedEnv, game, nsims)
         empty!(benv.pending)
 
         # Phase 1: Traverse to leaves (reuse pool games + pool sims)
-        for sim_idx in 1:current_batch_size
+        @inbounds for sim_idx in 1:current_batch_size
             env.total_simulations += 1
             if sim_idx <= length(benv.game_pool)
                 game_clone = GI.clone_into!(benv.game_pool[sim_idx], game)
@@ -475,7 +475,7 @@ function batched_explore!(benv::BatchedEnv, game, nsims)
         batch_evaluate_pending!(benv)
 
         # Phase 3: Backpropagate
-        for sim in benv.pending
+        @inbounds for sim in benv.pending
             backpropagate!(benv, sim)
         end
 
