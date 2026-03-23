@@ -1367,7 +1367,7 @@ function check_and_do_eval!()
         headers = auth_headers(client)
         resp = HTTP.get("$(SERVER_URL)/api/eval/status", headers;
                         status_exception=false, connect_timeout=10, readtimeout=30)
-        resp.status != 200 && (println("[EVAL] Status check returned $(resp.status)"); return false)
+        resp.status != 200 && (println("[EVAL] Status check returned $(resp.status): $(String(resp.body))"); return false)
         eval_status = JSON3.read(String(resp.body), Dict{String,Any})
     catch e
         println("[EVAL] Status check failed: $e")
@@ -1375,8 +1375,10 @@ function check_and_do_eval!()
     end
 
     eval_iter = get(eval_status, "eval_iter", 0)
-    eval_iter == 0 && return false
     available = get(eval_status, "available", 0)
+    println("[EVAL] Status: eval_iter=$eval_iter, available=$available")
+    flush(stdout)
+    eval_iter == 0 && return false
     available == 0 && return false
     expected_weights_version = get(eval_status, "weights_version", 0)
 
