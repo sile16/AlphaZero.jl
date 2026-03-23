@@ -722,6 +722,20 @@ end
 """
 Extract arrays from a GameResult trace for convert_trace_to_samples().
 
+Sample an action index from a probability distribution."""
+function _sample_from_policy(policy::AbstractVector{<:Real}, rng)
+    r = rand(rng)
+    cumsum = 0.0
+    for i in 1:length(policy)
+        cumsum += policy[i]
+        if r <= cumsum
+            return i
+        end
+    end
+    return length(policy)
+end
+
+"""Extract trace arrays from a GameResult.
 Filters out single-action forced moves to match the original behavior where
 only multi-action decision points were recorded in the trace.
 """
@@ -748,28 +762,27 @@ function _extract_trace_arrays(result::GameLoop.GameResult)
             rewards=trace_rewards, is_chance=trace_is_chance)
 end
 
-"""Core game-playing loop with shared CPU inference backend.
-If `az_agent` and `player` are provided, they are reused (no per-call allocation)."""
+"""Core game-playing loop — direct BatchedMCTS calls for minimal allocation.
+
+Bypasses GameLoop.play_game() to avoid per-move TraceEntry allocations and
+contact detection overhead that cause GC pressure under 32+ threads.
+This matches the v6 inline game loop that achieved 200-400 games/min."""
 function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
                           rng::MersenneTwister;
-                          az_agent=nothing, player=nothing)
+                          player=nothing)
     n_bearoff_truncated = 0
 
-    if az_agent === nothing
+    if player === nothing
         mcts_params = MctsParams(
             num_iters_per_turn=MCTS_ITERS,
             cpuct=Float64(config["cpuct"]),
             temperature=ConstSchedule(1.0),
             dirichlet_noise_ϵ=Float64(config["dirichlet_epsilon"]),
             dirichlet_noise_α=Float64(config["dirichlet_alpha"]))
-
         az_agent = GameLoop.MctsAgent(
             CPU_SINGLE_ORACLE, CPU_BATCH_ORACLE,
             mcts_params, INFERENCE_BATCH_SIZE, gspec;
             bearoff_eval=BEAROFF_EVALUATOR)
-    end
-
-    if player === nothing
         player = GameLoop.create_player(az_agent)
     end
 
@@ -777,56 +790,91 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
     while Threads.atomic_add!(games_claimed, 1) < total_games
         env = init_game(rng)
 
-        # Capture full bearoff equity (5-element vector) via closure,
-        # since GameResult only stores the scalar value.
-        first_bearoff_bo = Ref{Any}(nothing)
-        first_bearoff_wp = Ref{Bool}(true)
-        function bearoff_lookup_with_capture(game)
-            if !BearoffK6.is_bearoff_position(game.p0, game.p1)
-                return nothing
+        trace_states = []
+        trace_policies = Vector{Float32}[]
+        trace_actions = Vector{Int}[]
+        trace_rewards = Float32[]
+        trace_is_chance = Bool[]
+        bearoff_truncated = false
+        first_bearoff_bo = nothing
+        first_bearoff_wp = true
+        decision_move_num = 0
+
+        while !GI.game_terminated(env)
+            if GI.is_chance_node(env)
+                bg = env.game
+                if BearoffK6.is_bearoff_position(bg.p0, bg.p1)
+                    if first_bearoff_bo === nothing
+                        first_bearoff_bo = bearoff_table_equity(bg)
+                        first_bearoff_wp = (bg.current_player == 0)
+                    end
+                    if BEAROFF_TRUNCATION
+                        bearoff_truncated = true
+                        break
+                    end
+                end
+                outcomes = GI.chance_outcomes(env)
+                r = rand(rng)
+                acc = 0.0
+                @inbounds for (o, p) in outcomes
+                    acc += p
+                    if r <= acc; GI.apply_chance!(env, o); break; end
+                end
+                if !GI.is_chance_node(env) || GI.game_terminated(env)
+                    continue
+                end
+                GI.apply_chance!(env, outcomes[end][1])
+                continue
             end
-            bo = bearoff_table_equity(game)
-            if first_bearoff_bo[] === nothing
-                first_bearoff_bo[] = bo
-                first_bearoff_wp[] = (game.current_player == 0)
+
+            avail = GI.available_actions(env)
+            if length(avail) == 1
+                GI.play!(env, avail[1])
+                continue
             end
-            return bo
+
+            state = GI.current_state(env)
+            push!(trace_states, state)
+            actions, policy = BatchedMCTS.think(player, env)
+            push!(trace_policies, Float32.(policy))
+            push!(trace_actions, actions)
+            push!(trace_is_chance, false)
+
+            decision_move_num += 1
+            τ = get_temperature(decision_move_num)
+            if isone(τ)
+                action = actions[_sample_from_policy(policy, rng)]
+            elseif iszero(τ)
+                action = actions[argmax(policy)]
+            else
+                temp_policy = Util.apply_temperature(policy, τ)
+                action = actions[_sample_from_policy(temp_policy, rng)]
+            end
+            GI.play!(env, action)
+            push!(trace_rewards, 0.0f0)
         end
 
-        result = GameLoop.play_game(az_agent, az_agent, env;
-            white_player=player, black_player=player,
-            record_trace=true,
-            bearoff_truncation=BEAROFF_TRUNCATION,
-            bearoff_lookup=bearoff_lookup_with_capture,
-            rng=rng,
-            temperature_fn=get_temperature)
+        BatchedMCTS.reset_player!(player)
 
-        # Extract trace arrays for convert_trace_to_samples
-        tr = _extract_trace_arrays(result)
-
-        if result.bearoff_truncated
+        if bearoff_truncated
             n_bearoff_truncated += 1
-            bo = first_bearoff_bo[]
-            wp = first_bearoff_wp[]
-            final_reward = Float32(wp ? bo.value : -bo.value)
+            final_reward = Float32(first_bearoff_wp ? first_bearoff_bo.value : -first_bearoff_bo.value)
             samples = convert_trace_to_samples(
-                gspec, tr.states, tr.policies, tr.actions, tr.rewards, tr.is_chance,
+                gspec, trace_states, trace_policies, trace_actions, trace_rewards, trace_is_chance,
                 final_reward, nothing; rng=rng,
-                bearoff_equity=bo.equity, bearoff_wp=wp)
-        elseif first_bearoff_bo[] !== nothing
-            bo = first_bearoff_bo[]
-            wp = first_bearoff_wp[]
-            final_reward = Float32(wp ? bo.value : -bo.value)
+                bearoff_equity=first_bearoff_bo.equity, bearoff_wp=first_bearoff_wp)
+        elseif first_bearoff_bo !== nothing
+            final_reward = Float32(first_bearoff_wp ? first_bearoff_bo.value : -first_bearoff_bo.value)
             outcome = GI.game_outcome(env)
             samples = convert_trace_to_samples(
-                gspec, tr.states, tr.policies, tr.actions, tr.rewards, tr.is_chance,
+                gspec, trace_states, trace_policies, trace_actions, trace_rewards, trace_is_chance,
                 final_reward, outcome; rng=rng,
-                first_bearoff_equity=bo.equity, first_bearoff_wp=wp)
+                first_bearoff_equity=first_bearoff_bo.equity, first_bearoff_wp=first_bearoff_wp)
         else
-            final_reward = Float32(result.reward)
-            outcome = GI.game_outcome(env)
+            final_reward = Float32(GI.game_terminated(env) ? Float64(GI.white_reward(env)) : 0.0)
+            outcome = GI.game_terminated(env) ? GI.game_outcome(env) : nothing
             samples = convert_trace_to_samples(
-                gspec, tr.states, tr.policies, tr.actions, tr.rewards, tr.is_chance,
+                gspec, trace_states, trace_policies, trace_actions, trace_rewards, trace_is_chance,
                 final_reward, outcome; rng=rng)
         end
         append!(all_samples, samples)
@@ -1180,7 +1228,7 @@ function continuous_worker(worker_id::Int, rng::MersenneTwister)
         try
             games_claimed = Threads.Atomic{Int}(0)
             result = _play_games_loop(worker_id, games_claimed, 1, sub_rng;
-                                      az_agent=az_agent, player=player)
+                                      player=player)
             if !isempty(result.samples)
                 put!(SAMPLE_CHANNEL, result.samples)
             end
