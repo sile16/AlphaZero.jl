@@ -138,6 +138,17 @@ function create_player(::ExternalAgent)
     return nothing
 end
 
+"""Reset an MCTS player's tree between games."""
+function _reset_player!(player)
+    player === nothing && return
+    if player isa BatchedMCTS.BatchedMctsPlayer
+        BatchedMCTS.reset_player!(player)
+    else
+        reset_player! = getfield(parentmodule(@__MODULE__), :reset_player!)
+        reset_player!(player)
+    end
+end
+
 """
     select_action(agent::MctsAgent, player, env) -> (action, policy, legal_actions)
 
@@ -227,6 +238,7 @@ end
 
 """
     play_game(white::GameAgent, black::GameAgent, env;
+              white_player=nothing, black_player=nothing,
               record_trace=false,
               record_value_comparison=false,
               value_oracle=nothing,
@@ -245,6 +257,10 @@ Play a complete game between two agents.
 - `env`: Game environment (already initialized with starting position)
 
 # Keyword Arguments
+- `white_player`, `black_player`: Pre-created MCTS players to reuse across games.
+  If nothing, a new player is created (and destroyed) for this game.
+  For performance-critical loops, create players once with `create_player(agent)`
+  and pass them here — avoids per-game MCTS tree allocation.
 - `record_trace`: If true, record all decision points in the trace
 - `record_value_comparison`: If true, record NN value vs opponent value at each MCTS decision
 - `value_oracle`: Function `(env) -> Float64` returning NN value prediction (for value comparison)
@@ -262,6 +278,8 @@ Play a complete game between two agents.
 A `GameResult` with the game outcome, trace, and metadata.
 """
 function play_game(white::GameAgent, black::GameAgent, env;
+                   white_player=nothing,
+                   black_player=nothing,
                    record_trace::Bool=false,
                    record_value_comparison::Bool=false,
                    value_oracle=nothing,
@@ -272,9 +290,11 @@ function play_game(white::GameAgent, black::GameAgent, env;
                    temperature_fn=nothing,
                    action_selection_fn=nothing)
 
-    # Create MCTS players (once per game)
-    white_player = create_player(white)
-    black_player = create_player(black)
+    # Reuse pre-created players if provided, otherwise create new ones
+    own_white = white_player === nothing
+    own_black = black_player === nothing
+    white_player = own_white ? create_player(white) : white_player
+    black_player = own_black ? create_player(black) : black_player
 
     trace = TraceEntry[]
     value_samples = PositionValueSample[]
@@ -382,23 +402,10 @@ function play_game(white::GameAgent, black::GameAgent, env;
             GI.play!(env, action)
         end
     finally
-        # Always reset MCTS players to free tree memory
-        if white_player !== nothing
-            if white_player isa BatchedMCTS.BatchedMctsPlayer
-                BatchedMCTS.reset_player!(white_player)
-            else
-                reset_player! = getfield(parentmodule(@__MODULE__), :reset_player!)
-                reset_player!(white_player)
-            end
-        end
-        if black_player !== nothing
-            if black_player isa BatchedMCTS.BatchedMctsPlayer
-                BatchedMCTS.reset_player!(black_player)
-            else
-                reset_player! = getfield(parentmodule(@__MODULE__), :reset_player!)
-                reset_player!(black_player)
-            end
-        end
+        # Reset MCTS trees between games. For reused players this clears
+        # the tree for the next game; for owned players it frees memory.
+        _reset_player!(white_player)
+        _reset_player!(black_player)
     end
 
     # Compute reward

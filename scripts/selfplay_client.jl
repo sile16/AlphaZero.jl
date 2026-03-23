@@ -748,22 +748,30 @@ function _extract_trace_arrays(result::GameLoop.GameResult)
             rewards=trace_rewards, is_chance=trace_is_chance)
 end
 
-"""Core game-playing loop with shared CPU inference backend."""
+"""Core game-playing loop with shared CPU inference backend.
+If `az_agent` and `player` are provided, they are reused (no per-call allocation)."""
 function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
-                          rng::MersenneTwister)
+                          rng::MersenneTwister;
+                          az_agent=nothing, player=nothing)
     n_bearoff_truncated = 0
 
-    mcts_params = MctsParams(
-        num_iters_per_turn=MCTS_ITERS,
-        cpuct=Float64(config["cpuct"]),
-        temperature=ConstSchedule(1.0),
-        dirichlet_noise_ϵ=Float64(config["dirichlet_epsilon"]),
-        dirichlet_noise_α=Float64(config["dirichlet_alpha"]))
+    if az_agent === nothing
+        mcts_params = MctsParams(
+            num_iters_per_turn=MCTS_ITERS,
+            cpuct=Float64(config["cpuct"]),
+            temperature=ConstSchedule(1.0),
+            dirichlet_noise_ϵ=Float64(config["dirichlet_epsilon"]),
+            dirichlet_noise_α=Float64(config["dirichlet_alpha"]))
 
-    az_agent = GameLoop.MctsAgent(
-        CPU_SINGLE_ORACLE, CPU_BATCH_ORACLE,
-        mcts_params, INFERENCE_BATCH_SIZE, gspec;
-        bearoff_eval=BEAROFF_EVALUATOR)
+        az_agent = GameLoop.MctsAgent(
+            CPU_SINGLE_ORACLE, CPU_BATCH_ORACLE,
+            mcts_params, INFERENCE_BATCH_SIZE, gspec;
+            bearoff_eval=BEAROFF_EVALUATOR)
+    end
+
+    if player === nothing
+        player = GameLoop.create_player(az_agent)
+    end
 
     all_samples = []
     while Threads.atomic_add!(games_claimed, 1) < total_games
@@ -786,6 +794,7 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         end
 
         result = GameLoop.play_game(az_agent, az_agent, env;
+            white_player=player, black_player=player,
             record_trace=true,
             bearoff_truncation=BEAROFF_TRUNCATION,
             bearoff_lookup=bearoff_lookup_with_capture,
@@ -854,6 +863,9 @@ function worker_play_games_gpu(worker_id::Int, games_claimed::Threads.Atomic{Int
         mcts_params, INFERENCE_BATCH_SIZE, gspec;
         bearoff_eval=BEAROFF_EVALUATOR)
 
+    # Create player ONCE and reuse across all games
+    player = GameLoop.create_player(az_agent)
+
     all_samples = []
     while Threads.atomic_add!(games_claimed, 1) < total_games
         env = init_game(sub_rng)
@@ -874,6 +886,7 @@ function worker_play_games_gpu(worker_id::Int, games_claimed::Threads.Atomic{Int
         end
 
         result = GameLoop.play_game(az_agent, az_agent, env;
+            white_player=player, black_player=player,
             record_trace=true,
             bearoff_truncation=BEAROFF_TRUNCATION,
             bearoff_lookup=bearoff_lookup_with_capture,
@@ -1142,6 +1155,19 @@ function continuous_worker(worker_id::Int, rng::MersenneTwister)
     flush(stdout)
     sub_rng = MersenneTwister(rand(rng, UInt))
 
+    # Create agent and player ONCE per worker — reused across all games
+    mcts_params = MctsParams(
+        num_iters_per_turn=MCTS_ITERS,
+        cpuct=Float64(config["cpuct"]),
+        temperature=ConstSchedule(1.0),
+        dirichlet_noise_ϵ=Float64(config["dirichlet_epsilon"]),
+        dirichlet_noise_α=Float64(config["dirichlet_alpha"]))
+    az_agent = GameLoop.MctsAgent(
+        CPU_SINGLE_ORACLE, CPU_BATCH_ORACLE,
+        mcts_params, INFERENCE_BATCH_SIZE, gspec;
+        bearoff_eval=BEAROFF_EVALUATOR)
+    player = GameLoop.create_player(az_agent)
+
     # Play games forever — one at a time, push samples immediately
     games_played = 0
     while true
@@ -1152,9 +1178,9 @@ function continuous_worker(worker_id::Int, rng::MersenneTwister)
         end
         Threads.atomic_add!(ACTIVE_SELFPLAY_GAMES, 1)
         try
-            # Use _play_games_loop with total_games=1 via atomic counter
             games_claimed = Threads.Atomic{Int}(0)
-            result = _play_games_loop(worker_id, games_claimed, 1, sub_rng)
+            result = _play_games_loop(worker_id, games_claimed, 1, sub_rng;
+                                      az_agent=az_agent, player=player)
             if !isempty(result.samples)
                 put!(SAMPLE_CHANNEL, result.samples)
             end
