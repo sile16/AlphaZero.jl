@@ -1407,11 +1407,14 @@ function check_and_do_eval!()
     eval_race_net = FluxLib.FCResNetMultiHead(
         gspec, FluxLib.FCResNetMultiHeadHP(width=RACE_WIDTH, num_blocks=RACE_BLOCKS))
 
-    expected_version = expected_weights_version > 0 ? Int(expected_weights_version) : nothing
+    # Don't enforce version matching for eval weight downloads — by the time
+    # the client downloads, the server may have advanced to a newer iteration.
+    # Using the latest weights is fine; what matters is that eval is consistent
+    # within a single eval run (all chunks use the same downloaded weights).
     local result_c, result_r
     try
-        result_c = download_weights(client, :contact; expected_version=expected_version)
-        result_r = download_weights(client, :race; expected_version=expected_version)
+        result_c = download_weights(client, :contact)
+        result_r = download_weights(client, :race)
     catch e
         println("[EVAL] Failed to download eval weights: $e")
         PAUSE_SELFPLAY[] = false
