@@ -236,6 +236,9 @@ All under `/homeshare/projects/AlphaZero.jl/sessions/`:
 9. **Bear-off table signal mismatch FIXED** (2026-03-19) -- table values are pre-dice, game states are post-dice. Fixed via move enumeration: at decision nodes, enumerate all legal moves, look up resulting positions in table, take max. Also fixed perspective bug (evaluator returned mover-relative but MCTS assumed white-relative). Previous "bearoff hurt" finding needs retesting with this fix. See `notes/bearoff_chance_node_issue.md`.
 10. **Dual-model architecture** (2026-03-10) -- contact (256w×10b) + race (128w×3b) implemented in training_server.jl. Race-only training tested (50 iter).
 11. **PER was broken in distributed training** (fixed 2026-03-14) -- training_server.jl used uniform sampling instead of `per_sample()`. IS weights were not passed to the loss function. Fixed: per-model partition PER sampling with IS weight correction via `per_sample_partition()`. Per-component loss (policy/value/invalid) now logged to TensorBoard.
+12. **Jarvis OOM with server + client** (2026-03-23) -- Server 28GB + Client 34GB = 62GB on 64GB machine. Linux OOM killer terminates client. Reduce Jarvis workers or run client only on Neo.
+13. **GameLoop.play_game() kills threading perf** (2026-03-23) -- Per-move TraceEntry allocations cause 28% more GC, amplified to 20-30x under 32 threads. Selfplay must use direct BatchedMCTS calls. GameLoop only for eval scripts.
+14. **Multihead equity heads must be masked** (2026-03-23) -- Train P(gammon|win)/P(bg|win) only on won games, P(gammon|loss)/P(bg|loss) only on lost games. Without masking, network learns joint probabilities instead of conditionals, inconsistent with compute_equity().
 
 ### Evaluation
 12. **Random baseline is misleading** -- always evaluate vs wildbg or GnuBG
@@ -314,6 +317,28 @@ v6 tested `--training-steps 4000` (10x v5's ~390). Key finding: play strength ho
 | 10 | +0.015 | 50.1% |
 | 20 | +0.007 | 50.0% |
 | 30 | +0.016 | 50.1% |
+
+### v8 Multihead Fix + Performance (2026-03-23)
+
+**Key fixes:**
+- Conditional equity head masking (P(gammon|win) only trained on wins, etc.)
+- GameLoop.play_game() caused 20-30x selfplay regression under threading (GC pressure from per-move allocations). Selfplay now uses direct BatchedMCTS calls.
+- EvalAlphaZeroAgent created new MCTS player per MOVE — fixed to reuse.
+- @inbounds audit on MCTS hot paths (~2-5% gain).
+- Tailscale network extension on Neo blocked Julia LAN connections (EHOSTUNREACH). Removed.
+
+**v8 eval results** (1000 positions × 2 sides, 600 MCTS, wildbg large):
+
+| Iter | Loss | Equity | Win% |
+|------|------|--------|------|
+| 10 | 1.663 | +0.01 | 49.7% |
+| 20 | 1.968 | +0.02 | 50.0% |
+
+Play strength holds at ~even with wildbg despite loss rising from 1.5→2.1. Bootstrap→self-play transition artifact.
+
+**Performance lesson:** Never allocate in per-move inner loops. Julia's stop-the-world GC amplifies small per-move overhead into catastrophic throughput loss under 32+ threads. Profile under realistic concurrency, not single-thread.
+
+**Data:** Eval positions excluded from training set: `race_starts_tuples_no_eval.jls` (96,514 positions, 2000 eval positions removed).
 
 ### Future
 15. Web-based workers (WASM + WebGPU) via sibling project `/home/sile/github/tavlatalk/`
