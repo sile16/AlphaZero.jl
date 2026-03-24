@@ -270,7 +270,8 @@ function main()
                 rewards[job] = result.reward
                 vsamples[job] = result.value_samples
             catch e
-                Threads.atomic_add!(errors, 1)
+                n_err = Threads.atomic_add!(errors, 1) + 1
+                @warn "Eval game $job failed (pos=$pos_idx, white=$az_white, seed=$seed): $e"
                 # Skip this game — reward stays 0.0, no value samples
             end
             d = Threads.atomic_add!(done, 1) + 1
