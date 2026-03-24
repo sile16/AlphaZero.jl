@@ -241,12 +241,13 @@ function main()
     # Play each position from both sides:
     #   job 1..n_games:         AZ as white (P0)
     #   job n_games+1..2*n_games: AZ as black (P1)
-    rewards = Vector{Float64}(undef, n_total)
-    vsamples = Vector{Vector{PositionValueSample}}(undef, n_total)
+    rewards = zeros(Float64, n_total)
+    vsamples = [PositionValueSample[] for _ in 1:n_total]
 
     t_start = time()
     claimed = Threads.Atomic{Int}(0)
     done = Threads.Atomic{Int}(0)
+    errors = Threads.Atomic{Int}(0)
 
     Threads.@threads for tid in 1:num_workers
         wb = wildbg_backends[tid]
@@ -262,11 +263,16 @@ function main()
                 az_white = false
                 seed = job  # different seed than white game
             end
-            result = eval_race_game(single_oracle, batch_oracle, wb, positions[pos_idx],
-                                    value_batch_oracle; seed=seed, az_is_white=az_white,
-                                    gspec=gspec, mcts_params=mcts_params, batch_size=batch_size)
-            rewards[job] = result.reward
-            vsamples[job] = result.value_samples
+            try
+                result = eval_race_game(single_oracle, batch_oracle, wb, positions[pos_idx],
+                                        value_batch_oracle; seed=seed, az_is_white=az_white,
+                                        gspec=gspec, mcts_params=mcts_params, batch_size=batch_size)
+                rewards[job] = result.reward
+                vsamples[job] = result.value_samples
+            catch e
+                Threads.atomic_add!(errors, 1)
+                # Skip this game — reward stays 0.0, no value samples
+            end
             d = Threads.atomic_add!(done, 1) + 1
             if d % 100 == 0
                 elapsed = time() - t_start
@@ -303,7 +309,8 @@ function main()
     @printf("  Equity:    %.3f  (as white: %+.3f, as black: %+.3f)\n",
             avg_reward, white_avg, black_avg)
     @printf("  Win%%:      %.1f%%\n", win_pct)
-    @printf("  Games:     %d (%d positions × 2 sides)\n", n_total, n_games)
+    n_errors = errors[]
+    @printf("  Games:     %d (%d positions × 2 sides, %d errors skipped)\n", n_total, n_games, n_errors)
     @printf("  Time:      %.2f s (%.3f min)\n", elapsed, elapsed / 60)
     @printf("  Rate:      %.1f games/min\n", n_total / (elapsed / 60))
 
