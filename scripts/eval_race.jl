@@ -263,17 +263,11 @@ function main()
                 az_white = false
                 seed = job  # different seed than white game
             end
-            try
-                result = eval_race_game(single_oracle, batch_oracle, wb, positions[pos_idx],
-                                        value_batch_oracle; seed=seed, az_is_white=az_white,
-                                        gspec=gspec, mcts_params=mcts_params, batch_size=batch_size)
-                rewards[job] = result.reward
-                vsamples[job] = result.value_samples
-            catch e
-                n_err = Threads.atomic_add!(errors, 1) + 1
-                @warn "Eval game $job failed (pos=$pos_idx, white=$az_white, seed=$seed): $e"
-                # Skip this game — reward stays 0.0, no value samples
-            end
+            result = eval_race_game(single_oracle, batch_oracle, wb, positions[pos_idx],
+                                    value_batch_oracle; seed=seed, az_is_white=az_white,
+                                    gspec=gspec, mcts_params=mcts_params, batch_size=batch_size)
+            rewards[job] = result.reward
+            vsamples[job] = result.value_samples
             d = Threads.atomic_add!(done, 1) + 1
             if d % 100 == 0
                 elapsed = time() - t_start
