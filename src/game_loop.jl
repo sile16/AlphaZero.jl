@@ -331,8 +331,12 @@ function play_game(white::GameAgent, black::GameAgent, env;
             # ── Decision node ──
             avail = GI.available_actions(env)
 
-            # Single-action bypass: skip MCTS for forced moves
-            if length(avail) == 1
+            # Single-action bypass: skip MCTS for forced moves.
+            # Exception: don't bypass when remaining_actions > 1 (e.g. doubles
+            # in backgammon) because external agents (wildbg) need the call to
+            # set up state for the next sub-action.
+            remaining = hasproperty(env.game, :remaining_actions) ? env.game.remaining_actions : 1
+            if length(avail) == 1 && remaining <= 1
                 state = GI.current_state(env)
                 wp = GI.white_playing(env)
                 agent = wp ? white : black
