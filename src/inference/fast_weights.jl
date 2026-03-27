@@ -327,29 +327,30 @@ function fast_forward_normalized!(fw::FastWeights, fb::FastBuffers,
     dense!(fb.vt, fw.W_vt, fb.h1, fw.b_vt, n)
     layernorm_relu!(fb.h2, fb.vt, fw.ln_vt_s, fw.ln_vt_b, fb.ln_mean, fb.ln_rstd, n)
 
-    # 5-head value computation: sigmoid per head → equity
+    # 5-head value computation: sigmoid per head → joint equity formula
     local V_equity = fb.ln_mean  # Reuse buffer
     wvh1 = fw.W_vh[1]; wvh2 = fw.W_vh[2]; wvh3 = fw.W_vh[3]
     wvh4 = fw.W_vh[4]; wvh5 = fw.W_vh[5]
     bvh1 = fw.b_vh[1]; bvh2 = fw.b_vh[2]; bvh3 = fw.b_vh[3]
     bvh4 = fw.b_vh[4]; bvh5 = fw.b_vh[5]
     @inbounds for j in 1:n
-        p_win = bvh1; p_gw = bvh2; p_bgw = bvh3; p_gl = bvh4; p_bgl = bvh5
+        p_win = bvh1; p_wg = bvh2; p_wbg = bvh3; p_lg = bvh4; p_lbg = bvh5
         @simd for i in 1:w
             v = fb.h2[i, j]
             p_win += wvh1[i] * v
-            p_gw += wvh2[i] * v
-            p_bgw += wvh3[i] * v
-            p_gl += wvh4[i] * v
-            p_bgl += wvh5[i] * v
+            p_wg += wvh2[i] * v
+            p_wbg += wvh3[i] * v
+            p_lg += wvh4[i] * v
+            p_lbg += wvh5[i] * v
         end
+        # Apply sigmoid to raw logits
         p_win = 1.0f0 / (1.0f0 + exp(-p_win))
-        p_gw = 1.0f0 / (1.0f0 + exp(-p_gw))
-        p_bgw = 1.0f0 / (1.0f0 + exp(-p_bgw))
-        p_gl = 1.0f0 / (1.0f0 + exp(-p_gl))
-        p_bgl = 1.0f0 / (1.0f0 + exp(-p_bgl))
-        p_loss = 1.0f0 - p_win
-        V_equity[j] = (p_win * (1.0f0 + p_gw + p_bgw) - p_loss * (1.0f0 + p_gl + p_bgl)) / 3.0f0
+        p_wg = 1.0f0 / (1.0f0 + exp(-p_wg))
+        p_wbg = 1.0f0 / (1.0f0 + exp(-p_wbg))
+        p_lg = 1.0f0 / (1.0f0 + exp(-p_lg))
+        p_lbg = 1.0f0 / (1.0f0 + exp(-p_lbg))
+        # Joint equity formula: (2pw-1) + (wg-lg) + (wbg-lbg), normalized to [-1,1]
+        V_equity[j] = ((2.0f0 * p_win - 1.0f0) + (p_wg - p_lg) + (p_wbg - p_lbg)) / 3.0f0
     end
 
     # Policy head: Dense+LN+ReLU layers → final Dense → masked softmax

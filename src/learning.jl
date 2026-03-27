@@ -39,14 +39,9 @@ function convert_sample(
 
   # Multi-head equity targets (if available).
   #
-  # Important semantic note:
-  # - `eq_win` is an unconditional Bernoulli target P(win)
-  # - the four auxiliary heads are stored in conditional form
-  #   (`P(gammon|win)`, `P(bg|win)`, `P(gammon|loss)`, `P(bg|loss)`)
-  #
-  # For batching convenience, the "wrong-side" conditional targets are stored as
-  # 0.0 here and later masked out in `_equity_head_weights`. That masking step is
-  # what keeps training aligned with `FluxLib.compute_equity`.
+  # All 5 heads use joint cumulative semantics:
+  #   [P(win), P(win∧gammon+), P(win∧bg), P(lose∧gammon+), P(lose∧bg)]
+  # All heads are trained on all samples — no masking needed.
   if !isnothing(e.equity)
     eq = e.equity
     eq_win = [eq.p_win]
@@ -97,11 +92,11 @@ end
 
 Split packed 5-head equity vectors into the learner's columnar batch layout.
 
-`equities` must be shaped `(5, n)` in canonical head order:
-`[P(win), P(gammon|win), P(bg|win), P(gammon|loss), P(bg|loss)]`
+`equities` must be shaped `(5, n)` in canonical joint cumulative head order:
+`[P(win), P(win∧gammon+), P(win∧bg), P(lose∧gammon+), P(lose∧bg)]`
 
 Samples with `has_equity[i] == false` are zeroed in the returned arrays and rely
-on `HasEquity` to mask the multi-head BCE losses later in the training pipeline.
+on `HasEquity` to gate the BCEWithLogits losses in the training pipeline.
 """
 function split_equity_targets(equities::AbstractMatrix{<:Real}, has_equity)
   size(equities, 1) == 5 || throw(ArgumentError("expected equities to have 5 rows, got $(size(equities, 1))"))
@@ -143,28 +138,22 @@ entropy_wmean(π, w) = -sum(π .* log.(π .+ eps(eltype(π))) .* w) / sum(w)
 
 wmean(x, w) = sum(x .* w) / sum(w)
 
-# Binary cross-entropy loss (for multi-head outputs)
+# Binary cross-entropy loss (for multi-head outputs, operates on probabilities)
 bce_wmean(ŷ, y, w) = -sum((y .* log.(ŷ .+ eps(eltype(y))) .+
                            (1f0 .- y) .* log.(1f0 .- ŷ .+ eps(eltype(y)))) .* w) / sum(w)
 
 """
-    _equity_head_weights(W, EqWin, HasEquity)
+    bce_logits_wmean(logits, targets, weights)
 
-Build per-head sample weights for the multi-head equity loss.
+Numerically stable BCE loss operating on raw logits (BCEWithLogits).
+Uses the log-sum-exp trick: `max(x,0) - x*y + log(1+exp(-|x|))`
 
-`EqWin` acts as the routing signal:
-- if `EqWin == 1`, the sample contributes to `p_win`, `p_gammon_win`, `p_bg_win`
-- if `EqWin == 0`, the sample contributes to `p_win`, `p_gammon_loss`, `p_bg_loss`
-
-This is the key step that makes the auxiliary heads conditional rather than
-joint probabilities. Without this masking, storing `0.0` on the opposite side
-would incorrectly train the network toward `P(win ∧ gammon)`-style targets.
+All 5 heads are trained on all samples — no masking needed with joint targets.
 """
-function _equity_head_weights(W, EqWin, HasEquity)
-  W_equity = W .* HasEquity
-  W_win = W_equity .* EqWin
-  W_loss = W_equity .* (1f0 .- EqWin)
-  return W_equity, W_win, W_loss
+function bce_logits_wmean(logits, targets, weights)
+  # max(x,0) - x*y + log(1+exp(-|x|))
+  loss_per_sample = max.(logits, 0f0) .- logits .* targets .+ log.(1f0 .+ exp.(.-abs.(logits)))
+  return sum(loss_per_sample .* weights) / sum(weights)
 end
 
 """
@@ -194,31 +183,35 @@ function losses(nn, params, Wmean, Hp, batch)
   is_multihead = nn isa FluxLib.FCResNetMultiHead
 
   if is_multihead
-    # Multi-head forward pass
-    P̂, V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl, p_invalid =
+    # Multi-head forward pass — returns raw logits (no sigmoid)
+    P̂, L̂_win, L̂_gw, L̂_bgw, L̂_gl, L̂_bgl, p_invalid =
       FluxLib.forward_normalized_multihead(nn, X, A)
 
-    # Get equity targets
+    # Get equity targets (joint cumulative)
     EqWin, EqGW, EqBGW, EqGL, EqBGL, HasEquity =
       batch.EqWin, batch.EqGW, batch.EqBGW, batch.EqGL, batch.EqBGL, batch.HasEquity
 
-    # Weight for samples that have equity targets. The auxiliary heads are
-    # conditional probabilities, so they are only trained on the subset of
-    # samples where their conditioning event is true.
-    W_equity, W_win, W_loss = _equity_head_weights(W, EqWin, HasEquity)
+    # All 5 heads trained on all samples with equity targets (no masking)
+    W_equity = W .* HasEquity
 
-    # Multi-head value losses (binary cross-entropy for each head)
+    # Multi-head value losses (BCEWithLogits for each head, all samples)
     if sum(W_equity) > 0
-      Lv_win = bce_wmean(V̂_win, EqWin, W_equity)
-      Lv_gw = sum(W_win) > 0 ? bce_wmean(V̂_gw, EqGW, W_win) : zero(Lv_win)
-      Lv_bgw = sum(W_win) > 0 ? bce_wmean(V̂_bgw, EqBGW, W_win) : zero(Lv_win)
-      Lv_gl = sum(W_loss) > 0 ? bce_wmean(V̂_gl, EqGL, W_loss) : zero(Lv_win)
-      Lv_bgl = sum(W_loss) > 0 ? bce_wmean(V̂_bgl, EqBGL, W_loss) : zero(Lv_win)
+      Lv_win = bce_logits_wmean(L̂_win, EqWin, W_equity)
+      Lv_gw = bce_logits_wmean(L̂_gw, EqGW, W_equity)
+      Lv_bgw = bce_logits_wmean(L̂_bgw, EqBGW, W_equity)
+      Lv_gl = bce_logits_wmean(L̂_gl, EqGL, W_equity)
+      Lv_bgl = bce_logits_wmean(L̂_bgl, EqBGL, W_equity)
       Lv = Lv_win + Lv_gw + Lv_bgw + Lv_gl + Lv_bgl
     else
       # Fallback: use standard value loss if no equity targets
       V_normalized = V ./ params.rewards_renormalization
-      equity = FluxLib.compute_equity(V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl)
+      # Apply sigmoid to logits for equity computation
+      V̂_win_p = Flux.sigmoid.(L̂_win)
+      V̂_gw_p = Flux.sigmoid.(L̂_gw)
+      V̂_bgw_p = Flux.sigmoid.(L̂_bgw)
+      V̂_gl_p = Flux.sigmoid.(L̂_gl)
+      V̂_bgl_p = Flux.sigmoid.(L̂_bgl)
+      equity = FluxLib.compute_equity(V̂_win_p, V̂_gw_p, V̂_bgw_p, V̂_gl_p, V̂_bgl_p)
       V̂_combined = equity ./ params.rewards_renormalization
       Lv = mse_wmean(V̂_combined, V_normalized, W)
     end

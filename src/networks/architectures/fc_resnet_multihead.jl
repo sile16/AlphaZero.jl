@@ -9,15 +9,17 @@ using Flux: LayerNorm
     EquityOutput
 
 Container for multi-head equity output from the network.
-Contains 5 probabilities that together determine the expected game value.
+Contains 5 joint cumulative probabilities that determine the expected game value.
 
 | Field | Description |
 |:------|:------------|
-| `p_win` | Probability of winning the game |
-| `p_gammon_win` | P(gammon | win) - probability of gammon given we win |
-| `p_bg_win` | P(backgammon | win) - probability of backgammon given we win |
-| `p_gammon_loss` | P(gammon | loss) - probability opponent gammons us given we lose |
-| `p_bg_loss` | P(backgammon | loss) - probability opponent backgammons us given we lose |
+| `p_win` | P(win) |
+| `p_gammon_win` | P(win ∧ gammon+) — joint cumulative, includes backgammon |
+| `p_bg_win` | P(win ∧ backgammon) |
+| `p_gammon_loss` | P(lose ∧ gammon+) — joint cumulative, includes backgammon |
+| `p_bg_loss` | P(lose ∧ backgammon) |
+
+Equity formula (joint): `(2*p_win - 1) + (p_wg - p_lg) + (p_wbg - p_lbg)`
 """
 struct EquityOutput
   p_win::Float32
@@ -30,61 +32,38 @@ end
 """
     compute_equity(e::EquityOutput) -> Float32
 
-Compute the expected game value from equity output components.
+Compute the expected game value from joint cumulative equity output.
 
-This formula assumes the auxiliary heads are conditional probabilities:
-- `p_gammon_win = P(gammon | win)`
-- `p_bg_win = P(backgammon | win)`
-- `p_gammon_loss = P(gammon | loss)`
-- `p_bg_loss = P(backgammon | loss)`
+The heads are joint cumulative probabilities:
+- `p_win` = P(win)
+- `p_gammon_win` = P(win ∧ gammon+) — includes backgammon
+- `p_bg_win` = P(win ∧ backgammon)
+- `p_gammon_loss` = P(lose ∧ gammon+) — includes backgammon
+- `p_bg_loss` = P(lose ∧ backgammon)
 
-The formula is:
+Joint equity formula (GnuBG-style):
 ```
-E = P(win) * (1 + P(gammon|win) + P(bg|win))
-  - P(loss) * (1 + P(gammon|loss) + P(bg|loss))
+E = (2*p_win - 1) + (p_wg - p_lg) + (p_wbg - p_lbg)
 ```
-
-This accounts for backgammon scoring where:
-- Single game: 1 point
-- Gammon: 2 points (adds 1 to base)
-- Backgammon: 3 points (adds 1 more beyond gammon)
-
-Note: P(bg|win) is additive on top of P(gammon|win), so:
-- p_gammon=0, p_bg=0 → 1 point (single)
-- p_gammon=1, p_bg=0 → 2 points (gammon)
-- p_gammon=1, p_bg=1 → 3 points (backgammon)
 
 Returns a value in approximately [-3, +3] range.
-
-This function is intentionally paired with the masked training logic in
-`AlphaZero._equity_head_weights`. The network is not supposed to learn joint
-probabilities like `P(win ∧ gammon)` here; instead it learns:
-- `p_win`
-- `P(gammon | win)` / `P(backgammon | win)` on winning samples only
-- `P(gammon | loss)` / `P(backgammon | loss)` on losing samples only
 """
 function compute_equity(e::EquityOutput)
-  p_loss = 1f0 - e.p_win
-
-  # Expected points from winning (1 base + gammon bonus + backgammon bonus)
-  win_value = e.p_win * (1f0 + e.p_gammon_win + e.p_bg_win)
-
-  # Expected points lost from losing
-  loss_value = p_loss * (1f0 + e.p_gammon_loss + e.p_bg_loss)
-
-  return win_value - loss_value
+  return (2f0 * e.p_win - 1f0) +
+         (e.p_gammon_win - e.p_gammon_loss) +
+         (e.p_bg_win - e.p_bg_loss)
 end
 
 """
     compute_equity(p_win, p_gammon_win, p_bg_win, p_gammon_loss, p_bg_loss)
 
 Compute equity from individual probability values (for batched computation).
+Uses joint formula: `(2*pw - 1) + (wg - lg) + (wbg - lbg)`
 """
 function compute_equity(p_win, p_gammon_win, p_bg_win, p_gammon_loss, p_bg_loss)
-  p_loss = 1f0 .- p_win
-  win_value = p_win .* (1f0 .+ p_gammon_win .+ p_bg_win)
-  loss_value = p_loss .* (1f0 .+ p_gammon_loss .+ p_bg_loss)
-  return win_value .- loss_value
+  return (2f0 .* p_win .- 1f0) .+
+         (p_gammon_win .- p_gammon_loss) .+
+         (p_bg_win .- p_bg_loss)
 end
 
 """
@@ -113,25 +92,18 @@ end
 
 A fully-connected ResNet with multi-head value output for backgammon-style games.
 
-Instead of a single value output, this network outputs 5 probabilities:
+Instead of a single value output, this network outputs 5 raw logits
+(sigmoid applied at inference only, BCEWithLogits used for training):
 - p_win: P(win)
-- p_gammon_win: P(gammon | win)
-- p_bg_win: P(backgammon | win)
-- p_gammon_loss: P(gammon | loss)
-- p_bg_loss: P(backgammon | loss)
+- p_gammon_win: P(win ∧ gammon+) — joint cumulative
+- p_bg_win: P(win ∧ backgammon) — joint
+- p_gammon_loss: P(lose ∧ gammon+) — joint cumulative
+- p_bg_loss: P(lose ∧ backgammon) — joint
 
-These are combined to compute the expected game equity.
+All 5 heads are trained on all samples (no masking needed).
+Equity formula: `(2*pw - 1) + (wg - lg) + (wbg - lbg)`
 
-Based on the TD-Gammon/gnubg approach where conditional probabilities
-are more stable training targets than raw outcome probabilities.
-
-The implementation relies on a simple contract:
-1. training stores the opposite-side auxiliary targets as `0.0`
-2. loss masking removes those inapplicable targets from BCE
-3. `compute_equity` combines the resulting conditional probabilities
-
-If step 2 were removed, this architecture would become mathematically
-inconsistent, which is why the masking regression test exists.
+This matches the GnuBG/TD-Gammon/BGBlitz/Wildbg joint cumulative convention.
 """
 mutable struct FCResNetMultiHead <: FluxNetwork
   gspec
@@ -183,7 +155,8 @@ function FCResNetMultiHead(gspec::AbstractGameSpec, hyper::FCResNetMultiHeadHP)
     vhead_trunk = identity
   end
 
-  # Individual value heads (each outputs a single sigmoid probability)
+  # Individual value heads (each outputs a single raw logit — no sigmoid)
+  # Sigmoid is applied at inference time only; training uses BCEWithLogits.
   function make_value_head(depth)
     layers = []
     if !hyper.share_value_trunk
@@ -194,9 +167,8 @@ function FCResNetMultiHead(gspec::AbstractGameSpec, hyper::FCResNetMultiHeadHP)
         push!(layers, x -> relu.(x))
       end
     end
-    # Final layer: sigmoid output
+    # Final layer: raw logit output (no sigmoid)
     push!(layers, Dense(width, 1))
-    push!(layers, x -> Flux.sigmoid.(x))
     return Chain(layers...)
   end
 
@@ -237,13 +209,13 @@ Returns:
 function Network.forward(nn::FCResNetMultiHead, state)
   c = nn.common(state)
 
-  # Value heads
+  # Value heads (raw logits → sigmoid for probabilities)
   v_trunk = nn.vhead_trunk(c)
-  p_win = nn.vhead_win(v_trunk)
-  p_gw = nn.vhead_gw(v_trunk)
-  p_bgw = nn.vhead_bgw(v_trunk)
-  p_gl = nn.vhead_gl(v_trunk)
-  p_bgl = nn.vhead_bgl(v_trunk)
+  p_win = Flux.sigmoid.(nn.vhead_win(v_trunk))
+  p_gw = Flux.sigmoid.(nn.vhead_gw(v_trunk))
+  p_bgw = Flux.sigmoid.(nn.vhead_bgw(v_trunk))
+  p_gl = Flux.sigmoid.(nn.vhead_gl(v_trunk))
+  p_bgl = Flux.sigmoid.(nn.vhead_bgl(v_trunk))
 
   # Compute combined equity for MCTS compatibility
   # Scale from [-3, 3] range to [-1, 1] for tanh-like behavior
@@ -259,48 +231,52 @@ end
 """
     forward_multihead(nn::FCResNetMultiHead, state)
 
-Compute forward pass returning all value heads separately.
+Compute forward pass returning all value heads as **raw logits**.
 
 Returns:
 - `P`: Policy of shape (num_actions, batch_size)
-- `V_win`: P(win) of shape (1, batch_size)
-- `V_gw`: P(gammon|win) of shape (1, batch_size)
-- `V_bgw`: P(bg|win) of shape (1, batch_size)
-- `V_gl`: P(gammon|loss) of shape (1, batch_size)
-- `V_bgl`: P(bg|loss) of shape (1, batch_size)
+- `L_win`: logit for P(win) of shape (1, batch_size)
+- `L_gw`: logit for P(win∧gammon+) of shape (1, batch_size)
+- `L_bgw`: logit for P(win∧bg) of shape (1, batch_size)
+- `L_gl`: logit for P(lose∧gammon+) of shape (1, batch_size)
+- `L_bgl`: logit for P(lose∧bg) of shape (1, batch_size)
+
+Callers that need probabilities should apply sigmoid. The loss function
+uses BCEWithLogits directly on the logits.
 """
 function forward_multihead(nn::FCResNetMultiHead, state)
   c = nn.common(state)
 
   v_trunk = nn.vhead_trunk(c)
-  p_win = nn.vhead_win(v_trunk)
-  p_gw = nn.vhead_gw(v_trunk)
-  p_bgw = nn.vhead_bgw(v_trunk)
-  p_gl = nn.vhead_gl(v_trunk)
-  p_bgl = nn.vhead_bgl(v_trunk)
+  l_win = nn.vhead_win(v_trunk)
+  l_gw = nn.vhead_gw(v_trunk)
+  l_bgw = nn.vhead_bgw(v_trunk)
+  l_gl = nn.vhead_gl(v_trunk)
+  l_bgl = nn.vhead_bgl(v_trunk)
 
   p = nn.phead(c)
 
-  return (p, p_win, p_gw, p_bgw, p_gl, p_bgl)
+  return (p, l_win, l_gw, l_bgw, l_gl, l_bgl)
 end
 
 """
     forward_normalized_multihead(nn::FCResNetMultiHead, state, actions_mask)
 
-Like forward_normalized but returns all value heads.
+Like forward_normalized but returns all value heads as **raw logits**.
+The loss function uses BCEWithLogits directly on these logits.
 """
 function forward_normalized_multihead(nn::FCResNetMultiHead, state, actions_mask)
-  p, p_win, p_gw, p_bgw, p_gl, p_bgl = forward_multihead(nn, state)
+  p, l_win, l_gw, l_bgw, l_gl, l_bgl = forward_multihead(nn, state)
   p = p .* actions_mask
   sp = sum(p, dims=1)
   p = p ./ (sp .+ eps(eltype(p)))
   p_invalid = 1f0 .- sp
-  return (p, p_win, p_gw, p_bgw, p_gl, p_bgl, p_invalid)
+  return (p, l_win, l_gw, l_bgw, l_gl, l_bgl, p_invalid)
 end
 
 Network.hyperparams(nn::FCResNetMultiHead) = nn.hyper
 Network.game_spec(nn::FCResNetMultiHead) = nn.gspec
-Network.on_gpu(nn::FCResNetMultiHead) = array_on_gpu(nn.vhead_win[end-1].bias)
+Network.on_gpu(nn::FCResNetMultiHead) = array_on_gpu(nn.vhead_win[end].bias)
 
 function Base.copy(nn::FCResNetMultiHead)
   return FCResNetMultiHead(

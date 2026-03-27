@@ -81,33 +81,40 @@ end
 
 @testset "Multi-head Equity Tests" begin
 
-  @testset "EquityOutput and compute_equity" begin
-    # Test equity computation
+  @testset "EquityOutput and compute_equity (joint formula)" begin
+    # Test equity computation with joint cumulative formula:
+    # E = (2*pw - 1) + (wg - lg) + (wbg - lbg)
+
     eq = FluxLib.EquityOutput(1.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0)  # Simple win
     @test FluxLib.compute_equity(eq) ≈ 1.0f0
 
     eq = FluxLib.EquityOutput(0.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0)  # Simple loss
     @test FluxLib.compute_equity(eq) ≈ -1.0f0
 
-    eq = FluxLib.EquityOutput(1.0f0, 1.0f0, 0.0f0, 0.0f0, 0.0f0)  # Gammon win
+    # Joint gammon win: pw=1, wg=1 (P(win∧gammon+)=1)
+    eq = FluxLib.EquityOutput(1.0f0, 1.0f0, 0.0f0, 0.0f0, 0.0f0)
     @test FluxLib.compute_equity(eq) ≈ 2.0f0
 
-    eq = FluxLib.EquityOutput(0.0f0, 0.0f0, 0.0f0, 1.0f0, 0.0f0)  # Gammon loss
+    # Joint gammon loss: pw=0, lg=1 (P(lose∧gammon+)=1)
+    eq = FluxLib.EquityOutput(0.0f0, 0.0f0, 0.0f0, 1.0f0, 0.0f0)
     @test FluxLib.compute_equity(eq) ≈ -2.0f0
 
-    eq = FluxLib.EquityOutput(1.0f0, 1.0f0, 1.0f0, 0.0f0, 0.0f0)  # Backgammon win
+    # Joint backgammon win: pw=1, wg=1, wbg=1
+    eq = FluxLib.EquityOutput(1.0f0, 1.0f0, 1.0f0, 0.0f0, 0.0f0)
     @test FluxLib.compute_equity(eq) ≈ 3.0f0
 
-    eq = FluxLib.EquityOutput(0.0f0, 0.0f0, 0.0f0, 1.0f0, 1.0f0)  # Backgammon loss
+    # Joint backgammon loss: pw=0, lg=1, lbg=1
+    eq = FluxLib.EquityOutput(0.0f0, 0.0f0, 0.0f0, 1.0f0, 1.0f0)
     @test FluxLib.compute_equity(eq) ≈ -3.0f0
 
     # Test 50/50 game
     eq = FluxLib.EquityOutput(0.5f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0)
     @test FluxLib.compute_equity(eq) ≈ 0.0f0
 
-    # Test mixed probabilities
-    eq = FluxLib.EquityOutput(0.6f0, 0.2f0, 0.0f0, 0.3f0, 0.0f0)
-    expected = 0.6f0 * (1f0 + 0.2f0) - 0.4f0 * (1f0 + 0.3f0)
+    # Test with joint probabilities
+    # pw=0.6, wg=0.12 (P(win∧gammon+)), lg=0.12 (P(lose∧gammon+))
+    eq = FluxLib.EquityOutput(0.6f0, 0.12f0, 0.0f0, 0.12f0, 0.0f0)
+    expected = (2f0 * 0.6f0 - 1f0) + (0.12f0 - 0.12f0) + (0f0 - 0f0)
     @test FluxLib.compute_equity(eq) ≈ expected
   end
 
@@ -165,23 +172,31 @@ end
     @test AlphaZero.flip_equity_perspective(flipped) == soft
   end
 
-  @testset "Conditional head masking regression" begin
-    W = Float32[1 1]
-    EqWin = Float32[1 0]
-    HasEquity = Float32[1 1]
+  @testset "BCEWithLogits numerical correctness" begin
+    # BCEWithLogits: max(x,0) - x*y + log(1+exp(-|x|))
+    # For logit=0 and target=0.5: max(0,0) - 0*0.5 + log(1+exp(0)) = log(2) ≈ 0.693
+    logits = Float32[0 2 -2]
+    targets = Float32[0.5 1.0 0.0]
+    weights = Float32[1 1 1]
 
-    W_equity, W_win, W_loss = AlphaZero._equity_head_weights(W, EqWin, HasEquity)
-    @test W_equity == Float32[1 1]
-    @test W_win == Float32[1 0]
-    @test W_loss == Float32[0 1]
+    loss = AlphaZero.bce_logits_wmean(logits, targets, weights)
+    @test isfinite(loss)
+    @test loss > 0
 
-    pred_gw = Float32[1 1]
-    targ_gw = Float32[1 0]
-    masked_loss = AlphaZero.bce_wmean(pred_gw, targ_gw, W_win)
-    unmasked_loss = AlphaZero.bce_wmean(pred_gw, targ_gw, W_equity)
+    # Perfect prediction: logit=100 (sigmoid≈1) for target=1 → loss≈0
+    logits_perfect = Float32[100.0]'
+    targets_perfect = Float32[1.0]'
+    weights_one = Float32[1.0]'
+    loss_perfect = AlphaZero.bce_logits_wmean(logits_perfect, targets_perfect, weights_one)
+    @test loss_perfect < 1f-4
 
-    @test masked_loss ≈ 0f0 atol=1f-6
-    @test unmasked_loss > masked_loss
+    # Compare BCEWithLogits vs manual BCE(sigmoid(logit), target) for numerical agreement
+    logit = 1.5f0
+    target = 0.7f0
+    p = 1f0 / (1f0 + exp(-logit))
+    manual_bce = -(target * log(p + eps(Float32)) + (1f0 - target) * log(1f0 - p + eps(Float32)))
+    logit_bce = max(logit, 0f0) - logit * target + log(1f0 + exp(-abs(logit)))
+    @test manual_bce ≈ logit_bce atol=1f-5
   end
 
   @testset "Split equity targets preserves head order and masking" begin
@@ -257,13 +272,14 @@ end
     @test size(v) == (1, 1)
     @test all(-1 .<= v .<= 1)  # Value in [-1, 1] range
 
-    # Multi-head forward
-    p, v_win, v_gw, v_bgw, v_gl, v_bgl = FluxLib.forward_multihead(nn, x_batch)
+    # Multi-head forward (returns raw logits, not probabilities)
+    p, l_win, l_gw, l_bgw, l_gl, l_bgl = FluxLib.forward_multihead(nn, x_batch)
     @test size(p) == (9, 1)
-    @test size(v_win) == (1, 1)
-    @test size(v_gw) == (1, 1)
-    @test all(0 .<= v_win .<= 1)  # Probabilities in [0, 1]
-    @test all(0 .<= v_gw .<= 1)
+    @test size(l_win) == (1, 1)
+    @test size(l_gw) == (1, 1)
+    # Logits can be any real value (not constrained to [0,1])
+    @test all(isfinite.(l_win))
+    @test all(isfinite.(l_gw))
 
     # Test evaluation interface
     p_eval, v_eval = Network.evaluate(nn, state)

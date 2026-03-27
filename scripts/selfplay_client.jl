@@ -229,29 +229,35 @@ end
 #####
 
 const BEAROFF_SRC_DIR = let
-    local_path = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k6.jl")
-    pkg_path = joinpath(dirname(pathof(BackgammonNet)), "bearoff_k6.jl")
+    local_path = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k7.jl")
+    pkg_path = joinpath(dirname(pathof(BackgammonNet)), "bearoff_k7.jl")
     if isfile(local_path)
         dirname(local_path)
     elseif isfile(pkg_path)
         dirname(pkg_path)
     else
-        error("Cannot find bearoff_k6.jl. Expected at:\n  $local_path\n  $pkg_path")
+        error("Cannot find bearoff_k7.jl. Expected at:\n  $local_path\n  $pkg_path")
     end
 end
 
-include(joinpath(BEAROFF_SRC_DIR, "bearoff_k6.jl"))
-using .BearoffK6
+include(joinpath(BEAROFF_SRC_DIR, "bearoff_k7.jl"))
+using .BearoffK7
 
 const BEAROFF_TABLE = let
-    table_dir = joinpath(BEAROFF_SRC_DIR, "..", "tools", "bearoff_twosided", "bearoff_k6_twosided")
-    if !isdir(table_dir)
-        error("Bear-off table not found at: $table_dir")
+    # Try NFS first (shared across machines), then local build directory
+    nfs_dir = "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided"
+    local_dir = joinpath(BEAROFF_SRC_DIR, "..", "tools", "bearoff_twosided", "bearoff_k7_twosided")
+    table_dir = if isdir(nfs_dir) && isfile(joinpath(nfs_dir, "bearoff_k7_c14.bin"))
+        nfs_dir
+    elseif isdir(local_dir)
+        local_dir
+    else
+        error("Bear-off k=7 table not found at:\n  $nfs_dir\n  $local_dir")
     end
-    println("Loading k=6 bear-off table from $table_dir ...")
+    println("Loading k=7 bear-off table from $table_dir ...")
     t = BearoffTable(table_dir)
-    println("  c14: $(t.c14_pairs) pairs ($(round(length(t.c14_data)/1e9, digits=1)) GB)")
-    println("  c15: $(t.c15_pairs) pairs ($(round(length(t.c15_data)/1e9, digits=1)) GB)")
+    println("  c14: $(round(length(t.c14_data)/1e9, digits=1)) GB")
+    println("  c15: $(round(length(t.c15_data)/1e9, digits=1)) GB")
     flush(stdout)
     t
 end
@@ -259,26 +265,24 @@ end
 """
 Look up exact bear-off equity from the precomputed table.
 
-The returned `equity` vector follows the same five-head convention as the
-network and training samples:
-- `p_win`
-- `p_gammon_win = P(gammon | win)`
-- `p_bg_win = P(backgammon | win)`
-- `p_gammon_loss = P(gammon | loss)`
-- `p_bg_loss = P(backgammon | loss)`
+The k=7 bearoff table stores joint non-cumulative values directly:
+- `pW`  = P(win)
+- `pWG` = P(win AND gammon) — joint, not conditional
+- `pLG` = P(lose AND gammon) — joint, not conditional
+- bg = 0 in bearoff (not stored)
 
-That alignment is what allows exact bear-off targets to plug directly into the
-multi-head loss and `compute_equity` without any semantic conversion.
+Maps to the NN's 5-head joint convention:
+- `[P(win), P(win∧gammon+), P(win∧bg), P(lose∧gammon+), P(lose∧bg)]`
 """
 function bearoff_table_equity(game::BackgammonNet.BackgammonGame)
-    r = BearoffK6.lookup(BEAROFF_TABLE, game)
-    eq = Float32[r.p_win, r.p_gammon_win, r.p_bg_win, r.p_gammon_loss, r.p_bg_loss]
-    value = BearoffK6.compute_equity(r)
+    r = BearoffK7.lookup(BEAROFF_TABLE, game)
+    eq = Float32[r.pW, r.pWG, 0.0f0, r.pLG, 0.0f0]
+    value = BearoffK7.compute_equity(r)
     return (value=value, equity=eq)
 end
 
 """
-Compute exact post-dice bear-off value via move enumeration.
+Compute exact post-dice bear-off value via move enumeration (k=7).
 
 At a decision node (specific dice rolled), enumerate all legal moves, look up each
 resulting position in the bear-off table, and return the best (max) value.
@@ -286,19 +290,19 @@ This gives the exact Q(board, dice) = max_move V(result(board, dice, move)),
 where V is the opponent's pre-dice table value (negated for perspective flip).
 
 Returns `(value, equity)` where `value` is white-relative scalar equity and
-`equity` is the 5-element conditional-probability vector used throughout the
-multi-head stack, or `nothing` if not a bear-off position.
+`equity` is the 5-element joint cumulative vector, or `nothing` if not a
+bear-off position.
 """
 function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
-    if !BearoffK6.is_bearoff_position(game.p0, game.p1)
+    if !BearoffK7.is_bearoff_position(game.p0, game.p1)
         return nothing
     end
     if BackgammonNet.is_chance_node(game)
         # Pre-dice: table value is exact. lookup() returns mover-relative;
         # convert to white-relative for consistency with the function's contract.
-        r = BearoffK6.lookup(table, game)
-        mover_val = BearoffK6.compute_equity(r)
-        mover_eq = Float32[r.p_win, r.p_gammon_win, r.p_bg_win, r.p_gammon_loss, r.p_bg_loss]
+        r = BearoffK7.lookup(table, game)
+        mover_val = BearoffK7.compute_equity(r)
+        mover_eq = Float32[r.pW, r.pWG, 0.0f0, r.pLG, 0.0f0]
         if game.current_player == 0
             return (value=mover_val, equity=mover_eq)
         else
@@ -315,7 +319,7 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
 
     # Compute in mover's perspective (maximize), then convert to white-relative
     best_mover_value = -Inf32
-    best_mover_equity = nothing  # 5-elem vector from mover's perspective
+    best_mover_equity = nothing  # 5-elem joint vector from mover's perspective
     bg_copy = BackgammonNet.clone(game)
     mover = game.current_player  # 0 (P0/white) or 1 (P1/black)
 
@@ -330,16 +334,15 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
             # Mover bore off all checkers — they win (simple win, no gammons at terminal bearoff)
             mover_val = 1.0f0
             mover_eq = Float32[1.0, 0.0, 0.0, 0.0, 0.0]
-        elseif BearoffK6.is_bearoff_position(bg_copy.p0, bg_copy.p1)
+        elseif BearoffK7.is_bearoff_position(bg_copy.p0, bg_copy.p1)
             # After move, opponent's turn at a chance node.
             # lookup() returns from bg_copy.current_player's perspective (the opponent).
-            r_opp = BearoffK6.lookup(table, bg_copy)
+            r_opp = BearoffK7.lookup(table, bg_copy)
             # Negate for mover's perspective.
-            mover_val = -BearoffK6.compute_equity(r_opp)
-            # Flip the conditional heads, not joint probabilities:
-            # mover's `P(gammon|win)` is the opponent's `P(gammon|loss)`, etc.
-            mover_eq = AlphaZero.flip_equity_perspective(
-                Float32[r_opp.p_win, r_opp.p_gammon_win, r_opp.p_bg_win, r_opp.p_gammon_loss, r_opp.p_bg_loss])
+            mover_val = -BearoffK7.compute_equity(r_opp)
+            # k=7 returns joint values directly — convert to 5-head and flip
+            opp_eq = Float32[r_opp.pW, r_opp.pWG, 0.0f0, r_opp.pLG, 0.0f0]
+            mover_eq = AlphaZero.flip_equity_perspective(opp_eq)
         else
             continue
         end
@@ -359,8 +362,7 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
         # Mover is white — already white-relative
         return (value=best_mover_value, equity=best_mover_equity)
     else
-        # Mover is black — flip to white perspective while preserving the same
-        # conditional-head convention expected by training/inference.
+        # Mover is black — flip to white perspective
         white_value = -best_mover_value
         white_eq = AlphaZero.flip_equity_perspective(best_mover_equity)
         return (value=white_value, equity=white_eq)
@@ -368,7 +370,7 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
 end
 
 """
-Create bear-off evaluator for MCTS.
+Create bear-off evaluator for MCTS (k=7).
 
 At chance nodes (pre-dice): returns the pre-dice table value directly (exact).
 At decision nodes (post-dice): enumerates all legal moves, looks up each resulting
@@ -379,14 +381,14 @@ Returns white-relative equity or nothing if not a bear-off position.
 function make_bearoff_evaluator(table)
     return function(game_env)
         bg = game_env.game
-        if !BearoffK6.is_bearoff_position(bg.p0, bg.p1)
+        if !BearoffK7.is_bearoff_position(bg.p0, bg.p1)
             return nothing
         end
 
         if BackgammonNet.is_chance_node(bg)
-            # Pre-dice: table value is exact (mover-relative → white-relative)
-            r = BearoffK6.lookup(table, bg)
-            mover_equity = Float64(BearoffK6.compute_equity(r))
+            # Pre-dice: table value is exact (mover-relative -> white-relative)
+            r = BearoffK7.lookup(table, bg)
+            mover_equity = Float64(BearoffK7.compute_equity(r))
             return bg.current_player == 0 ? mover_equity : -mover_equity
         end
 
@@ -396,7 +398,7 @@ function make_bearoff_evaluator(table)
             return nothing
         end
 
-        # Allocate per-call (thread-safe; clone is cheap — just field copies + buffer alloc)
+        # Allocate per-call (thread-safe; clone is cheap -- just field copies + buffer alloc)
         bg_copy = BackgammonNet.clone(bg)
 
         best_value = -Inf
@@ -407,10 +409,10 @@ function make_bearoff_evaluator(table)
             if bg_copy.terminated
                 # Terminal: current player won (bore off all checkers)
                 move_val = 1.0
-            elseif BearoffK6.is_bearoff_position(bg_copy.p0, bg_copy.p1)
+            elseif BearoffK7.is_bearoff_position(bg_copy.p0, bg_copy.p1)
                 # Opponent's turn (chance node). Look up their pre-dice equity, negate.
-                r_opp = BearoffK6.lookup(table, bg_copy)
-                move_val = -Float64(BearoffK6.compute_equity(r_opp))
+                r_opp = BearoffK7.lookup(table, bg_copy)
+                move_val = -Float64(BearoffK7.compute_equity(r_opp))
             else
                 continue
             end
@@ -581,16 +583,13 @@ multi-head equity targets are aligned.
 
 Per sample:
 - `value` is always stored from the side-to-move perspective at that sample
-- `equity` always follows the five-head conditional contract used by the network:
-  `[P(win), P(gammon|win), P(bg|win), P(gammon|loss), P(bg|loss)]`
+- `equity` uses joint cumulative 5-head convention:
+  `[P(win), P(win∧gammon+), P(win∧bg), P(lose∧gammon+), P(lose∧bg)]`
 
 Target precedence is intentionally:
 1. exact bear-off truncation target captured earlier in the game, if present
 2. exact post-dice bear-off value for the current state, if available
 3. final game outcome as a hard 0/1 target
-
-Whenever perspective flips are needed, the code swaps the win-conditioned and
-loss-conditioned heads. It does not reinterpret them as joint probabilities.
 """
 function convert_trace_to_samples(gspec, states, policies, trace_actions, rewards, is_chance, final_reward, outcome; rng=nothing,
         bearoff_equity=nothing, bearoff_wp=nothing,
@@ -644,19 +643,17 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
                 eq = AlphaZero.flip_equity_perspective(probs_white)
             end
         elseif !isnothing(outcome)
-            # Hard terminal supervision. The opposite-side conditional heads stay
-            # at 0 here by construction; masked BCE in `src/learning.jl` ensures
-            # those placeholders do not turn the auxiliary heads into joint-event
-            # targets during training.
+            # Hard terminal supervision. Zeros on the non-applicable side are
+            # valid joint probabilities (e.g., P(win∧gammon)=0 when you lost).
             has_eq = true
             eq = AlphaZero.equity_vector_from_outcome(outcome, wp)
         end
 
         is_bearoff_pos = false
         if bearoff_equity === nothing && state isa BackgammonNet.BackgammonGame &&
-                BearoffK6.is_bearoff_position(state.p0, state.p1)
+                BearoffK7.is_bearoff_position(state.p0, state.p1)
             # Use post-dice move enumeration for exact Q(board, dice) values
-            # and the matching five-head conditional target for this specific
+            # and the matching five-head joint target for this specific
             # state. Override both together so `value` and `equity` stay aligned.
             bo = bearoff_post_dice_equity(state, BEAROFF_TABLE)
             if bo !== nothing
@@ -803,7 +800,7 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         while !GI.game_terminated(env)
             if GI.is_chance_node(env)
                 bg = env.game
-                if BearoffK6.is_bearoff_position(bg.p0, bg.p1)
+                if BearoffK7.is_bearoff_position(bg.p0, bg.p1)
                     if first_bearoff_bo === nothing
                         first_bearoff_bo = bearoff_table_equity(bg)
                         first_bearoff_wp = (bg.current_player == 0)
@@ -922,7 +919,7 @@ function worker_play_games_gpu(worker_id::Int, games_claimed::Threads.Atomic{Int
         first_bearoff_bo = Ref{Any}(nothing)
         first_bearoff_wp = Ref{Bool}(true)
         function bearoff_lookup_with_capture(game)
-            if !BearoffK6.is_bearoff_position(game.p0, game.p1)
+            if !BearoffK7.is_bearoff_position(game.p0, game.p1)
                 return nothing
             end
             bo = bearoff_table_equity(game)

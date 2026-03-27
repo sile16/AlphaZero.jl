@@ -631,9 +631,9 @@ if !isempty(ARGS["bootstrap_file"])
         #   state, policy, value, equity, has_equity, is_chance, is_contact, is_bearoff
         #
         # `value` is already in the same player-relative convention used by the
-        # learner, while `equity` follows the same five-head conditional contract
-        # as the self-play sample path. The loader below preserves that layout and
-        # only repacks it into columnar arrays for the replay buffer.
+        # learner. `equity` contains joint cumulative 5-head values (same
+        # convention as the NN and self-play targets). The loader below preserves
+        # that layout and only repacks it into columnar arrays for the replay buffer.
         n_bootstrap = length(bootstrap_samples)
         max_load = ARGS["bootstrap_max_samples"] > 0 ?
             min(ARGS["bootstrap_max_samples"], BUFFER_CAPACITY) : min(n_bootstrap, BUFFER_CAPACITY)
@@ -709,8 +709,8 @@ The returned batch matches the same learner-side contract as
 `AlphaZero.convert_samples`:
 - `V` is the scalar player-relative target used by the single-head fallback and
   for TD error computation
-- `EqWin/EqGW/EqBGW/EqGL/EqBGL` are the five conditional equity heads
-- `HasEquity` gates whether the multi-head BCE losses apply to that sample
+- `EqWin/EqGW/EqBGW/EqGL/EqBGL` are the five joint cumulative equity heads
+- `HasEquity` gates whether the multi-head BCEWithLogits losses apply to that sample
 """
 function prepare_batch_columnar(col_data, num_actions, use_gpu_flag, net)
     n = size(col_data.states, 2)
@@ -749,9 +749,12 @@ function compute_td_errors(nn, batch_data)
     X, A, V = batch_data.X, batch_data.A, batch_data.V
     is_multihead = nn isa FluxLib.FCResNetMultiHead
     if is_multihead
-        _, V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl, _ =
+        # forward_normalized_multihead returns raw logits; apply sigmoid for equity
+        _, L̂_win, L̂_gw, L̂_bgw, L̂_gl, L̂_bgl, _ =
             FluxLib.forward_normalized_multihead(nn, X, A)
-        equity = FluxLib.compute_equity(V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl)
+        equity = FluxLib.compute_equity(
+            Flux.sigmoid.(L̂_win), Flux.sigmoid.(L̂_gw), Flux.sigmoid.(L̂_bgw),
+            Flux.sigmoid.(L̂_gl), Flux.sigmoid.(L̂_bgl))
         V̂_combined = equity ./ 3f0
         td = abs.(Flux.cpu(V̂_combined) .- Flux.cpu(V))
     else
@@ -888,8 +891,14 @@ function reanalyze_buffer!()
             )
             sub_batch_data = prepare_batch_columnar(sub_col, NUM_ACTIONS, USE_GPU, net)
 
-            _, V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl, _ =
+            # forward_normalized_multihead returns raw logits; apply sigmoid
+            _, L̂_win, L̂_gw, L̂_bgw, L̂_gl, L̂_bgl, _ =
                 FluxLib.forward_normalized_multihead(net, sub_batch_data.X, sub_batch_data.A)
+            V̂_win = Flux.sigmoid.(L̂_win)
+            V̂_gw = Flux.sigmoid.(L̂_gw)
+            V̂_bgw = Flux.sigmoid.(L̂_bgw)
+            V̂_gl = Flux.sigmoid.(L̂_gl)
+            V̂_bgl = Flux.sigmoid.(L̂_bgl)
             equity = FluxLib.compute_equity(V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl)
             new_values = Float32.(vec(Flux.cpu(equity ./ 3f0)))
 

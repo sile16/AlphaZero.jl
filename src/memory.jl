@@ -7,21 +7,19 @@
     EquityTargets
 
 Targets for multi-head equity training (backgammon-style games).
+Uses joint cumulative semantics — all 5 heads trained on all samples.
 
 | Field | Description |
 |:------|:------------|
-| `p_win` | Target for P(win) - 1.0 if won, 0.0 if lost |
-| `p_gammon_win` | Target for P(gammon|win) - 1.0 if won by gammon |
-| `p_bg_win` | Target for P(backgammon|win) - 1.0 if won by backgammon |
-| `p_gammon_loss` | Target for P(gammon|loss) - 1.0 if lost by gammon |
-| `p_bg_loss` | Target for P(backgammon|loss) - 1.0 if lost by backgammon |
+| `p_win` | P(win) — 1.0 if won, 0.0 if lost |
+| `p_gammon_win` | P(win ∧ gammon+) — 1.0 if won by gammon or backgammon |
+| `p_bg_win` | P(win ∧ backgammon) — 1.0 if won by backgammon |
+| `p_gammon_loss` | P(lose ∧ gammon+) — 1.0 if lost by gammon or backgammon |
+| `p_bg_loss` | P(lose ∧ backgammon) — 1.0 if lost by backgammon |
 
-The conditional heads are only trained on samples where they are defined:
-- `p_gammon_win` / `p_bg_win` on won games
-- `p_gammon_loss` / `p_bg_loss` on lost games
-
-The opposite-side targets are stored as `0.0` for batching convenience and are
-masked out in the loss function.
+For self-play binary targets, the vectors are numerically identical to the
+old conditional representation (zeros on the non-applicable side are valid
+joint probabilities, not masked placeholders).
 """
 struct EquityTargets
   p_win :: Float64
@@ -34,20 +32,20 @@ end
 """
     equity_targets_from_outcome(outcome::GI.GameOutcome, white_perspective::Bool)
 
-Create equity targets from a game outcome.
+Create equity targets from a game outcome using joint cumulative semantics.
 
 For a won game:
 - p_win = 1.0
-- p_gammon_win = 1.0 if gammon, 0.0 otherwise
+- p_gammon_win = 1.0 if gammon or backgammon, 0.0 otherwise
 - p_bg_win = 1.0 if backgammon, 0.0 otherwise
-- p_gammon_loss = N/A (stored as 0.0, masked during training)
-- p_bg_loss = N/A (stored as 0.0, masked during training)
+- p_gammon_loss = 0.0 (valid joint probability — did not lose)
+- p_bg_loss = 0.0
 
 For a lost game:
 - p_win = 0.0
-- p_gammon_win = N/A (stored as 0.0, masked during training)
-- p_bg_win = N/A (stored as 0.0, masked during training)
-- p_gammon_loss = 1.0 if opponent won by gammon, 0.0 otherwise
+- p_gammon_win = 0.0 (valid joint probability — did not win)
+- p_bg_win = 0.0
+- p_gammon_loss = 1.0 if opponent won by gammon or backgammon, 0.0 otherwise
 - p_bg_loss = 1.0 if opponent won by backgammon, 0.0 otherwise
 """
 function equity_targets_from_outcome(outcome::GI.GameOutcome, white_perspective::Bool)
@@ -75,7 +73,7 @@ end
 
 Materialize an `EquityTargets` struct into the canonical 5-head vector order:
 
-`[P(win), P(gammon|win), P(bg|win), P(gammon|loss), P(bg|loss)]`
+`[P(win), P(win∧gammon+), P(win∧bg), P(lose∧gammon+), P(lose∧bg)]`
 """
 function equity_vector(targets::EquityTargets, ::Type{T}=Float32) where T <: AbstractFloat
   return T[
@@ -103,14 +101,15 @@ end
 """
     flip_equity_perspective(eq::AbstractVector{<:Real}) -> Vector
 
-Flip a canonical 5-head equity vector to the opponent's perspective while
-preserving the same conditional semantics.
+Flip a canonical 5-head equity vector to the opponent's perspective.
+Works identically for both joint and conditional semantics: negate p_win,
+swap the win-side and loss-side heads.
 
 If `eq` is:
-`[P(win), P(gammon|win), P(bg|win), P(gammon|loss), P(bg|loss)]`
+`[P(win), P(win∧gammon+), P(win∧bg), P(lose∧gammon+), P(lose∧bg)]`
 
 then the returned vector is:
-`[P(loss), P(gammon|loss), P(bg|loss), P(gammon|win), P(bg|win)]`
+`[P(lose), P(lose∧gammon+), P(lose∧bg), P(win∧gammon+), P(win∧bg)]`
 """
 function flip_equity_perspective(eq::AbstractVector{T}) where T <: Real
   length(eq) == 5 || throw(ArgumentError("expected 5 equity heads, got $(length(eq))"))

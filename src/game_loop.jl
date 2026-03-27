@@ -335,7 +335,10 @@ function play_game(white::GameAgent, black::GameAgent, env;
             # Exception: don't bypass when remaining_actions > 1 (e.g. doubles
             # in backgammon) because external agents (wildbg) need the call to
             # set up state for the next sub-action.
-            remaining = hasproperty(env.game, :remaining_actions) ? env.game.remaining_actions : 1
+            remaining = let
+                has_game = hasproperty(env, :game)
+                has_game && hasproperty(env.game, :remaining_actions) ? env.game.remaining_actions : 1
+            end
             if length(avail) == 1 && remaining <= 1
                 state = GI.current_state(env)
                 wp = GI.white_playing(env)
