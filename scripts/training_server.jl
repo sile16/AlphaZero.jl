@@ -1193,6 +1193,58 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         @info "server/cpu_percent" value=server_stats["cpu_percent"] log_step_increment=1
     end
 
+    # Bearoff accuracy: NN equity vs exact table targets on bearoff positions
+    # Measures how well the NN has learned bearoff evaluation
+    try
+        n_buf = buf_length(replay_buffer)
+        bearoff_mask = findall(i -> replay_buffer.is_bearoff[i] && replay_buffer.has_equity[i], 1:n_buf)
+        n_bo = length(bearoff_mask)
+        if n_bo >= 100
+            n_sample = min(1000, n_bo)
+            sample_idx = bearoff_mask[randperm(n_sample)]
+
+            # Get states and targets
+            bo_states = replay_buffer.states[:, sample_idx]
+            bo_eq_targets = replay_buffer.equities[:, sample_idx]  # 5×n, exact table values
+
+            # NN forward pass (on GPU)
+            bo_states_gpu = Flux.gpu(bo_states)
+            nn = ARGS["training_mode"] == "race" ? race_network : contact_network
+            P_hat, V_hat = Network.forward(nn, bo_states_gpu)
+            nn_equity = Vector{Float32}(vec(Flux.cpu(V_hat)))  # normalized [-1,1]
+
+            # Table equity from stored targets (joint formula, normalized)
+            table_equity = Float32[
+                ((2*bo_eq_targets[1,i] - 1) + (bo_eq_targets[2,i] - bo_eq_targets[4,i]) +
+                 (bo_eq_targets[3,i] - bo_eq_targets[5,i])) / 3.0f0
+                for i in 1:n_sample]
+
+            # Compute MSE and correlation
+            diffs = nn_equity .- table_equity
+            bo_mse = sum(diffs .^ 2) / n_sample
+            bo_mae = sum(abs.(diffs)) / n_sample
+
+            nn_mean = sum(nn_equity) / n_sample
+            tbl_mean = sum(table_equity) / n_sample
+            nn_dev = nn_equity .- nn_mean
+            tbl_dev = table_equity .- tbl_mean
+            cov_val = sum(nn_dev .* tbl_dev) / n_sample
+            nn_std = sqrt(sum(nn_dev .^ 2) / n_sample)
+            tbl_std = sqrt(sum(tbl_dev .^ 2) / n_sample)
+            bo_corr = (nn_std > 0 && tbl_std > 0) ? cov_val / (nn_std * tbl_std) : 0.0f0
+
+            with_logger(TB_LOGGER) do
+                @info "bearoff/nn_vs_table_mse" value=bo_mse log_step_increment=0
+                @info "bearoff/nn_vs_table_mae" value=bo_mae log_step_increment=0
+                @info "bearoff/nn_vs_table_corr" value=bo_corr log_step_increment=0
+                @info "bearoff/n_samples" value=n_bo log_step_increment=0
+            end
+            @info "Bearoff accuracy" mse=round(bo_mse, digits=6) mae=round(bo_mae, digits=4) corr=round(bo_corr, digits=4) n_bearoff=n_bo n_sampled=n_sample
+        end
+    catch e
+        @warn "Bearoff accuracy computation failed" exception=e
+    end
+
     # Save client stats
     save_client_stats(server_state, joinpath(DATA_DIR, "clients.json"))
 
