@@ -244,15 +244,15 @@ include(joinpath(BEAROFF_SRC_DIR, "bearoff_k7.jl"))
 using .BearoffK7
 
 const BEAROFF_TABLE = let
-    # Try NFS first (shared across machines), then local build directory
-    nfs_dir = "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided"
+    # Prefer local copy (mmap over NFS can cause bus errors on large files)
     local_dir = joinpath(BEAROFF_SRC_DIR, "..", "tools", "bearoff_twosided", "bearoff_k7_twosided")
-    table_dir = if isdir(nfs_dir) && isfile(joinpath(nfs_dir, "bearoff_k7_c14.bin"))
-        nfs_dir
-    elseif isdir(local_dir)
+    nfs_dir = "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided"
+    table_dir = if isdir(local_dir) && isfile(joinpath(local_dir, "bearoff_k7_c14.bin"))
         local_dir
+    elseif isdir(nfs_dir) && isfile(joinpath(nfs_dir, "bearoff_k7_c14.bin"))
+        nfs_dir
     else
-        error("Bear-off k=7 table not found at:\n  $nfs_dir\n  $local_dir")
+        error("Bear-off k=7 table not found at:\n  $local_dir\n  $nfs_dir")
     end
     println("Loading k=7 bear-off table from $table_dir ...")
     t = BearoffTable(table_dir)
@@ -903,10 +903,11 @@ function worker_play_games_gpu(worker_id::Int, games_claimed::Threads.Atomic{Int
         dirichlet_noise_ϵ=Float64(config["dirichlet_epsilon"]),
         dirichlet_noise_α=Float64(config["dirichlet_alpha"]))
 
+    # Eval uses NN+MCTS only (no bearoff table) — measures actual NN strength
     az_agent = GameLoop.MctsAgent(
         GPU_SINGLE_ORACLE, GPU_BATCH_ORACLE,
         mcts_params, INFERENCE_BATCH_SIZE, gspec;
-        bearoff_eval=BEAROFF_EVALUATOR)
+        bearoff_eval=nothing)
 
     # Create player ONCE and reuse across all games
     player = GameLoop.create_player(az_agent)
