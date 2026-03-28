@@ -43,9 +43,9 @@ function parse_args()
             arg_type = String
             default = ""
         "--num-workers"
-            help = "Number of CPU self-play workers"
+            help = "Number of CPU self-play workers (default: num threads)"
             arg_type = Int
-            default = 22
+            default = 0
         "--upload-interval"
             help = "Upload samples every N games"
             arg_type = Int
@@ -83,7 +83,7 @@ end
 
 const ARGS = parse_args()
 const SERVER_URL = ARGS["server"]
-const NUM_WORKERS = ARGS["num_workers"]
+const NUM_WORKERS = ARGS["num_workers"] > 0 ? ARGS["num_workers"] : Threads.nthreads()
 const GPU_WORKERS = ARGS["gpu_workers"]
 const USE_GPU = GPU_WORKERS > 0
 const EVAL_CAPABLE = ARGS["eval_capable"]
