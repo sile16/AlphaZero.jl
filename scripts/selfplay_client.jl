@@ -2,16 +2,20 @@
 
 # Auto-install dependencies on first run
 import Pkg
-if !isfile(joinpath(dirname(@__DIR__), "Manifest.toml"))
-    println("First run — installing dependencies...")
-    # BackgammonNet.jl is not in the public registry — dev-link from sibling dir or clone
-    bgnet_dir = joinpath(dirname(@__DIR__), "..", "BackgammonNet.jl")
-    if !isdir(bgnet_dir)
-        println("Cloning BackgammonNet.jl...")
-        run(`git clone https://github.com/sile16/BackgammonNet.jl.git $bgnet_dir`)
+let manifest = joinpath(dirname(@__DIR__), "Manifest.toml")
+    if !isfile(manifest) || filesize(manifest) < 100
+        println("First run — installing dependencies...")
+        # BackgammonNet.jl is not in the public registry — dev-link from sibling dir or clone
+        bgnet_dir = joinpath(dirname(@__DIR__), "..", "BackgammonNet.jl")
+        if !isdir(bgnet_dir)
+            println("Cloning BackgammonNet.jl...")
+            run(`git clone https://github.com/sile16/BackgammonNet.jl.git $bgnet_dir`)
+        end
+        Pkg.develop(path=bgnet_dir)
+        Pkg.resolve()
+        Pkg.instantiate()
+        println("Dependencies installed. Precompiling (this takes ~10 min on first run)...")
     end
-    Pkg.develop(path=bgnet_dir)
-    Pkg.instantiate()
 end
 
 """
