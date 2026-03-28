@@ -43,7 +43,7 @@ echo "=== AlphaZero Self-Play Client ==="
 echo "Threads: $THREADS (= workers)"
 echo "Server: $SERVER"
 echo "Log: $LOG"
-echo "Extra args: ${EXTRA_ARGS[*]:-none}"
+echo "Extra args: ${EXTRA_ARGS[*]+"${EXTRA_ARGS[*]}"}"
 echo ""
 
 while true; do
@@ -51,7 +51,7 @@ while true; do
 
     julia --threads "$THREADS" --project scripts/selfplay_client.jl \
         --server "$SERVER" --api-key "$API_KEY" \
-        "${EXTRA_ARGS[@]}" \
+        ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
         2>&1 | tee -a "$LOG" || true
 
     echo ""
