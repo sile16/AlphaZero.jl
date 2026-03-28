@@ -1661,7 +1661,16 @@ function check_and_do_eval!()
         end
     catch e
         println("[EVAL] Error during eval: $e")
-        @show e
+        if e isa CompositeException
+            for (i, ex) in enumerate(e.exceptions)
+                println("[EVAL]   nested[$i]: ", ex)
+                if ex isa TaskFailedException
+                    println("[EVAL]   task error: ", ex.task.result)
+                end
+            end
+        end
+        Base.showerror(stdout, e, catch_backtrace())
+        println()
     end
 
     @label eval_finished
