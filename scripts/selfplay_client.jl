@@ -4,6 +4,13 @@
 import Pkg
 if !isfile(joinpath(dirname(@__DIR__), "Manifest.toml"))
     println("First run — installing dependencies...")
+    # BackgammonNet.jl is not in the public registry — dev-link from sibling dir or clone
+    bgnet_dir = joinpath(dirname(@__DIR__), "..", "BackgammonNet.jl")
+    if !isdir(bgnet_dir)
+        println("Cloning BackgammonNet.jl...")
+        run(`git clone https://github.com/sile16/BackgammonNet.jl.git $bgnet_dir`)
+    end
+    Pkg.develop(path=bgnet_dir)
     Pkg.instantiate()
 end
 
