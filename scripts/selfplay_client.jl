@@ -266,14 +266,17 @@ const BEAROFF_SERVER_URL = "http://192.168.20.155:8787"
 
 const BEAROFF_TABLE = let
     # Prefer local copy (mmap over NFS can cause bus errors on large files)
-    local_dir = joinpath(BEAROFF_SRC_DIR, "..", "tools", "bearoff_twosided", "bearoff_k7_twosided")
-    nfs_dir = "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided"
-    table_dir = if isdir(local_dir) && isfile(joinpath(local_dir, "bearoff_k7_c14.bin"))
-        local_dir
-    elseif isdir(nfs_dir) && isfile(joinpath(nfs_dir, "bearoff_k7_c14.bin"))
-        nfs_dir
-    else
-        nothing
+    candidates = [
+        joinpath(BEAROFF_SRC_DIR, "..", "tools", "bearoff_twosided", "bearoff_k7_twosided"),
+        joinpath(homedir(), "bearoff_k7_twosided"),
+        "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
+    ]
+    table_dir = nothing
+    for dir in candidates
+        if isdir(dir) && isfile(joinpath(dir, "bearoff_k7_c14.bin"))
+            table_dir = dir
+            break
+        end
     end
     if table_dir !== nothing
         println("Loading k=7 bear-off table from $table_dir ...")
