@@ -65,6 +65,9 @@ mutable struct ServerState
 
     # Server start time
     start_time::DateTime
+
+    # Client restart flag (set via /api/restart-clients, cleared after all clients disconnect)
+    restart_clients::Threads.Atomic{Bool}
 end
 
 function ServerState(; api_key::String, config::Dict{String, Any})
@@ -79,6 +82,7 @@ function ServerState(; api_key::String, config::Dict{String, Any})
         config,
         api_key,
         now(),
+        Threads.Atomic{Bool}(false),
     )
 end
 
@@ -155,7 +159,8 @@ function handle_samples(req::HTTP.Request, state::ServerState, buffer::PERBuffer
             end
         end
 
-        resp = Dict("accepted" => Int(batch.n), "buffer_size" => buf_length(buffer))
+        resp = Dict("accepted" => Int(batch.n), "buffer_size" => buf_length(buffer),
+                    "restart" => state.restart_clients[])
         return HTTP.Response(200, ["Content-Type" => "application/json"], JSON.json(resp))
     catch e
         @warn "Error handling samples" exception=(e, catch_backtrace())
@@ -257,6 +262,21 @@ function handle_client_stats(req::HTTP.Request, state::ServerState)
     catch e
         return HTTP.Response(400, "Bad request: $e")
     end
+end
+
+function handle_restart_clients(req::HTTP.Request, state::ServerState)
+    check_auth(req, state) || return HTTP.Response(401, "Unauthorized")
+    Threads.atomic_xchg!(state.restart_clients, true)
+    n = length(state.clients)
+    println("[Server] Restart signal sent — $n client(s) will restart after next upload")
+    return HTTP.Response(200, JSON.json(Dict("ok" => true, "clients" => n)))
+end
+
+function handle_cancel_restart(req::HTTP.Request, state::ServerState)
+    check_auth(req, state) || return HTTP.Response(401, "Unauthorized")
+    Threads.atomic_xchg!(state.restart_clients, false)
+    println("[Server] Restart signal cancelled")
+    return HTTP.Response(200, JSON.json(Dict("ok" => true)))
 end
 
 """Get aggregate cluster performance stats."""
@@ -457,6 +477,8 @@ function create_router(state::ServerState, buffer::PERBuffer)
     HTTP.register!(router, "GET", "/api/status", req -> handle_status(req, state, buffer))
     HTTP.register!(router, "GET", "/api/clients", req -> handle_clients(req, state))
     HTTP.register!(router, "POST", "/api/client_stats", req -> handle_client_stats(req, state))
+    HTTP.register!(router, "POST", "/api/restart-clients", req -> handle_restart_clients(req, state))
+    HTTP.register!(router, "POST", "/api/cancel-restart", req -> handle_cancel_restart(req, state))
 
     # Distributed eval endpoints
     HTTP.register!(router, "GET", "/api/eval/status", req -> handle_eval_status(req, state))

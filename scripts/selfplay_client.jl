@@ -938,6 +938,13 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
 
             avail = GI.available_actions(env)
             if length(avail) == 1
+                # Record forced move for value training (no MCTS needed)
+                state = GI.current_state(env)
+                push!(trace_states, state)
+                push!(trace_policies, Float32[1.0])
+                push!(trace_actions, [avail[1]])
+                push!(trace_is_chance, false)
+                push!(trace_rewards, 0.0f0)
                 GI.play!(env, avail[1])
                 continue
             end
@@ -1274,6 +1281,11 @@ Threads.@spawn begin
             if resp.status == 200
                 result = JSON.parse(String(resp.body))
                 println("  Uploaded $(result["accepted"]) samples ($(round(length(bytes)/1024, digits=1)) KB, $(round(t_upload, digits=2))s), buffer=$(result["buffer_size"]))")
+                if get(result, "restart", false)
+                    println("\n*** Server requested restart — exiting for update ***")
+                    flush(stdout)
+                    exit(0)
+                end
             else
                 println("  Upload failed: $(resp.status)")
             end
