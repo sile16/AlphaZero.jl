@@ -464,6 +464,29 @@ function create_router(state::ServerState, buffer::PERBuffer)
     HTTP.register!(router, "POST", "/api/eval/submit", req -> handle_eval_submit(req, state))
     HTTP.register!(router, "POST", "/api/eval/heartbeat", req -> handle_eval_heartbeat(req, state))
 
+    # File serving endpoint — clients download start positions, eval positions, etc.
+    HTTP.register!(router, "GET", "/api/file/*", function(req)
+        filename = split(req.target, "/api/file/")[end]
+        # Security: only serve from known data directories, no path traversal
+        if contains(filename, "..") || contains(filename, "/")
+            return HTTP.Response(400, "Invalid filename")
+        end
+        # Search known data directories
+        search_paths = [
+            "/homeshare/projects/AlphaZero.jl/eval_data",
+            get(state.config, "data_dir", ""),
+        ]
+        for dir in search_paths
+            path = joinpath(dir, filename)
+            if isfile(path)
+                data = read(path)
+                return HTTP.Response(200, ["Content-Type" => "application/octet-stream",
+                    "Content-Length" => string(length(data))], data)
+            end
+        end
+        return HTTP.Response(404, "File not found: $filename")
+    end)
+
     return router
 end
 

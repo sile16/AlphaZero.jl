@@ -536,14 +536,35 @@ const START_POSITIONS_FILE = get(config, "start_positions_file", "")
 
 const START_POSITIONS = if !isempty(START_POSITIONS_FILE)
     if !isfile(START_POSITIONS_FILE)
-        error("Start positions file not found: $START_POSITIONS_FILE")
+        # Try downloading from server
+        local_path = joinpath(dirname(@__DIR__), "eval_data", basename(START_POSITIONS_FILE))
+        mkpath(dirname(local_path))
+        println("Start positions not found locally, downloading from server...")
+        try
+            resp = HTTP.get("$(SERVER_URL)/api/file/$(basename(START_POSITIONS_FILE))";
+                headers=auth_headers(client), status_exception=false,
+                connect_timeout=10, readtimeout=60)
+            if resp.status == 200
+                open(local_path, "w") do f; write(f, resp.body); end
+                println("Downloaded to $local_path ($(round(length(resp.body)/1e6, digits=1)) MB)")
+            else
+                error("Start positions file not found locally ($START_POSITIONS_FILE) and server download failed ($(resp.status))")
+            end
+        catch e
+            error("Start positions file required but not available:\n  Local: $START_POSITIONS_FILE\n  Download failed: $e")
+        end
+        tuples = Serialization.deserialize(local_path)
+        println("Loaded $(length(tuples)) starting positions")
+        flush(stdout)
+        tuples
+    else
+        tuples = Serialization.deserialize(START_POSITIONS_FILE)
+        println("Loaded $(length(tuples)) starting positions from $START_POSITIONS_FILE")
+        flush(stdout)
+        tuples
     end
-    tuples = Serialization.deserialize(START_POSITIONS_FILE)
-    println("Loaded $(length(tuples)) starting positions from $START_POSITIONS_FILE")
-    flush(stdout)
-    tuples  # Vector{Tuple{UInt128, UInt128, Int8}}
 else
-    nothing
+    error("Start positions file is required but not configured by server")
 end
 
 """Initialize a game environment from configured starting positions or default opening."""
