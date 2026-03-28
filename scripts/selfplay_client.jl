@@ -1562,23 +1562,20 @@ function check_and_do_eval!()
             claimed = Threads.Atomic{Int}(0)
             t_chunk_start = time()
 
-            Threads.@threads for tid in 1:min(NUM_WORKERS, n_games)
-                wb_agent = BackgammonNet.BackendAgent(wildbg_backends[tid])
-                while true
-                    job = Threads.atomic_add!(claimed, 1) + 1
-                    job > n_games && break
-                    pos_idx = pos_start + job - 1
-                    if pos_idx > length(EVAL_POSITIONS)
-                        rewards[job] = 0.0
-                        value_data[job] = PositionValueSample[]
-                        continue
-                    end
-                    result = eval_game_from_position(
-                        az_agent, wb_agent, EVAL_POSITIONS[pos_idx], value_batch_oracle;
-                        seed=chunk_id * 10000 + job, az_is_white=az_is_white)
-                    rewards[job] = result.reward
-                    value_data[job] = result.value_samples
+            # Run eval games sequentially — az_agent's MCTS player is not thread-safe
+            wb_agent = BackgammonNet.BackendAgent(wildbg_backends[1])
+            for job in 1:n_games
+                pos_idx = pos_start + job - 1
+                if pos_idx > length(EVAL_POSITIONS)
+                    rewards[job] = 0.0
+                    value_data[job] = PositionValueSample[]
+                    continue
                 end
+                result = eval_game_from_position(
+                    az_agent, wb_agent, EVAL_POSITIONS[pos_idx], value_batch_oracle;
+                    seed=chunk_id * 10000 + job, az_is_white=az_is_white)
+                rewards[job] = result.reward
+                value_data[job] = result.value_samples
             end
 
             chunk_done[] = true
