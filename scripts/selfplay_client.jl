@@ -31,15 +31,15 @@ function parse_args()
 
     @add_arg_table! s begin
         "--server"
-            help = "Training server URL (use localhost with SSH tunnel)"
+            help = "Training server URL"
             arg_type = String
-            default = "http://localhost:9090"
+            default = "http://jarvis:9090"
         "--api-key"
             help = "API key for server authentication"
             arg_type = String
             default = "alphazero-dev-key"
         "--client-name"
-            help = "Human-readable client name"
+            help = "Client name (default: hostname)"
             arg_type = String
             default = ""
         "--num-workers"
@@ -120,7 +120,7 @@ include(joinpath(@__DIR__, "..", "src", "distributed", "protocol.jl"))
 include(joinpath(@__DIR__, "..", "src", "distributed", "client.jl"))
 
 # Connect to server and get config
-client_name = isempty(ARGS["client_name"]) ? "julia-$(gethostname())-$(getpid())" : ARGS["client_name"]
+client_name = isempty(ARGS["client_name"]) ? lowercase(gethostname()) : ARGS["client_name"]
 client = SelfPlayClient(SERVER_URL, ARGS["api_key"];
                         client_id=client_name, upload_threshold=ARGS["upload_interval"] * 200)
 
