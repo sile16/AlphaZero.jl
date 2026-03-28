@@ -283,16 +283,9 @@ const BEAROFF_TABLE = let
         flush(stdout)
         t
     else
-        # No local table — require remote bearoff server
-        try
-            resp = HTTP.get("$BEAROFF_SERVER_URL/bearoff/health"; connect_timeout=3, readtimeout=5, status_exception=false)
-            resp.status == 200 || error("Remote bearoff server returned $(resp.status)")
-            println("Using remote bearoff server at $BEAROFF_SERVER_URL (no local table)")
-            flush(stdout)
-            nothing  # Table is nothing; lookups go through remote server
-        catch e
-            error("Bear-off unavailable. No local k=7 table at:\n  $local_dir\n  $nfs_dir\nRemote server at $BEAROFF_SERVER_URL unreachable: $e")
-        end
+        println("No local k=7 bear-off table — NN will handle bearoff positions")
+        flush(stdout)
+        nothing
     end
 end
 
@@ -323,19 +316,11 @@ Maps to the NN's 5-head joint convention:
 - `[P(win), P(win∧gammon+), P(win∧bg), P(lose∧gammon+), P(lose∧bg)]`
 """
 function bearoff_table_equity(game::BackgammonNet.BackgammonGame)
-    if BEAROFF_TABLE !== nothing
-        r = BearoffK7.lookup(BEAROFF_TABLE, game)
-        eq = Float32[r.pW, r.pWG, 0.0f0, r.pLG, 0.0f0]
-        value = BearoffK7.compute_equity(r)
-        return (value=value, equity=eq)
-    else
-        # Remote lookup
-        cp = Int(game.current_player)
-        r = _remote_bearoff_lookup(game.p0, game.p1, cp)
-        r.is_bearoff || return nothing
-        eq = Float32[r.pW, r.pWG, 0.0f0, r.pLG, 0.0f0]
-        return (value=r.equity, equity=eq)
-    end
+    BEAROFF_TABLE === nothing && return nothing
+    r = BearoffK7.lookup(BEAROFF_TABLE, game)
+    eq = Float32[r.pW, r.pWG, 0.0f0, r.pLG, 0.0f0]
+    value = BearoffK7.compute_equity(r)
+    return (value=value, equity=eq)
 end
 
 """
@@ -352,26 +337,7 @@ bear-off position.
 """
 function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
     if table === nothing
-        # Use remote server for post-dice enumeration (server does the move enum)
-        if !BearoffK7.is_bearoff_position(game.p0, game.p1)
-            return nothing
-        end
-        try
-            body = JSON3.write(Dict(
-                "p0" => string(game.p0, base=16),
-                "p1" => string(game.p1, base=16),
-                "player" => Int(game.current_player),
-                "dice_high" => Int(game.dice[1]),
-                "dice_low" => Int(game.dice[2])))
-            resp = HTTP.post("$BEAROFF_SERVER_URL/bearoff/postdice",
-                ["Content-Type" => "application/json"], body;
-                connect_timeout=5, readtimeout=10)
-            data = JSON3.read(String(resp.body))
-            !data["is_bearoff"] && return nothing
-            eq = Float32.(data["equity"])
-            return (value=Float32(data["value"]), equity=eq)
-        catch
-            return nothing
+        return nothing
         end
     end
     if !BearoffK7.is_bearoff_position(game.p0, game.p1)
@@ -460,6 +426,10 @@ Returns white-relative equity or nothing if not a bear-off position.
 """
 function make_bearoff_evaluator(table)
     return function(game_env)
+        # No local table → skip bearoff eval entirely (NN handles it).
+        # Remote HTTP is far too slow for per-MCTS-iteration lookups.
+        table === nothing && return nothing
+
         bg = game_env.game
         if !BearoffK7.is_bearoff_position(bg.p0, bg.p1)
             return nothing
@@ -467,21 +437,10 @@ function make_bearoff_evaluator(table)
 
         if BackgammonNet.is_chance_node(bg)
             # Pre-dice: table value is exact (mover-relative → white-relative)
-            if table !== nothing
-                r = BearoffK7.lookup(table, bg)
-                mover_equity = Float64(BearoffK7.compute_equity(r))
-            else
-                # Remote lookup for pre-dice value
-                cp = Int(bg.current_player)
-                rr = _remote_bearoff_lookup(bg.p0, bg.p1, cp)
-                rr.is_bearoff || return nothing
-                mover_equity = Float64(rr.equity)
-            end
+            r = BearoffK7.lookup(table, bg)
+            mover_equity = Float64(BearoffK7.compute_equity(r))
             return bg.current_player == 0 ? mover_equity : -mover_equity
         end
-
-        # Decision node: skip if no local table (HTTP too slow for move enumeration)
-        table === nothing && return nothing
 
         # Decision node (post-dice): enumerate moves to get exact Q(board, dice)
         actions = BackgammonNet.legal_actions(bg)
