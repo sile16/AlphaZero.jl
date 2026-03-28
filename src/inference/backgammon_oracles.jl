@@ -184,6 +184,10 @@ function _task_buffer_resolver(initfn)
 
     function task_buffers()
         task = current_task()
+        # Fast path: lock-free lookup for already-initialized tasks
+        buf = get(buffers_by_task, task, nothing)
+        buf !== nothing && return buf
+        # Slow path: initialize under lock (once per task)
         lock(buffers_lock) do
             return get!(buffers_by_task, task) do
                 initfn()
