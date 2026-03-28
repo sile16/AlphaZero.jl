@@ -495,6 +495,7 @@ function create_router(state::ServerState, buffer::PERBuffer)
         end
         # Search known data directories
         search_paths = [
+            joinpath(@__DIR__, "..", "..", "eval_data"),  # project eval_data/
             "/homeshare/projects/AlphaZero.jl/eval_data",
             get(state.config, "data_dir", ""),
         ]
