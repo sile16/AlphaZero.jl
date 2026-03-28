@@ -1,4 +1,12 @@
 #!/usr/bin/env julia
+
+# Auto-install dependencies on first run
+import Pkg
+if !isfile(joinpath(dirname(@__DIR__), "Manifest.toml"))
+    println("First run — installing dependencies...")
+    Pkg.instantiate()
+end
+
 """
 Self-play client for distributed training.
 
