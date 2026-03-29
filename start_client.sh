@@ -46,6 +46,10 @@ echo "Log: $LOG"
 echo "Extra args: ${EXTRA_ARGS[*]+"${EXTRA_ARGS[*]}"}"
 echo ""
 
+# Pull latest code before first start
+echo "[$(date)] Pulling latest code..."
+git pull --ff-only 2>&1 || echo "  git pull failed (non-fatal)"
+
 while true; do
     echo "[$(date)] Starting client..."
 
@@ -55,8 +59,8 @@ while true; do
         2>&1 | tee -a "$LOG" || true
 
     echo ""
-    echo "[$(date)] Client exited. Pulling latest code..."
-    git pull --ff-only 2>&1 || echo "  git pull failed (non-fatal)"
-    echo "[$(date)] Sleeping 30s before restart..."
+    echo "[$(date)] Client exited. Sleeping 30s..."
     sleep 30
+    echo "[$(date)] Pulling latest code..."
+    git pull --ff-only 2>&1 || echo "  git pull failed (non-fatal)"
 done
