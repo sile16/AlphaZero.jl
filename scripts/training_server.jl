@@ -756,7 +756,8 @@ function compute_td_errors(nn, batch_data)
             Flux.sigmoid.(L̂_win), Flux.sigmoid.(L̂_gw), Flux.sigmoid.(L̂_bgw),
             Flux.sigmoid.(L̂_gl), Flux.sigmoid.(L̂_bgl))
         V̂_combined = equity ./ 3f0
-        td = abs.(Flux.cpu(V̂_combined) .- Flux.cpu(V))
+        V_normalized = V ./ 3f0  # Buffer V is in [-3,3], normalize to match network output
+        td = abs.(Flux.cpu(V̂_combined) .- Flux.cpu(V_normalized))
     else
         _, V̂, _ = Network.forward_normalized(nn, X, A)
         td = abs.(Flux.cpu(V̂) .- Flux.cpu(V))
@@ -900,7 +901,7 @@ function reanalyze_buffer!()
             V̂_gl = Flux.sigmoid.(L̂_gl)
             V̂_bgl = Flux.sigmoid.(L̂_bgl)
             equity = FluxLib.compute_equity(V̂_win, V̂_gw, V̂_bgw, V̂_gl, V̂_bgl)
-            new_values = Float32.(vec(Flux.cpu(equity ./ 3f0)))
+            new_values = Float32.(vec(Flux.cpu(equity)))  # Keep raw [-3,3] scale to match selfplay
 
             new_eq_win = Float32.(vec(Flux.cpu(V̂_win)))
             new_eq_gw = Float32.(vec(Flux.cpu(V̂_gw)))
