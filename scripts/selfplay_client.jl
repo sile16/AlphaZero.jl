@@ -1351,7 +1351,7 @@ end
 mutable struct EvalSession
     iter::Int
     weights_version::Int
-    az_agent::Union{Nothing, EvalAlphaZeroAgent}
+    az_agent::Any      # EvalAlphaZeroAgent (defined later)
     wildbg_backend::Any
     value_batch_oracle::Any
 end
