@@ -1532,7 +1532,10 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
                                    eval_mcts_params, INFERENCE_BATCH_SIZE, gspec)
 
     # Open wildbg backend
-    wb_backend = BackgammonNet.WildbgBackend(; lib_path=WILDBG_LIB_EVAL)
+    # Auto-detect nets variant from file size (large > 16MB)
+    lib_size = filesize(WILDBG_LIB_EVAL)
+    nets_variant = lib_size > 16_000_000 ? :large : :small
+    wb_backend = BackgammonNet.WildbgBackend(; nets=nets_variant, lib_path=WILDBG_LIB_EVAL)
     BackgammonNet.open!(wb_backend)
 
     # Store in session
