@@ -1597,8 +1597,8 @@ function process_eval_chunk!(chunk_data::Dict)
     println("[EVAL] Chunk $chunk_id: positions $pos_start-$pos_end ($(az_is_white ? "white" : "black")), iter=$eval_iter")
     flush(stdout)
 
-    # Setup or refresh eval session if iter changed
-    if EVAL_SESSION.iter != eval_iter
+    # Setup or refresh eval session if iter changed or not initialized
+    if EVAL_SESSION.az_agent === nothing || EVAL_SESSION.iter != eval_iter
         setup_eval_session!(eval_iter, weights_version)
     end
 
