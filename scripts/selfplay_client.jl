@@ -1533,7 +1533,7 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
 
     # Open wildbg backend
     wb_backend = BackgammonNet.WildbgBackend(; lib_path=WILDBG_LIB_EVAL)
-    BackgammonNet.open_backend!(wb_backend)
+    BackgammonNet.open!(wb_backend)
 
     # Store in session
     EVAL_SESSION.iter = eval_iter
