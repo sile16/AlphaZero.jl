@@ -338,7 +338,7 @@ end
 
 const EVAL_JOB = Ref{Union{Nothing, EvalManager.EvalJob}}(nothing)
 const EVAL_LOCK = ReentrantLock()
-const EVAL_CHUNK_SIZE = 10          # 10 games per chunk (was 50 — too slow with weak NN)
+const EVAL_CHUNK_SIZE = 100         # 100 games per chunk → 20 chunks for 2000 games
 const EVAL_CHECKOUT_LEASE = 1200.0  # 20 minutes per chunk (was 5 min — insufficient for 600 MCTS)
 const EVAL_JOB_TIMEOUT = 3600.0    # 60 minutes total (was 30 min)
 
