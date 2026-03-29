@@ -52,7 +52,8 @@ function auth_headers(client::SelfPlayClient)
 end
 
 """Register and return (success, assigned_seed). Server assigns unique seed per client."""
-function register!(client::SelfPlayClient; name::String=client.client_id)
+function register!(client::SelfPlayClient; name::String=client.client_id,
+                   eval_capable::Bool=false, has_wildbg::Bool=false)
     git_commit = try
         strip(read(`git -C $(dirname(@__DIR__)) rev-parse --short HEAD`, String))
     catch
@@ -63,6 +64,8 @@ function register!(client::SelfPlayClient; name::String=client.client_id)
         "client_type" => client.client_type,
         "name" => name,
         "git_commit" => git_commit,
+        "eval_capable" => eval_capable,
+        "has_wildbg" => has_wildbg,
     ))
     resp = HTTP.post("$(client.server_url)/api/register",
                      auth_headers(client),

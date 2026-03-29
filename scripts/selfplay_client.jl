@@ -107,8 +107,6 @@ const GPU_WORKERS = ARGS["gpu_workers"]
 const USE_GPU = GPU_WORKERS > 0
 const EVAL_CAPABLE = ARGS["eval_capable"]
 const EVAL_MCTS_ITERS = ARGS["eval_mcts_iters"]
-const PAUSE_SELFPLAY = Threads.Atomic{Bool}(false)
-const ACTIVE_SELFPLAY_GAMES = Threads.Atomic{Int}(0)
 
 println("=" ^ 60)
 println("AlphaZero Self-Play Client")
@@ -144,7 +142,9 @@ client = SelfPlayClient(SERVER_URL, ARGS["api_key"];
                         client_id=client_name, upload_threshold=ARGS["upload_interval"] * 200)
 
 println("\nConnecting to server...")
-reg = register!(client; name=client_name)
+reg = register!(client; name=client_name,
+                eval_capable=EVAL_CAPABLE,
+                has_wildbg=!isempty(WILDBG_LIB_EVAL))
 if !reg.success
     error("Failed to register with server")
 end
@@ -505,37 +505,45 @@ using StaticArrays
 const TRAINING_MODE = get(config, "training_mode", "dual")
 const START_POSITIONS_FILE = get(config, "start_positions_file", "")
 
-const START_POSITIONS = if !isempty(START_POSITIONS_FILE)
-    if !isfile(START_POSITIONS_FILE)
-        # Try downloading from server
-        local_path = joinpath(dirname(@__DIR__), "eval_data", basename(START_POSITIONS_FILE))
-        mkpath(dirname(local_path))
-        println("Start positions not found locally, downloading from server...")
-        try
-            resp = HTTP.get("$(SERVER_URL)/api/file/$(basename(START_POSITIONS_FILE))";
-                headers=auth_headers(client), status_exception=false,
-                connect_timeout=10, readtimeout=60)
-            if resp.status == 200
-                open(local_path, "w") do f; write(f, resp.body); end
-                println("Downloaded to $local_path ($(round(length(resp.body)/1e6, digits=1)) MB)")
-            else
-                error("Start positions file not found locally ($START_POSITIONS_FILE) and server download failed ($(resp.status))")
-            end
-        catch e
-            error("Start positions file required but not available:\n  Local: $START_POSITIONS_FILE\n  Download failed: $e")
-        end
-        tuples = Serialization.deserialize(local_path)
-        println("Loaded $(length(tuples)) starting positions")
-        flush(stdout)
-        tuples
-    else
-        tuples = Serialization.deserialize(START_POSITIONS_FILE)
-        println("Loaded $(length(tuples)) starting positions from $START_POSITIONS_FILE")
-        flush(stdout)
-        tuples
+"""Find a data file locally or download from server. Returns local path."""
+function find_or_download(filename::String; required::Bool=true)
+    isempty(filename) && (required ? error("Data file not configured") : return "")
+    name = basename(filename)
+    # Search local paths
+    candidates = [
+        filename,  # full path (if provided)
+        joinpath(dirname(@__DIR__), "eval_data", name),
+        joinpath(homedir(), "eval_data", name),
+    ]
+    for p in candidates
+        isfile(p) && return p
     end
-else
-    error("Start positions file is required but not configured by server")
+    # Download from server
+    local_path = joinpath(dirname(@__DIR__), "eval_data", name)
+    mkpath(dirname(local_path))
+    println("Downloading $name from server...")
+    try
+        resp = HTTP.get("$(SERVER_URL)/api/file/$name";
+            headers=auth_headers(client), status_exception=false,
+            connect_timeout=10, readtimeout=120)
+        if resp.status == 200
+            open(local_path, "w") do f; write(f, resp.body); end
+            println("  Downloaded $(round(length(resp.body)/1e6, digits=1)) MB → $local_path")
+            return local_path
+        end
+    catch e
+        required || return ""
+        error("Data file $name not available locally or from server: $e")
+    end
+    required ? error("Data file $name not found") : ""
+end
+
+const START_POSITIONS = let
+    path = find_or_download(START_POSITIONS_FILE; required=true)
+    tuples = Serialization.deserialize(path)
+    println("Loaded $(length(tuples)) starting positions from $(basename(path))")
+    flush(stdout)
+    tuples
 end
 
 """Initialize a game environment from configured starting positions or default opening."""
@@ -1235,6 +1243,7 @@ const UPLOAD_INTERVAL = ARGS["upload_interval"]
 # Single background network thread handles uploads AND weight sync.
 # HTTP.jl deadlocks with multiple concurrent spawned threads doing HTTP.
 const UPLOAD_CHANNEL = Channel{Vector{UInt8}}(8)
+const EVAL_CHANNEL = Channel{Dict{String,Any}}(4)  # eval chunks from server upload response
 Threads.@spawn begin
     while true
         # Block waiting for upload data
@@ -1256,6 +1265,16 @@ Threads.@spawn begin
                     println("\n*** Server requested restart — exiting for update ***")
                     flush(stdout)
                     exit(0)
+                end
+                # Queue eval work if server assigned a chunk
+                eval_chunk = get(result, "eval_chunk", nothing)
+                if eval_chunk !== nothing
+                    if isready(EVAL_CHANNEL)
+                        println("  [EVAL] Chunk offered but channel full, skipping")
+                    else
+                        put!(EVAL_CHANNEL, Dict{String,Any}(eval_chunk))
+                        println("  [EVAL] Chunk $(eval_chunk["chunk_id"]) queued (iter=$(eval_chunk["eval_iter"]))")
+                    end
                 end
             else
                 println("  Upload failed: $(resp.status)")
@@ -1312,26 +1331,16 @@ function continuous_worker(worker_id::Int, rng::MersenneTwister)
     # Play games forever — one at a time, push samples immediately
     games_played = 0
     while true
-        # Check if self-play is paused (eval in progress)
-        if PAUSE_SELFPLAY[]
-            sleep(0.1)
-            continue
+        games_claimed = Threads.Atomic{Int}(0)
+        result = _play_games_loop(worker_id, games_claimed, 1, sub_rng;
+                                  player=player)
+        if !isempty(result.samples)
+            put!(SAMPLE_CHANNEL, result.samples)
         end
-        Threads.atomic_add!(ACTIVE_SELFPLAY_GAMES, 1)
-        try
-            games_claimed = Threads.Atomic{Int}(0)
-            result = _play_games_loop(worker_id, games_claimed, 1, sub_rng;
-                                      player=player)
-            if !isempty(result.samples)
-                put!(SAMPLE_CHANNEL, result.samples)
-            end
-            games_played += 1
-            if games_played <= 3
-                println("  Worker $worker_id: game $games_played done, $(length(result.samples)) samples")
-                flush(stdout)
-            end
-        finally
-            Threads.atomic_sub!(ACTIVE_SELFPLAY_GAMES, 1)
+        games_played += 1
+        if games_played <= 3
+            println("  Worker $worker_id: game $games_played done, $(length(result.samples)) samples")
+            flush(stdout)
         end
     end
 end
@@ -1340,23 +1349,26 @@ end
 ##### Client-side eval mode
 #####
 
-# Eval weight state — separate from self-play weights
-mutable struct EvalWeightState
+# Eval session — caches agent/weights across chunks from same iteration
+mutable struct EvalSession
     iter::Int
-    contact_fast_weights::Any
-    race_fast_weights::Any
+    weights_version::Int
+    az_agent::Union{Nothing, EvalAlphaZeroAgent}
+    wildbg_backend::Any
+    value_batch_oracle::Any
 end
-const EVAL_WEIGHTS = EvalWeightState(0, nothing, nothing)
+const EVAL_SESSION = EvalSession(0, 0, nothing, nothing, nothing)
 
 # Load eval positions if eval-capable
 const EVAL_POSITIONS = if EVAL_CAPABLE
-    pos_file = ARGS["eval_positions_file"]
-    if isfile(pos_file)
-        pos = Serialization.deserialize(pos_file)
-        println("Eval: loaded $(length(pos)) positions from $pos_file")
+    eval_file = get(config, "eval_positions_file", ARGS["eval_positions_file"])
+    path = find_or_download(eval_file; required=false)
+    if !isempty(path)
+        pos = Serialization.deserialize(path)
+        println("Eval: loaded $(length(pos)) positions from $(basename(path))")
         pos
     else
-        println("WARNING: Eval positions file not found: $pos_file — eval disabled")
+        println("WARNING: Eval positions not available — eval disabled")
         nothing
     end
 else
@@ -1454,18 +1466,183 @@ function eval_game_from_position(az_agent::EvalAlphaZeroAgent,
     return (reward=az_reward, value_samples=value_samples)
 end
 
-"""Check for eval work from server. If available, pause self-play and run eval."""
-function check_and_do_eval!()
+"""Set up eval session for a new iteration (download weights, create agent + wildbg)."""
+function setup_eval_session!(eval_iter::Int, weights_version::Int)
+    println("[EVAL] Setting up eval session for iter $eval_iter (weights v$weights_version)")
+    flush(stdout)
+
+    # Create fresh networks and download eval weights
+    eval_contact_net = Network.copy(contact_network)
+    eval_race_net = Network.copy(race_network)
+    try
+        updated = sync_weights!(client, eval_contact_net, eval_race_net)
+        if !updated
+            println("[EVAL] WARNING: Failed to download eval weights")
+        end
+    catch e
+        println("[EVAL] Weight download error: $e")
+    end
+
+    # Create FastWeights for eval
+    eval_contact_fw = CPU_INFERENCE_BACKEND == :fast ?
+        AlphaZero.FastInference.extract_fast_weights(eval_contact_net) : nothing
+    eval_race_fw = CPU_INFERENCE_BACKEND == :fast ?
+        AlphaZero.FastInference.extract_fast_weights(eval_race_net) : nothing
+
+    # Create eval oracles
+    eval_cfg = AlphaZero.BackgammonInference.OracleConfig(
+        state_dim=STATE_DIM, num_actions=NUM_ACTIONS,
+        route_state=ORACLE_CFG.route_state,
+        vectorize_state=ORACLE_CFG.vectorize_state)
+    eval_oracles = AlphaZero.BackgammonInference.make_cpu_oracles(
+        CPU_INFERENCE_BACKEND, eval_contact_net, eval_cfg;
+        secondary_net=eval_race_net, batch_size=INFERENCE_BATCH_SIZE,
+        primary_fw=eval_contact_fw, secondary_fw=eval_race_fw)
+    eval_single_oracle = eval_oracles[1]
+    eval_batch_oracle = eval_oracles[2]
+
+    # Value oracle for NN value comparison
+    value_oracles = AlphaZero.BackgammonInference.make_cpu_oracles(
+        CPU_INFERENCE_BACKEND, eval_contact_net, eval_cfg;
+        secondary_net=eval_race_net, batch_size=1,
+        primary_fw=eval_contact_fw, secondary_fw=eval_race_fw)
+    value_batch_oracle = value_oracles[2]
+
+    # Create eval MCTS agent
+    eval_mcts_params = MctsParams(
+        num_iters_per_turn=EVAL_MCTS_ITERS,
+        cpuct=1.5,
+        temperature=ConstSchedule(0.0),
+        dirichlet_noise_ϵ=0.0,
+        dirichlet_noise_α=0.3)
+    az_agent = EvalAlphaZeroAgent(eval_single_oracle, eval_batch_oracle,
+                                   eval_mcts_params, INFERENCE_BATCH_SIZE, gspec)
+
+    # Open wildbg backend
+    wb_backend = BackgammonNet.WildbgBackend(WILDBG_LIB_EVAL)
+    BackgammonNet.open_backend!(wb_backend)
+
+    # Store in session
+    EVAL_SESSION.iter = eval_iter
+    EVAL_SESSION.weights_version = weights_version
+    EVAL_SESSION.az_agent = az_agent
+    EVAL_SESSION.wildbg_backend = wb_backend
+    EVAL_SESSION.value_batch_oracle = value_batch_oracle
+
+    println("[EVAL] Session ready (iter=$eval_iter)")
+    flush(stdout)
+end
+
+"""Send heartbeat for an active eval chunk."""
+function send_eval_heartbeat(chunk_id::Int)
+    try
+        body = MsgPack.pack(Dict("chunk_id" => chunk_id, "client_name" => client.client_id))
+        HTTP.post("$(client.server_url)/api/eval/heartbeat",
+                  vcat(auth_headers(client), ["Content-Type" => "application/msgpack"]),
+                  body; status_exception=false, connect_timeout=5, readtimeout=10)
+    catch
+    end
+end
+
+"""Submit eval results for a completed chunk."""
+function submit_eval_results(chunk_id::Int, rewards, val_nn, val_opp, val_is_contact)
+    result = Dict(
+        "chunk_id" => chunk_id,
+        "client_name" => client.client_id,
+        "rewards" => rewards,
+        "value_nn" => val_nn,
+        "value_opp" => val_opp,
+        "value_is_contact" => val_is_contact,
+    )
+    body = MsgPack.pack(result)
+    for attempt in 1:3
+        try
+            resp = HTTP.post("$(client.server_url)/api/eval/submit",
+                             vcat(auth_headers(client), ["Content-Type" => "application/msgpack"]),
+                             body; status_exception=false, connect_timeout=10, readtimeout=30)
+            if resp.status == 200
+                data = JSON.parse(String(resp.body))
+                if get(data, "eval_complete", false)
+                    println("[EVAL] *** Eval complete for iter $(EVAL_SESSION.iter) ***")
+                end
+                return true
+            else
+                println("[EVAL] Submit failed (attempt $attempt): HTTP $(resp.status)")
+            end
+        catch e
+            println("[EVAL] Submit error (attempt $attempt): $e")
+        end
+        sleep(2^attempt)
+    end
+    return false
+end
+
+"""Process a single eval chunk (called from main loop between selfplay batches)."""
+function process_eval_chunk!(chunk_data::Dict)
+    EVAL_POSITIONS === nothing && return
+    isempty(WILDBG_LIB_EVAL) && return
+
+    chunk_id = Int(chunk_data["chunk_id"])
+    eval_iter = Int(chunk_data["eval_iter"])
+    weights_version = Int(chunk_data["weights_version"])
+    pos_start = Int(chunk_data["position_range_start"])
+    pos_end = Int(chunk_data["position_range_end"])
+    az_is_white = Bool(chunk_data["az_is_white"])
+    n_games = pos_end - pos_start + 1
+
+    println("[EVAL] Chunk $chunk_id: positions $pos_start-$pos_end ($(az_is_white ? "white" : "black")), iter=$eval_iter")
+    flush(stdout)
+
+    # Setup or refresh eval session if iter changed
+    if EVAL_SESSION.iter != eval_iter
+        setup_eval_session!(eval_iter, weights_version)
+    end
+
+    az_agent = EVAL_SESSION.az_agent
+    wb_agent = BackgammonNet.BackendAgent(EVAL_SESSION.wildbg_backend)
+    value_batch_oracle = EVAL_SESSION.value_batch_oracle
+
+    rewards = Vector{Float64}(undef, n_games)
+    val_nn = Float64[]
+    val_opp = Float64[]
+    val_is_contact = Bool[]
+    t0 = time()
+
+    for job in 1:n_games
+        pos_idx = pos_start + job - 1
+        if pos_idx > length(EVAL_POSITIONS)
+            rewards[job] = 0.0
+            continue
+        end
+        result = eval_game_from_position(
+            az_agent, wb_agent, EVAL_POSITIONS[pos_idx], value_batch_oracle;
+            seed=chunk_id * 10000 + job, az_is_white=az_is_white)
+        rewards[job] = result.reward
+        for s in result.value_samples
+            push!(val_nn, s.nn_val)
+            push!(val_opp, s.wb_val)
+            push!(val_is_contact, false)
+        end
+        # Heartbeat every 5 games
+        job % 5 == 0 && send_eval_heartbeat(chunk_id)
+    end
+
+    t_chunk = time() - t0
+    avg_reward = length(rewards) > 0 ? sum(rewards) / length(rewards) : 0.0
+    win_pct = length(rewards) > 0 ? count(r -> r > 0, rewards) / length(rewards) * 100 : 0.0
+    println("[EVAL] Chunk $chunk_id done: equity=$(round(avg_reward, digits=3)), win=$(round(win_pct, digits=1))%, $(round(t_chunk, digits=1))s")
+    flush(stdout)
+
+    submit_eval_results(chunk_id, rewards, val_nn, val_opp, val_is_contact)
+end
+
+# Dead function kept as reference — replaced by process_eval_chunk!()
+# The old check_and_do_eval!() polled the server, paused selfplay, ran eval, resumed.
+# Now eval work is pushed via upload response and processed between selfplay batches.
+function _check_and_do_eval_DEAD!()
+    return false  # DEAD CODE — left for reference, will be removed
     EVAL_POSITIONS === nothing && return false
     isempty(WILDBG_LIB_EVAL) && return false
-
-    # Check eval status
-    local eval_status
-    try
-        headers = auth_headers(client)
-        resp = HTTP.get("$(SERVER_URL)/api/eval/status", headers;
-                        status_exception=false, connect_timeout=10, readtimeout=30)
-        resp.status != 200 && (println("[EVAL] Status check returned $(resp.status): $(String(resp.body))"); return false)
         eval_status = JSON3.read(String(resp.body), Dict{String,Any})
     catch e
         println("[EVAL] Status check failed: $e")
@@ -1816,9 +1993,20 @@ function main_loop()
     batch_samples = []
     batch_games = 0
     t_batch_start = time()
-    last_eval_check = time()
 
     while true
+        # Process eval chunks first (prioritize eval over selfplay)
+        while isready(EVAL_CHANNEL)
+            chunk_data = take!(EVAL_CHANNEL)
+            try
+                process_eval_chunk!(chunk_data)
+            catch e
+                println("[EVAL] Chunk error: $e")
+                Base.showerror(stdout, e, catch_backtrace())
+                println()
+            end
+        end
+
         # Drain completed games from workers (blocking wait for first game)
         game_samples = take!(SAMPLE_CHANNEL)
         append!(batch_samples, game_samples)
@@ -1849,23 +2037,6 @@ function main_loop()
         batch = samples_to_batch(batch_samples)
         bytes = pack_samples(batch)
         put!(UPLOAD_CHANNEL, bytes)
-
-        # Periodic eval check (every 30 seconds)
-        if EVAL_CAPABLE && time() - last_eval_check > 30.0
-            last_eval_check = time()
-            try
-                println("[EVAL] Checking for eval work...")
-                flush(stdout)
-                check_and_do_eval!()
-            catch e
-                println("[EVAL] Check error: $e")
-                for (exc, bt) in Base.catch_stack()
-                    showerror(stdout, exc, bt)
-                    println()
-                end
-            end
-            last_eval_check = time()  # reset after eval completes (may take a while)
-        end
 
         # Reset batch
         batch_samples = []

@@ -23,6 +23,8 @@ mutable struct ClientStats
     client_type::String    # "julia" or "web"
     name::String
     git_commit::String
+    eval_capable::Bool
+    has_wildbg::Bool
     games_contributed::Int
     samples_contributed::Int
     first_seen::DateTime
@@ -105,6 +107,8 @@ function handle_register(req::HTTP.Request, state::ServerState)
         client_type = get(body, "client_type", "julia")
         name = get(body, "name", client_id)
         git_commit = get(body, "git_commit", "unknown")
+        eval_capable = get(body, "eval_capable", false)
+        has_wildbg = get(body, "has_wildbg", false)
 
         # Assign unique seed based on client count (deterministic, non-overlapping)
         assigned_seed = lock(state.clients_lock) do
@@ -112,10 +116,12 @@ function handle_register(req::HTTP.Request, state::ServerState)
             seed = state.config["seed"] + (n + 1) * 104729  # large prime stride
             state.clients[client_id] = ClientStats(
                 client_id, client_type, name, git_commit,
+                eval_capable, has_wildbg,
                 0, 0, now(), now(),
                 0.0, 0.0, 0.0, 0.0, 0.0
             )
-            println("[Server] Client registered: $name ($client_id) commit=$git_commit")
+            eval_str = eval_capable ? " [eval-capable$(has_wildbg ? "+wildbg" : "")]" : ""
+            println("[Server] Client registered: $name ($client_id) commit=$git_commit$eval_str")
             seed
         end
 
@@ -162,8 +168,30 @@ function handle_samples(req::HTTP.Request, state::ServerState, buffer::PERBuffer
             end
         end
 
-        resp = Dict("accepted" => Int(batch.n), "buffer_size" => buf_length(buffer),
+        resp = Dict{String,Any}("accepted" => Int(batch.n), "buffer_size" => buf_length(buffer),
                     "restart" => state.restart_clients[])
+
+        # Assign eval work to eval-capable clients
+        lock(EVAL_LOCK) do
+            job = EVAL_JOB[]
+            job === nothing && return
+            is_eval_client = lock(state.clients_lock) do
+                c = get(state.clients, client_id, nothing)
+                c !== nothing && c.eval_capable && c.has_wildbg
+            end
+            is_eval_client || return
+            chunk = EvalManager.checkout_chunk!(job, client_id)
+            chunk === nothing && return
+            resp["eval_chunk"] = Dict(
+                "chunk_id" => chunk.chunk_id,
+                "position_range_start" => first(chunk.position_range),
+                "position_range_end" => last(chunk.position_range),
+                "az_is_white" => chunk.az_is_white,
+                "weights_version" => job.weights_version,
+                "eval_iter" => job.iter,
+            )
+        end
+
         return HTTP.Response(200, ["Content-Type" => "application/json"], JSON.json(resp))
     catch e
         @warn "Error handling samples" exception=(e, catch_backtrace())
@@ -230,6 +258,8 @@ function handle_clients(req::HTTP.Request, state::ServerState)
             "type" => c.client_type,
             "name" => c.name,
             "git_commit" => c.git_commit,
+            "eval_capable" => c.eval_capable,
+            "has_wildbg" => c.has_wildbg,
             "games_contributed" => c.games_contributed,
             "samples_contributed" => c.samples_contributed,
             "first_seen" => Dates.format(c.first_seen, "yyyy-mm-dd HH:MM:SS"),

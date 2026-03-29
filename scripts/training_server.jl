@@ -976,8 +976,8 @@ const SERVER_CONFIG = Dict{String, Any}(
     "bearoff_hard_targets" => ARGS["bearoff_hard_targets"],
     "bearoff_truncation" => ARGS["bearoff_truncation"],
     "training_mode" => ARGS["training_mode"],
-    "start_positions_file" => ARGS["start_positions_file"],
-    "eval_positions_file" => ARGS["eval_positions_file"],
+    "start_positions_file" => basename(ARGS["start_positions_file"]),
+    "eval_positions_file" => basename(ARGS["eval_positions_file"]),
     "seed" => ARGS["seed"],
 )
 
@@ -1063,7 +1063,7 @@ function collect_server_stats()
     return stats
 end
 
-# Background task: expire stale eval checkouts and abandoned eval jobs
+# Background task: expire stale eval checkouts (no job timeout — jobs complete naturally)
 @async begin
     while true
         sleep(60)
@@ -1073,14 +1073,6 @@ end
             expired = EvalManager.expire_stale_checkouts!(job; lease_seconds=EVAL_CHECKOUT_LEASE)
             if expired > 0
                 println("Eval: expired $expired stale checkout(s) for iter $(job.iter)")
-            end
-            if time() - job.created_at > EVAL_JOB_TIMEOUT
-                n_done = count(c -> c.completed, job.chunks)
-                n_total = length(job.chunks)
-                if n_done < n_total
-                    println("WARNING: Eval job iter $(job.iter) timed out ($n_done/$n_total chunks). Abandoning.")
-                    EVAL_JOB[] = nothing
-                end
             end
         end
     end
