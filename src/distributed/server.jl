@@ -180,7 +180,7 @@ function handle_samples(req::HTTP.Request, state::ServerState, buffer::PERBuffer
                 c !== nothing && c.eval_capable && c.has_wildbg
             end
             is_eval_client || return
-            chunk = EvalManager.checkout_chunk!(job, client_id)
+            chunk = EvalManager.checkout_chunk!(job, String(client_id))
             chunk === nothing && return
             println("[Eval] Assigned chunk $(chunk.chunk_id) to $client_id (iter=$(job.iter))")
             resp["eval_chunk"] = Dict(
