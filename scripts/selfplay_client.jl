@@ -341,7 +341,6 @@ bear-off position.
 function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
     if table === nothing
         return nothing
-        end
     end
     if !BearoffK7.is_bearoff_position(game.p0, game.p1)
         return nothing
