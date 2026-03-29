@@ -1085,6 +1085,16 @@ const SAMPLES_PER_ITERATION = ARGS["games_per_iteration"] * 200  # ~200 samples 
 # libuv event loop stays active for HTTP.jl to handle requests.
 training_task = Threads.@spawn begin
 
+# Eval at iter 0 (bootstrap weights) — baseline before any self-play training
+if EVAL_ENABLED && START_ITER == 0
+    lock(EVAL_LOCK) do
+        wv = ARGS["training_mode"] == "race" ? server_state.race_version[] : server_state.contact_version[]
+        n_pos = length(EVAL_POSITIONS)
+        EVAL_JOB[] = EvalManager.create_eval_job(0, n_pos, wv; chunk_size=EVAL_CHUNK_SIZE)
+        println("Eval job created for iter 0 (bootstrap baseline): $(length(EVAL_JOB[].chunks)) chunks")
+    end
+end
+
 for iter in (START_ITER + 1):ARGS["total_iterations"]
     # Wait for enough new samples (offset by START_ITER so resume works)
     target_samples = (iter - START_ITER) * SAMPLES_PER_ITERATION
