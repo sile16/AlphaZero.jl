@@ -1660,6 +1660,7 @@ function main_loop()
     batch_num = 0
     batch_samples = []
     batch_games = 0
+    t_session_start = time()
     t_batch_start = time()
 
     while true
@@ -1699,9 +1700,9 @@ function main_loop()
         batch_num += 1
         n_samples = length(batch_samples)
         total_samples_collected += n_samples
-        t_play = time() - t_batch_start
-        gps = batch_games / max(t_play, 0.001)
-        println("Batch $batch_num: $batch_games games, $n_samples samples, $(round(gps, digits=1)) games/sec")
+        t_total = time() - t_session_start
+        avg_gps = games_played / max(t_total, 1.0)
+        println("Batch $batch_num: $batch_games games, $n_samples samples (avg $(round(avg_gps, digits=1)) games/sec)")
 
         # Queue upload + weight sync on background network thread (non-blocking)
         batch = samples_to_batch(batch_samples)
