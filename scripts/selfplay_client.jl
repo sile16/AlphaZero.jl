@@ -1676,6 +1676,9 @@ function main_loop()
         end
 
         # Drain completed games from workers (blocking wait for first game)
+        if batch_games == 0
+            t_batch_start = time()  # start timing from first game drain
+        end
         game_samples = take!(SAMPLE_CHANNEL)
         append!(batch_samples, game_samples)
         batch_games += 1
@@ -1697,8 +1700,7 @@ function main_loop()
         n_samples = length(batch_samples)
         total_samples_collected += n_samples
         t_play = time() - t_batch_start
-        gps = batch_games / t_play
-        sps = n_samples / t_play
+        gps = batch_games / max(t_play, 0.001)
         println("Batch $batch_num: $batch_games games, $n_samples samples, $(round(gps, digits=1)) games/sec")
 
         # Queue upload + weight sync on background network thread (non-blocking)
@@ -1709,7 +1711,6 @@ function main_loop()
         # Reset batch
         batch_samples = []
         batch_games = 0
-        t_batch_start = time()
         flush(stdout)
     end
 end
