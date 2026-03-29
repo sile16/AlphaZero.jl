@@ -1676,7 +1676,7 @@ function main_loop()
     t_batch_start = time()
 
     while true
-        # Process eval chunks first (prioritize eval over selfplay)
+        # Process eval chunks (prioritize eval over selfplay)
         while isready(EVAL_CHANNEL)
             chunk_data = take!(EVAL_CHANNEL)
             try
@@ -1688,25 +1688,29 @@ function main_loop()
             end
         end
 
-        # Drain completed games from workers (blocking wait for first game)
+        # Drain selfplay games — poll with timeout so we can check eval between waits
         if batch_games == 0
-            t_batch_start = time()  # start timing from first game drain
+            t_batch_start = time()
         end
-        game_samples = take!(SAMPLE_CHANNEL)
-        append!(batch_samples, game_samples)
-        batch_games += 1
-        games_played += 1
-
-        # Drain any other ready games
-        while batch_games < UPLOAD_INTERVAL && isready(SAMPLE_CHANNEL)
-            game_samples = take!(SAMPLE_CHANNEL)
-            append!(batch_samples, game_samples)
-            batch_games += 1
-            games_played += 1
-        end
-
-        if batch_games < UPLOAD_INTERVAL
-            continue
+        while batch_games < UPLOAD_INTERVAL
+            if isready(SAMPLE_CHANNEL)
+                game_samples = take!(SAMPLE_CHANNEL)
+                append!(batch_samples, game_samples)
+                batch_games += 1
+                games_played += 1
+            elseif isready(EVAL_CHANNEL)
+                # Eval work arrived while waiting for selfplay — process it
+                chunk_data = take!(EVAL_CHANNEL)
+                try
+                    process_eval_chunk!(chunk_data)
+                catch e
+                    println("[EVAL] Chunk error: $e")
+                    Base.showerror(stdout, e, catch_backtrace())
+                    println()
+                end
+            else
+                sleep(0.01)  # Brief sleep to avoid busy-wait
+            end
         end
 
         batch_num += 1
