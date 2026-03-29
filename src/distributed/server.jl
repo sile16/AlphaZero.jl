@@ -182,6 +182,7 @@ function handle_samples(req::HTTP.Request, state::ServerState, buffer::PERBuffer
             is_eval_client || return
             chunk = EvalManager.checkout_chunk!(job, client_id)
             chunk === nothing && return
+            println("[Eval] Assigned chunk $(chunk.chunk_id) to $client_id (iter=$(job.iter))")
             resp["eval_chunk"] = Dict(
                 "chunk_id" => chunk.chunk_id,
                 "position_range_start" => first(chunk.position_range),
