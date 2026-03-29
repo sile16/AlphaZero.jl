@@ -286,9 +286,19 @@ const BEAROFF_TABLE = let
         flush(stdout)
         t
     else
-        println("No local k=7 bear-off table — NN will handle bearoff positions")
-        flush(stdout)
-        nothing
+        # No local table — require remote bearoff server
+        try
+            resp = HTTP.get("$BEAROFF_SERVER_URL/bearoff/health"; connect_timeout=3, readtimeout=5, status_exception=false)
+            resp.status == 200 || error("Remote bearoff server returned $(resp.status)")
+            println("Using remote bearoff server at $BEAROFF_SERVER_URL (no local table)")
+            flush(stdout)
+            nothing  # Table is nothing; MCTS skips bearoff eval, training targets use game outcome
+        catch e
+            error("Bear-off unavailable. No local k=7 table and remote server unreachable.\n" *
+                  "  Searched: $(join(candidates, ", "))\n" *
+                  "  Remote: $BEAROFF_SERVER_URL ($e)\n" *
+                  "  Fix: copy bearoff_k7_twosided/ to ~/bearoff_k7_twosided/ or start bearoff server")
+        end
     end
 end
 

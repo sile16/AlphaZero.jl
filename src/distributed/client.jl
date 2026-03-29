@@ -53,10 +53,16 @@ end
 
 """Register and return (success, assigned_seed). Server assigns unique seed per client."""
 function register!(client::SelfPlayClient; name::String=client.client_id)
+    git_commit = try
+        strip(read(`git -C $(dirname(@__DIR__)) rev-parse --short HEAD`, String))
+    catch
+        "unknown"
+    end
     body = JSON.json(Dict(
         "client_id" => client.client_id,
         "client_type" => client.client_type,
         "name" => name,
+        "git_commit" => git_commit,
     ))
     resp = HTTP.post("$(client.server_url)/api/register",
                      auth_headers(client),

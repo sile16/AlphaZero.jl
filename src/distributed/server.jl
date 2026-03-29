@@ -22,6 +22,7 @@ mutable struct ClientStats
     client_id::String
     client_type::String    # "julia" or "web"
     name::String
+    git_commit::String
     games_contributed::Int
     samples_contributed::Int
     first_seen::DateTime
@@ -103,16 +104,18 @@ function handle_register(req::HTTP.Request, state::ServerState)
         client_id = get(body, "client_id", "unknown")
         client_type = get(body, "client_type", "julia")
         name = get(body, "name", client_id)
+        git_commit = get(body, "git_commit", "unknown")
 
         # Assign unique seed based on client count (deterministic, non-overlapping)
         assigned_seed = lock(state.clients_lock) do
             n = length(state.clients)
             seed = state.config["seed"] + (n + 1) * 104729  # large prime stride
             state.clients[client_id] = ClientStats(
-                client_id, client_type, name,
+                client_id, client_type, name, git_commit,
                 0, 0, now(), now(),
                 0.0, 0.0, 0.0, 0.0, 0.0
             )
+            println("[Server] Client registered: $name ($client_id) commit=$git_commit")
             seed
         end
 
@@ -226,6 +229,7 @@ function handle_clients(req::HTTP.Request, state::ServerState)
             "client_id" => c.client_id,
             "type" => c.client_type,
             "name" => c.name,
+            "git_commit" => c.git_commit,
             "games_contributed" => c.games_contributed,
             "samples_contributed" => c.samples_contributed,
             "first_seen" => Dates.format(c.first_seen, "yyyy-mm-dd HH:MM:SS"),
