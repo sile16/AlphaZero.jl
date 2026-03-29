@@ -1299,17 +1299,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         @info "Buffer checkpoint saved" path=buf_path elapsed=round(time()-t0, digits=1)
     end
 
-    # Distributed eval: create a non-blocking eval job for clients to work on
-    if EVAL_ENABLED && iter % EVAL_INTERVAL == 0
-        lock(EVAL_LOCK) do
-            wv = ARGS["training_mode"] == "race" ? server_state.race_version[] : server_state.contact_version[]
-            n_pos = length(EVAL_POSITIONS)
-            EVAL_JOB[] = EvalManager.create_eval_job(iter, n_pos, wv; chunk_size=EVAL_CHUNK_SIZE)
-            println("Eval job created for iter $iter: $(length(EVAL_JOB[].chunks)) chunks, $n_pos positions × 2 sides")
-        end
-    end
-
-    # Check if a previous eval job completed — finalize and log results
+    # Check if a previous eval job completed — finalize and log results BEFORE creating new job
     lock(EVAL_LOCK) do
         job = EVAL_JOB[]
         if job !== nothing && EvalManager.is_complete(job)
@@ -1325,6 +1315,16 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
                 @info "eval/games" value=result.num_games log_step_increment=0
             end
             EVAL_JOB[] = nothing
+        end
+    end
+
+    # Distributed eval: create a non-blocking eval job for clients to work on
+    if EVAL_ENABLED && iter % EVAL_INTERVAL == 0
+        lock(EVAL_LOCK) do
+            wv = ARGS["training_mode"] == "race" ? server_state.race_version[] : server_state.contact_version[]
+            n_pos = length(EVAL_POSITIONS)
+            EVAL_JOB[] = EvalManager.create_eval_job(iter, n_pos, wv; chunk_size=EVAL_CHUNK_SIZE)
+            println("Eval job created for iter $iter: $(length(EVAL_JOB[].chunks)) chunks, $n_pos positions × 2 sides")
         end
     end
 end
