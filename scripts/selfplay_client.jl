@@ -1479,9 +1479,19 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
     eval_contact_net = Network.copy(contact_network; on_gpu=false, test_mode=true)
     eval_race_net = Network.copy(race_network; on_gpu=false, test_mode=true)
     try
-        updated = sync_weights!(client, eval_contact_net, eval_race_net)
-        if !updated
-            println("[EVAL] WARNING: Failed to download eval weights")
+        # Download weights directly (bypass version check — always get latest)
+        result_c = download_weights(client, :contact)
+        if result_c !== nothing
+            FluxLib.load_weights!(eval_contact_net, result_c[2])
+            println("[EVAL] Downloaded contact weights v$(result_c[1].iteration)")
+        end
+        result_r = download_weights(client, :race)
+        if result_r !== nothing
+            FluxLib.load_weights!(eval_race_net, result_r[2])
+            println("[EVAL] Downloaded race weights v$(result_r[1].iteration)")
+        end
+        if result_c === nothing && result_r === nothing
+            println("[EVAL] WARNING: No weights available — using self-play weights copy")
         end
     catch e
         println("[EVAL] Weight download error: $e")
@@ -1522,7 +1532,7 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
                                    eval_mcts_params, INFERENCE_BATCH_SIZE, gspec)
 
     # Open wildbg backend
-    wb_backend = BackgammonNet.WildbgBackend(WILDBG_LIB_EVAL)
+    wb_backend = BackgammonNet.WildbgBackend(; lib_path=WILDBG_LIB_EVAL)
     BackgammonNet.open_backend!(wb_backend)
 
     # Store in session
