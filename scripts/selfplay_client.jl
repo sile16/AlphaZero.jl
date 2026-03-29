@@ -1476,8 +1476,8 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
     flush(stdout)
 
     # Create fresh networks and download eval weights
-    eval_contact_net = Network.copy(contact_network)
-    eval_race_net = Network.copy(race_network)
+    eval_contact_net = Network.copy(contact_network; on_gpu=false, test_mode=true)
+    eval_race_net = Network.copy(race_network; on_gpu=false, test_mode=true)
     try
         updated = sync_weights!(client, eval_contact_net, eval_race_net)
         if !updated
@@ -1495,9 +1495,8 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
 
     # Create eval oracles
     eval_cfg = AlphaZero.BackgammonInference.OracleConfig(
-        state_dim=STATE_DIM, num_actions=NUM_ACTIONS,
-        route_state=ORACLE_CFG.route_state,
-        vectorize_state=ORACLE_CFG.vectorize_state)
+        _state_dim, NUM_ACTIONS, gspec;
+        route_state=ORACLE_CFG.route_state)
     eval_oracles = AlphaZero.BackgammonInference.make_cpu_oracles(
         CPU_INFERENCE_BACKEND, eval_contact_net, eval_cfg;
         secondary_net=eval_race_net, batch_size=INFERENCE_BATCH_SIZE,
