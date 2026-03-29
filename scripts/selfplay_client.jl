@@ -142,9 +142,7 @@ client = SelfPlayClient(SERVER_URL, ARGS["api_key"];
                         client_id=client_name, upload_threshold=ARGS["upload_interval"] * 200)
 
 println("\nConnecting to server...")
-reg = register!(client; name=client_name,
-                eval_capable=EVAL_CAPABLE,
-                has_wildbg=!isempty(WILDBG_LIB_EVAL))
+reg = register!(client; name=client_name)
 if !reg.success
     error("Failed to register with server")
 end
@@ -1400,6 +1398,12 @@ if EVAL_CAPABLE
     else
         println("Eval: wildbg lib = $WILDBG_LIB_EVAL")
     end
+end
+
+# Re-register with eval capability now that WILDBG_LIB_EVAL is known
+if EVAL_CAPABLE
+    register!(client; name=client_name,
+              eval_capable=true, has_wildbg=!isempty(WILDBG_LIB_EVAL))
 end
 
 # Eval agent struct — holds a reusable MCTS player to avoid per-move allocation
