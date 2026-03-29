@@ -1182,7 +1182,29 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         # Server stats
         @info "server/gpu_percent" value=server_stats["gpu_percent"] log_step_increment=0
         @info "server/gpu_memory_gb" value=server_stats["gpu_memory_used_gb"] log_step_increment=0
-        @info "server/cpu_percent" value=server_stats["cpu_percent"] log_step_increment=1
+        @info "server/cpu_percent" value=server_stats["cpu_percent"] log_step_increment=0
+
+        # Buffer reward distribution (sanity check: gammon/backgammon rates)
+        n_buf = buf_length(replay_buffer)
+        if n_buf > 0
+            vals = @view replay_buffer.values[1:n_buf]
+            n_bg_loss = count(v -> v <= -2.5f0, vals)
+            n_g_loss  = count(v -> -2.5f0 < v <= -1.5f0, vals)
+            n_loss    = count(v -> -1.5f0 < v < -0.5f0, vals)
+            n_win     = count(v -> 0.5f0 < v < 1.5f0, vals)
+            n_g_win   = count(v -> 1.5f0 <= v < 2.5f0, vals)
+            n_bg_win  = count(v -> v >= 2.5f0, vals)
+            @info "buffer/reward_bg_loss" value=n_bg_loss/n_buf log_step_increment=0
+            @info "buffer/reward_g_loss" value=n_g_loss/n_buf log_step_increment=0
+            @info "buffer/reward_loss" value=n_loss/n_buf log_step_increment=0
+            @info "buffer/reward_win" value=n_win/n_buf log_step_increment=0
+            @info "buffer/reward_g_win" value=n_g_win/n_buf log_step_increment=0
+            @info "buffer/reward_bg_win" value=n_bg_win/n_buf log_step_increment=0
+            @info "buffer/gammon_rate" value=(n_g_loss+n_bg_loss+n_g_win+n_bg_win)/n_buf log_step_increment=0
+            @info "buffer/backgammon_rate" value=(n_bg_loss+n_bg_win)/n_buf log_step_increment=1
+        else
+            @info "placeholder" value=0 log_step_increment=1
+        end
     end
 
     # Bearoff accuracy: NN equity vs exact table targets on bearoff positions
