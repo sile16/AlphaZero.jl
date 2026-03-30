@@ -52,6 +52,10 @@ mutable struct ServerState
     race_onnx_bytes::Vector{UInt8}
     weight_lock::ReentrantLock
 
+    # Weight history: version → (contact_bytes, race_bytes)
+    # Kept alive while an eval job references that version
+    weight_history::Dict{Int, Tuple{Vector{UInt8}, Vector{UInt8}}}
+
     # Loss metrics
     contact_loss::Float64
     race_loss::Float64
@@ -79,6 +83,7 @@ function ServerState(; api_key::String, config::Dict{String, Any})
         Threads.Atomic{Int}(0), Threads.Atomic{Int}(0),
         UInt8[], UInt8[], UInt8[], UInt8[],
         ReentrantLock(),
+        Dict{Int, Tuple{Vector{UInt8}, Vector{UInt8}}}(),
         0.0, 0.0,
         Dict{String, ClientStats}(),
         ReentrantLock(),
@@ -202,15 +207,40 @@ end
 
 function handle_weights(req::HTTP.Request, state::ServerState, model::Symbol)
     check_auth(req, state) || return HTTP.Response(401, "Unauthorized")
+    # Parse ?version=N query param for pinned weight downloads (eval)
+    requested_version = nothing
+    query_str = split(req.target, "?"; limit=2)
+    if length(query_str) == 2
+        for param in split(query_str[2], "&")
+            kv = split(param, "="; limit=2)
+            if length(kv) == 2 && kv[1] == "version"
+                requested_version = tryparse(Int, kv[2])
+            end
+        end
+    end
+
     lock(state.weight_lock) do
-        bytes = model == :contact ? state.contact_weight_bytes : state.race_weight_bytes
-        isempty(bytes) && return HTTP.Response(404, "No weights available yet")
-        version = model == :contact ? state.contact_version[] : state.race_version[]
-        return HTTP.Response(200,
-            ["Content-Type" => "application/octet-stream",
-             "X-Iteration" => string(state.iteration[]),
-             "X-Version" => string(version)],
-            bytes)
+        if requested_version !== nothing
+            # Serve pinned version from history (for eval)
+            entry = get(state.weight_history, requested_version, nothing)
+            entry === nothing && return HTTP.Response(404, "Weight version $requested_version not available")
+            bytes = model == :contact ? entry[1] : entry[2]
+            return HTTP.Response(200,
+                ["Content-Type" => "application/octet-stream",
+                 "X-Iteration" => string(state.iteration[]),
+                 "X-Version" => string(requested_version)],
+                bytes)
+        else
+            # Serve latest (normal self-play sync)
+            bytes = model == :contact ? state.contact_weight_bytes : state.race_weight_bytes
+            isempty(bytes) && return HTTP.Response(404, "No weights available yet")
+            version = model == :contact ? state.contact_version[] : state.race_version[]
+            return HTTP.Response(200,
+                ["Content-Type" => "application/octet-stream",
+                 "X-Iteration" => string(state.iteration[]),
+                 "X-Version" => string(version)],
+                bytes)
+        end
     end
 end
 
@@ -562,6 +592,31 @@ function update_weight_cache!(state::ServerState, contact_network, race_network;
         state.race_weight_bytes = serialize_weights_with_header(race_network, race_header)
         Threads.atomic_add!(state.contact_version, 1)
         Threads.atomic_add!(state.race_version, 1)
+
+        # Stash current weights in history (version is post-increment)
+        cv = state.contact_version[]
+        state.weight_history[cv] = (copy(state.contact_weight_bytes), copy(state.race_weight_bytes))
+
+        # Prune history: keep only versions referenced by active eval job
+        prune_weight_history!(state)
+    end
+end
+
+"""Remove weight history entries not needed by any active eval job. Must hold weight_lock."""
+function prune_weight_history!(state::ServerState)
+    needed = Set{Int}()
+    # Always keep the latest version
+    needed_latest = max(state.contact_version[], state.race_version[])
+    push!(needed, needed_latest)
+    # Keep version referenced by active eval job
+    job = EVAL_JOB[]
+    if job !== nothing
+        push!(needed, job.weights_version)
+    end
+    for v in keys(state.weight_history)
+        if v ∉ needed
+            delete!(state.weight_history, v)
+        end
     end
 end
 

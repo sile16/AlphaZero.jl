@@ -1475,26 +1475,27 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
     println("[EVAL] Setting up eval session for iter $eval_iter (weights v$weights_version)")
     flush(stdout)
 
-    # Create fresh networks and download eval weights
+    # Create fresh networks and download eval weights pinned to the exact version
     eval_contact_net = Network.copy(contact_network; on_gpu=false, test_mode=true)
     eval_race_net = Network.copy(race_network; on_gpu=false, test_mode=true)
     try
-        # Download weights directly (bypass version check — always get latest)
-        result_c = download_weights(client, :contact)
+        # Download weights pinned to the eval job's version — ensures all chunks
+        # for an eval iteration use the same checkpoint
+        result_c = download_weights(client, :contact; pinned_version=weights_version)
         if result_c !== nothing
             FluxLib.load_weights!(eval_contact_net, result_c[2])
-            println("[EVAL] Downloaded contact weights v$(result_c[1].iteration)")
+            println("[EVAL] Downloaded contact weights v$weights_version")
         end
-        result_r = download_weights(client, :race)
+        result_r = download_weights(client, :race; pinned_version=weights_version)
         if result_r !== nothing
             FluxLib.load_weights!(eval_race_net, result_r[2])
-            println("[EVAL] Downloaded race weights v$(result_r[1].iteration)")
+            println("[EVAL] Downloaded race weights v$weights_version")
         end
         if result_c === nothing && result_r === nothing
-            println("[EVAL] WARNING: No weights available — using self-play weights copy")
+            println("[EVAL] WARNING: No weights v$weights_version available — using self-play weights copy")
         end
     catch e
-        println("[EVAL] Weight download error: $e")
+        println("[EVAL] Weight download error (v$weights_version): $e")
     end
 
     # Create FastWeights for eval
@@ -1609,8 +1610,9 @@ function process_eval_chunk!(chunk_data::Dict)
     println("[EVAL] Chunk $chunk_id: positions $pos_start-$pos_end ($(az_is_white ? "white" : "black")), iter=$eval_iter")
     flush(stdout)
 
-    # Setup or refresh eval session if iter changed or not initialized
-    if EVAL_SESSION.az_agent === nothing || EVAL_SESSION.iter != eval_iter
+    # Setup or refresh eval session if iter or weights version changed
+    if EVAL_SESSION.az_agent === nothing || EVAL_SESSION.iter != eval_iter ||
+       EVAL_SESSION.weights_version != weights_version
         setup_eval_session!(eval_iter, weights_version)
     end
 

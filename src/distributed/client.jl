@@ -106,10 +106,15 @@ function check_weight_version(client::SelfPlayClient)
 end
 
 """Download weights for a model. Returns (header, weight_arrays) or nothing."""
-function download_weights(client::SelfPlayClient, model::Symbol; expected_version::Union{Nothing, Int}=nothing)
+function download_weights(client::SelfPlayClient, model::Symbol;
+                          expected_version::Union{Nothing, Int}=nothing,
+                          pinned_version::Union{Nothing, Int}=nothing)
     endpoint = model == :contact ? "contact" : "race"
-    resp = HTTP.get("$(client.server_url)/api/weights/$endpoint",
-                    auth_headers(client);
+    url = "$(client.server_url)/api/weights/$endpoint"
+    if pinned_version !== nothing
+        url *= "?version=$pinned_version"
+    end
+    resp = HTTP.get(url, auth_headers(client);
                     status_exception=false,
                     connect_timeout=10, readtimeout=120)
     if resp.status != 200

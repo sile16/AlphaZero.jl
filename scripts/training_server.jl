@@ -1090,6 +1090,14 @@ training_task = Threads.@spawn begin
 if EVAL_ENABLED && START_ITER == 0
     lock(EVAL_LOCK) do
         wv = ARGS["training_mode"] == "race" ? server_state.race_version[] : server_state.contact_version[]
+        # Pin current weights in history so eval clients can download by version
+        lock(server_state.weight_lock) do
+            if !haskey(server_state.weight_history, wv) &&
+               !isempty(server_state.contact_weight_bytes) && !isempty(server_state.race_weight_bytes)
+                server_state.weight_history[wv] = (copy(server_state.contact_weight_bytes),
+                                                    copy(server_state.race_weight_bytes))
+            end
+        end
         n_pos = length(EVAL_POSITIONS)
         EVAL_JOB[] = EvalManager.create_eval_job(0, n_pos, wv; chunk_size=EVAL_CHUNK_SIZE)
         println("Eval job created for iter 0 (bootstrap baseline): $(length(EVAL_JOB[].chunks)) chunks")
