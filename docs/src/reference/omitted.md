@@ -16,12 +16,9 @@ Batchifier.client_done!
 Batchifier.BatchedOracle
 ```
 
-## KnetLib and FluxLib
+## FluxLib
 
 ```@docs
-#KnetLib
-#KnetLib.KNetwork
-#KnetLib.TwoHeadNetwork
 FluxLib
 FluxLib.FluxNetwork
 FluxLib.TwoHeadNetwork

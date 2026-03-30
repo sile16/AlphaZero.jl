@@ -12,23 +12,17 @@ On this page, we describe some key features of AlphaZero.jl:
   - Generic interfaces for games and neural networks
   - A simple user interface to get started quickly and diagnose problems
 
-### Asynchronous and Distributed Simulations
+### Batched MCTS and Distributed Training
 
-A key aspect of generating self-play data efficiently is to simulate a large number of games asynchronously and batch requests to the neural network across all simulations. Indeed,
-evaluating board positions one at a time would be terribly slow and lead to low GPU
-utilization.
+A key aspect of generating self-play data efficiently is to simulate a large number
+of games and batch neural network evaluations across MCTS simulations. AlphaZero.jl
+provides a `BatchedMCTS` module that runs multiple MCTS simulations in lockstep,
+collecting leaf positions into a single batch for efficient CPU or GPU inference.
 
-Thanks to Julia's great [abstractions](https://docs.julialang.org/en/v1/manual/asynchronous-programming/) for asynchronous programming, the complexity of dealing with asynchronous simulations and batching is factored out in a single place and does not
-affect most of the codebase. In particular, the standalone [MCTS module](@ref mcts) does
-not have to deal with batching and can be implemented in a straightforward,
-textbook fashion.
-
-Moreover, leveraging Julia's [Distributed](https://docs.julialang.org/en/v1/manual/distributed-computing/) module, simulations are automatically distributed over all
-available Julia processes. This makes it possible to train an agent on a cluster of
-machines as easily as on a single computer, without writing any additional code.
-This capability was demonstrated during Julia Computing's
-[sponsor talk](https://www.youtube.com/watch?v=JVUJ5Oohuhs) at
-JuliaCon 2020.
+Training uses an HTTP-based distributed architecture: a training server (with GPU)
+manages the replay buffer and runs gradient updates, while self-play clients
+generate games using CPU inference and upload samples. This scales from a single
+machine (server + client on localhost) to multiple machines over a network.
 
 ### Training Optimizations
 
@@ -57,11 +51,10 @@ your own game.
 
 ### Network Interface
 
-AlphaZero.jl is agnostic to the choice of deep learning framework and allows you
-to plug any neural network that implements the [Network Interface](@ref
-network_interface). For convenience, we provide a [library](@ref
-networks_library) of standard networks based on Knet. Right now, it features
-templates for two-headed [multi-layer perceptrons](@ref simplenet) and
+AlphaZero.jl allows you to plug any neural network that implements the
+[Network Interface](@ref network_interface). We provide a [library](@ref
+networks_library) of standard Flux-based networks, including two-headed
+[multi-layer perceptrons](@ref simplenet) and
 [convolutional resnets](@ref conv_resnet).
 
 ### User Interface and Utilities

@@ -1,13 +1,15 @@
 #####
-##### Unified Game Loop
-##### Single play_game() function replacing 5 duplicate game loops
+##### Game Loop (used by eval scripts)
 #####
 
 """
-Unified game loop module for AlphaZero.jl.
+Game loop module for AlphaZero.jl evaluation scripts.
 
-Provides a single `play_game()` function that handles:
-- Self-play (training data collection with trace recording)
+Provides `play_game()` for sequential eval games (vs wildbg, GnuBG, etc.).
+NOT used for self-play training — the selfplay client uses direct BatchedMCTS
+calls in `_play_games_loop` to avoid per-move allocation overhead under threading.
+
+Features:
 - Evaluation vs external agents (wildbg, GnuBG)
 - Value comparison recording (NN vs opponent)
 - Bear-off detection and truncation
