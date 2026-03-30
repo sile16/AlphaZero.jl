@@ -29,12 +29,12 @@ mutable struct ClientStats
     samples_contributed::Int
     first_seen::DateTime
     last_seen::DateTime
-    # Performance metrics (updated via POST /api/client_stats)
-    cpu_percent::Float64
-    memory_used_gb::Float64
-    memory_total_gb::Float64
-    games_per_sec::Float64
-    samples_per_sec::Float64
+end
+
+"""Compute samples/sec for a client from its contribution history."""
+function client_samples_per_sec(c::ClientStats)
+    elapsed = Dates.value(c.last_seen - c.first_seen) / 1000.0  # seconds
+    elapsed < 1.0 ? 0.0 : c.samples_contributed / elapsed
 end
 
 mutable struct ServerState
@@ -122,8 +122,7 @@ function handle_register(req::HTTP.Request, state::ServerState)
             state.clients[client_id] = ClientStats(
                 client_id, client_type, name, git_commit,
                 eval_capable, has_wildbg,
-                0, 0, now(), now(),
-                0.0, 0.0, 0.0, 0.0, 0.0
+                0, 0, now(), now()
             )
             eval_str = eval_capable ? " [eval-capable$(has_wildbg ? "+wildbg" : "")]" : ""
             println("[Server] Client registered: $name ($client_id) commit=$git_commit$eval_str")
@@ -295,38 +294,10 @@ function handle_clients(req::HTTP.Request, state::ServerState)
             "samples_contributed" => c.samples_contributed,
             "first_seen" => Dates.format(c.first_seen, "yyyy-mm-dd HH:MM:SS"),
             "last_seen" => Dates.format(c.last_seen, "yyyy-mm-dd HH:MM:SS"),
-            "cpu_percent" => c.cpu_percent,
-            "memory_used_gb" => c.memory_used_gb,
-            "memory_total_gb" => c.memory_total_gb,
-            "games_per_sec" => c.games_per_sec,
-            "samples_per_sec" => c.samples_per_sec,
+            "samples_per_sec" => round(client_samples_per_sec(c), digits=1),
         ) for c in values(state.clients)]
     end
     return HTTP.Response(200, ["Content-Type" => "application/json"], JSON.json(clients))
-end
-
-function handle_client_stats(req::HTTP.Request, state::ServerState)
-    check_auth(req, state) || return HTTP.Response(401, "Unauthorized")
-    try
-        body = JSON.parse(String(req.body))
-        client_id = get(body, "client_id", "unknown")
-
-        lock(state.clients_lock) do
-            if haskey(state.clients, client_id)
-                c = state.clients[client_id]
-                c.cpu_percent = Float64(get(body, "cpu_percent", 0.0))
-                c.memory_used_gb = Float64(get(body, "memory_used_gb", 0.0))
-                c.memory_total_gb = Float64(get(body, "memory_total_gb", 0.0))
-                c.games_per_sec = Float64(get(body, "games_per_sec", 0.0))
-                c.samples_per_sec = Float64(get(body, "samples_per_sec", 0.0))
-                c.last_seen = now()
-            end
-        end
-
-        return HTTP.Response(200, JSON.json(Dict("ok" => true)))
-    catch e
-        return HTTP.Response(400, "Bad request: $e")
-    end
 end
 
 function handle_restart_clients(req::HTTP.Request, state::ServerState)
@@ -349,18 +320,15 @@ function get_cluster_stats(state::ServerState)
     lock(state.clients_lock) do
         cutoff = now() - Dates.Minute(5)
         active_clients = filter(c -> c.last_seen >= cutoff, collect(values(state.clients)))
-        total_gps = sum(c.games_per_sec for c in active_clients; init=0.0)
-        total_sps = sum(c.samples_per_sec for c in active_clients; init=0.0)
+        total_sps = sum(client_samples_per_sec(c) for c in active_clients; init=0.0)
         n_active = length(active_clients)
         per_client = Dict{String, Dict{String, Float64}}()
         for c in active_clients
             per_client[c.client_id] = Dict(
-                "games_per_sec" => c.games_per_sec,
-                "cpu_percent" => c.cpu_percent,
+                "samples_per_sec" => round(client_samples_per_sec(c), digits=1),
             )
         end
-        return (total_games_per_sec=total_gps, total_samples_per_sec=total_sps,
-                total_clients=n_active, per_client=per_client)
+        return (total_samples_per_sec=total_sps, total_clients=n_active, per_client=per_client)
     end
 end
 
@@ -541,7 +509,7 @@ function create_router(state::ServerState, buffer::PERBuffer)
     HTTP.register!(router, "GET", "/api/weights/version", req -> handle_weights_version(req, state))
     HTTP.register!(router, "GET", "/api/status", req -> handle_status(req, state, buffer))
     HTTP.register!(router, "GET", "/api/clients", req -> handle_clients(req, state))
-    HTTP.register!(router, "POST", "/api/client_stats", req -> handle_client_stats(req, state))
+    # /api/client_stats removed — samples_per_sec computed server-side
     HTTP.register!(router, "POST", "/api/restart-clients", req -> handle_restart_clients(req, state))
     HTTP.register!(router, "POST", "/api/cancel-restart", req -> handle_cancel_restart(req, state))
 
@@ -630,11 +598,7 @@ function save_client_stats(state::ServerState, path::String)
             "samples_contributed" => c.samples_contributed,
             "first_seen" => Dates.format(c.first_seen, "yyyy-mm-dd HH:MM:SS"),
             "last_seen" => Dates.format(c.last_seen, "yyyy-mm-dd HH:MM:SS"),
-            "cpu_percent" => c.cpu_percent,
-            "memory_used_gb" => c.memory_used_gb,
-            "memory_total_gb" => c.memory_total_gb,
-            "games_per_sec" => c.games_per_sec,
-            "samples_per_sec" => c.samples_per_sec,
+            "samples_per_sec" => round(client_samples_per_sec(c), digits=1),
         ) for (id, c) in state.clients)
         open(path, "w") do f
             JSON.print(f, clients, 2)
