@@ -980,6 +980,7 @@ const SERVER_CONFIG = Dict{String, Any}(
     "start_positions_file" => basename(ARGS["start_positions_file"]),
     "eval_positions_file" => basename(ARGS["eval_positions_file"]),
     "seed" => ARGS["seed"],
+    "eval_mcts_iters" => ARGS["eval_mcts_iters"],
 )
 
 # Initialize server state

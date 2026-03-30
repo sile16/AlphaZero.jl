@@ -106,7 +106,6 @@ const NUM_WORKERS = ARGS["num_workers"] > 0 ? ARGS["num_workers"] : Threads.nthr
 const GPU_WORKERS = ARGS["gpu_workers"]
 const USE_GPU = GPU_WORKERS > 0
 const EVAL_CAPABLE = ARGS["eval_capable"]
-const EVAL_MCTS_ITERS = ARGS["eval_mcts_iters"]
 
 println("=" ^ 60)
 println("AlphaZero Self-Play Client")
@@ -180,6 +179,8 @@ const RACE_BLOCKS = Int(config["race_blocks"])
 const MCTS_ITERS = Int(config["mcts_iters"])
 const INFERENCE_BATCH_SIZE = Int(config["inference_batch_size"])
 const NUM_ACTIONS = Int(config["num_actions"])
+# Eval MCTS iters: prefer server config, fall back to CLI arg
+const EVAL_MCTS_ITERS = Int(get(config, "eval_mcts_iters", ARGS["eval_mcts_iters"]))
 
 # Temperature scheduling
 const TEMP_MOVE_CUTOFF = Int(get(config, "temp_move_cutoff", 20))
