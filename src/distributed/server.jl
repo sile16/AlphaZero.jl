@@ -175,7 +175,7 @@ function handle_samples(req::HTTP.Request, state::ServerState, buffer::PERBuffer
         resp = Dict{String,Any}("accepted" => Int(batch.n), "buffer_size" => buf_length(buffer),
                     "restart" => state.restart_clients[])
 
-        # Assign eval work to eval-capable clients
+        # Assign eval work to eval-capable clients (one chunk at a time per client)
         lock(EVAL_LOCK) do
             job = EVAL_JOB[]
             job === nothing && return
@@ -184,7 +184,11 @@ function handle_samples(req::HTTP.Request, state::ServerState, buffer::PERBuffer
                 c !== nothing && c.eval_capable && c.has_wildbg
             end
             is_eval_client || return
-            chunk = EvalManager.checkout_chunk!(job, String(client_id))
+            # Don't assign if this client already has a checked-out chunk
+            cid_str = String(client_id)
+            has_checkout = any(c -> c.checked_out_by == cid_str && !c.completed, job.chunks)
+            has_checkout && return
+            chunk = EvalManager.checkout_chunk!(job, cid_str)
             chunk === nothing && return
             println("[Eval] Assigned chunk $(chunk.chunk_id) to $client_id (iter=$(job.iter))")
             resp["eval_chunk"] = Dict(
@@ -337,8 +341,8 @@ end
 const EVAL_JOB = Ref{Union{Nothing, EvalManager.EvalJob}}(nothing)
 const EVAL_LOCK = ReentrantLock()
 const EVAL_CHUNK_SIZE = 100         # 100 games per chunk → 20 chunks for 2000 games
-const EVAL_CHECKOUT_LEASE = 1200.0  # 20 minutes per chunk (was 5 min — insufficient for 600 MCTS)
-const EVAL_JOB_TIMEOUT = 3600.0    # 60 minutes total (was 30 min)
+const EVAL_CHECKOUT_LEASE = 300.0   # 5 minutes — heartbeats extend; expires if client dies
+const EVAL_JOB_TIMEOUT = 7200.0    # 2 hours total — eval completes naturally, never replaced mid-run
 
 # --- Distributed Eval Handlers ---
 

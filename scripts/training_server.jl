@@ -1325,13 +1325,27 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         end
     end
 
-    # Distributed eval: create a non-blocking eval job for clients to work on
+    # Distributed eval: create a non-blocking eval job for clients to work on.
+    # Never replace a running eval — let it finish so results are valid.
     if EVAL_ENABLED && iter % EVAL_INTERVAL == 0
         lock(EVAL_LOCK) do
-            wv = ARGS["training_mode"] == "race" ? server_state.race_version[] : server_state.contact_version[]
-            n_pos = length(EVAL_POSITIONS)
-            EVAL_JOB[] = EvalManager.create_eval_job(iter, n_pos, wv; chunk_size=EVAL_CHUNK_SIZE)
-            println("Eval job created for iter $iter: $(length(EVAL_JOB[].chunks)) chunks, $n_pos positions × 2 sides")
+            if EVAL_JOB[] !== nothing
+                st = EvalManager.status(EVAL_JOB[])
+                println("Eval iter $(EVAL_JOB[].iter) still running ($(st.completed)/$(st.total_chunks) chunks) — skipping eval at iter $iter")
+            else
+                wv = ARGS["training_mode"] == "race" ? server_state.race_version[] : server_state.contact_version[]
+                n_pos = length(EVAL_POSITIONS)
+                EVAL_JOB[] = EvalManager.create_eval_job(iter, n_pos, wv; chunk_size=EVAL_CHUNK_SIZE)
+                # Pin weights in history for eval clients
+                lock(server_state.weight_lock) do
+                    if !haskey(server_state.weight_history, wv) &&
+                       !isempty(server_state.contact_weight_bytes) && !isempty(server_state.race_weight_bytes)
+                        server_state.weight_history[wv] = (copy(server_state.contact_weight_bytes),
+                                                            copy(server_state.race_weight_bytes))
+                    end
+                end
+                println("Eval job created for iter $iter: $(length(EVAL_JOB[].chunks)) chunks, $n_pos positions × 2 sides")
+            end
         end
     end
 end

@@ -1152,7 +1152,7 @@ const UPLOAD_INTERVAL = ARGS["upload_interval"]
 # Single background network thread handles uploads AND weight sync.
 # HTTP.jl deadlocks with multiple concurrent spawned threads doing HTTP.
 const UPLOAD_CHANNEL = Channel{Vector{UInt8}}(8)
-const EVAL_CHANNEL = Channel{Dict{String,Any}}(4)  # eval chunks from server upload response
+const EVAL_CHANNEL = Channel{Dict{String,Any}}(40)  # eval chunks from server upload response
 Threads.@spawn begin
     while true
         # Block waiting for upload data
@@ -1178,12 +1178,8 @@ Threads.@spawn begin
                 # Queue eval work if server assigned a chunk
                 eval_chunk = get(result, "eval_chunk", nothing)
                 if eval_chunk !== nothing
-                    if isready(EVAL_CHANNEL)
-                        println("  [EVAL] Chunk offered but channel full, skipping")
-                    else
-                        put!(EVAL_CHANNEL, Dict{String,Any}(eval_chunk))
-                        println("  [EVAL] Chunk $(eval_chunk["chunk_id"]) queued (iter=$(eval_chunk["eval_iter"]))")
-                    end
+                    put!(EVAL_CHANNEL, Dict{String,Any}(eval_chunk))
+                    println("  [EVAL] Chunk $(eval_chunk["chunk_id"]) queued (iter=$(eval_chunk["eval_iter"]))")
                 end
             else
                 println("  Upload failed: $(resp.status)")
