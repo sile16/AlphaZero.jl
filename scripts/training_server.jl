@@ -1189,14 +1189,12 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         @info "train/gradient_steps" value=(train_result.contact.num_batches + train_result.race.num_batches) log_step_increment=0
 
         # Cluster performance
-        @info "cluster/total_games_per_sec" value=cluster_stats.total_games_per_sec log_step_increment=0
         @info "cluster/total_samples_per_sec" value=cluster_stats.total_samples_per_sec log_step_increment=0
         @info "cluster/total_clients" value=cluster_stats.total_clients log_step_increment=0
 
-        # Per-client stats
+        # Per-client samples/sec
         for (cid, cstats) in cluster_stats.per_client
-            @info "client/$(cid)/games_per_sec" value=cstats["games_per_sec"] log_step_increment=0
-            @info "client/$(cid)/cpu_percent" value=cstats["cpu_percent"] log_step_increment=0
+            @info "client/$(cid)/samples_per_sec" value=cstats["samples_per_sec"] log_step_increment=0
         end
 
         # Server stats
