@@ -567,12 +567,14 @@ end
 ##### CPU inference backend
 #####
 
-# Extract FastWeights only when the selected CPU backend uses them
-const CONTACT_FAST_WEIGHTS = CPU_INFERENCE_BACKEND == :fast ? AlphaZero.FastInference.extract_fast_weights(contact_network) : nothing
-const RACE_FAST_WEIGHTS = CPU_INFERENCE_BACKEND == :fast ? AlphaZero.FastInference.extract_fast_weights(race_network) : nothing
+# Extract FastWeights wrapped in Ref for lock-free atomic swap on weight updates.
+# Oracle closures capture the Ref and dereference each call, so workers always
+# see the latest weights after a swap with zero synchronization overhead.
+const CONTACT_FAST_WEIGHTS = CPU_INFERENCE_BACKEND == :fast ? Ref(AlphaZero.FastInference.extract_fast_weights(contact_network)) : nothing
+const RACE_FAST_WEIGHTS = CPU_INFERENCE_BACKEND == :fast ? Ref(AlphaZero.FastInference.extract_fast_weights(race_network)) : nothing
 if CPU_INFERENCE_BACKEND == :fast
-    println("Fast forward (contact): $(CONTACT_FAST_WEIGHTS.num_blocks) res blocks, $(CONTACT_FAST_WEIGHTS.num_policy_layers) policy layers")
-    println("Fast forward (race): $(RACE_FAST_WEIGHTS.num_blocks) res blocks, $(RACE_FAST_WEIGHTS.num_policy_layers) policy layers")
+    println("Fast forward (contact): $(CONTACT_FAST_WEIGHTS[].num_blocks) res blocks, $(CONTACT_FAST_WEIGHTS[].num_policy_layers) policy layers")
+    println("Fast forward (race): $(RACE_FAST_WEIGHTS[].num_blocks) res blocks, $(RACE_FAST_WEIGHTS[].num_policy_layers) policy layers")
 end
 
 const CPU_ORACLES = if CPU_INFERENCE_BACKEND == :fast
@@ -605,8 +607,11 @@ const GPU_ORACLE_SERVER = USE_GPU ? GPU_ORACLES[3] : nothing
 
 function refresh_fast_weights!()
     if CPU_INFERENCE_BACKEND == :fast
-        AlphaZero.FastInference.refresh_fast_weights!(CONTACT_FAST_WEIGHTS, contact_network)
-        AlphaZero.FastInference.refresh_fast_weights!(RACE_FAST_WEIGHTS, race_network)
+        # Atomic swap: create new FastWeights and swap the Ref contents.
+        # Workers hold the old FastWeights for their current batch and pick up
+        # the new one on their next oracle call. No locks, no data races.
+        CONTACT_FAST_WEIGHTS[] = AlphaZero.FastInference.extract_fast_weights(contact_network)
+        RACE_FAST_WEIGHTS[] = AlphaZero.FastInference.extract_fast_weights(race_network)
     end
 
     # Also update GPU networks if enabled

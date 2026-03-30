@@ -315,8 +315,8 @@ function make_cpu_oracles(backend::Union{Symbol, AbstractString},
                           cfg::OracleConfig;
                           secondary_net=nothing,
                           batch_size::Int,
-                          primary_fw::Union{FastWeights, Nothing}=nothing,
-                          secondary_fw::Union{FastWeights, Nothing}=nothing,
+                          primary_fw::Union{FastWeights, Ref{FastWeights}, Nothing}=nothing,
+                          secondary_fw::Union{FastWeights, Ref{FastWeights}, Nothing}=nothing,
                           nslots::Int=Threads.nthreads())
     resolved = resolve_cpu_backend(backend)
     dual = secondary_net !== nothing || secondary_fw !== nothing
@@ -360,25 +360,38 @@ function make_cpu_oracles(backend::Union{Symbol, AbstractString},
         return flux_single_oracle, flux_batch_oracle
     end
 
+    # Unwrap Ref{FastWeights} for sizing, but keep Ref for closure capture
+    _unwrap_fw(fw::FastWeights) = fw
+    _unwrap_fw(fw::Ref{FastWeights}) = fw[]
+    _unwrap_fw(::Nothing) = nothing
+
     primary_fw = isnothing(primary_fw) ? extract_fast_weights(primary_net) : primary_fw
     if dual
         secondary_fw = isnothing(secondary_fw) ? extract_fast_weights(secondary_net) : secondary_fw
     end
-    primary_width = size(primary_fw.W_in, 1)
-    secondary_width = dual ? size(secondary_fw.W_in, 1) : nothing
+    primary_width = size(_unwrap_fw(primary_fw).W_in, 1)
+    secondary_width = dual ? size(_unwrap_fw(secondary_fw).W_in, 1) : nothing
     task_buffers = _task_buffer_resolver() do
         _new_fast_worker_buffers(cfg, batch_size, primary_width; secondary_width)
     end
 
+    # Capture primary_fw/secondary_fw (may be Ref or raw FastWeights).
+    # Dereference Ref each call so workers always see the latest weights
+    # after an atomic swap, with zero lock overhead.
+    _pfw = primary_fw
+    _sfw = secondary_fw
+
     function fast_batch_oracle(states::Vector)
         n = length(states)
         n == 0 && return Tuple{Vector{Float32}, Float32}[]
+        pfw = _unwrap_fw(_pfw)
+        sfw = _unwrap_fw(_sfw)
         worker = task_buffers()
         scratch = worker.scratch
         n_primary, n_secondary = _pack_states!(scratch, states, cfg)
-        _forward_fast!(scratch, primary_fw, worker.primary_fast, scratch.primary_input, scratch.primary_idxs, n_primary, cfg)
+        _forward_fast!(scratch, pfw, worker.primary_fast, scratch.primary_input, scratch.primary_idxs, n_primary, cfg)
         if dual
-            _forward_fast!(scratch, secondary_fw, worker.secondary_fast, scratch.secondary_input, scratch.secondary_idxs, n_secondary, cfg)
+            _forward_fast!(scratch, sfw, worker.secondary_fast, scratch.secondary_input, scratch.secondary_idxs, n_secondary, cfg)
         end
         return @view(scratch.results[1:n])
     end
