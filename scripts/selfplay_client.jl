@@ -84,9 +84,9 @@ function parse_args()
             help = "Enable eval mode (client does eval when server has eval jobs)"
             action = :store_true
         "--eval-mcts-iters"
-            help = "MCTS iterations for eval games"
+            help = "DEPRECATED — now controlled by server config"
             arg_type = Int
-            default = 600
+            default = 0
         "--wildbg-lib"
             help = "Path to wildbg shared library (for eval)"
             arg_type = String
@@ -179,8 +179,7 @@ const RACE_BLOCKS = Int(config["race_blocks"])
 const MCTS_ITERS = Int(config["mcts_iters"])
 const INFERENCE_BATCH_SIZE = Int(config["inference_batch_size"])
 const NUM_ACTIONS = Int(config["num_actions"])
-# Eval MCTS iters: prefer server config, fall back to CLI arg
-const EVAL_MCTS_ITERS = Int(get(config, "eval_mcts_iters", ARGS["eval_mcts_iters"]))
+const EVAL_MCTS_ITERS = Int(config["eval_mcts_iters"])
 if EVAL_CAPABLE
     println("Eval MCTS iters: $EVAL_MCTS_ITERS")
 end
