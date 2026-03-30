@@ -126,7 +126,7 @@ println("Server: $SERVER_URL")
 println("Workers: $NUM_WORKERS CPU" * (GPU_WORKERS > 0 ? " + $GPU_WORKERS GPU" : ""))
 println("GPU: $(GPU_WORKERS > 0 ? "Metal ($GPU_WORKERS workers)" : "disabled")")
 println("CPU inference: $(AlphaZero.BackgammonInference.cpu_backend_summary(CPU_INFERENCE_BACKEND))")
-println("Eval capable: $EVAL_CAPABLE" * (EVAL_CAPABLE ? " ($(EVAL_MCTS_ITERS) MCTS iters)" : ""))
+println("Eval capable: $EVAL_CAPABLE")
 println("=" ^ 60)
 flush(stdout)
 
@@ -181,6 +181,9 @@ const INFERENCE_BATCH_SIZE = Int(config["inference_batch_size"])
 const NUM_ACTIONS = Int(config["num_actions"])
 # Eval MCTS iters: prefer server config, fall back to CLI arg
 const EVAL_MCTS_ITERS = Int(get(config, "eval_mcts_iters", ARGS["eval_mcts_iters"]))
+if EVAL_CAPABLE
+    println("Eval MCTS iters: $EVAL_MCTS_ITERS")
+end
 
 # Temperature scheduling
 const TEMP_MOVE_CUTOFF = Int(get(config, "temp_move_cutoff", 20))
