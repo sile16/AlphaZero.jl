@@ -1514,7 +1514,7 @@ function process_eval_chunk!(chunk_data::Dict)
     flush(stdout)
 
     # Setup or refresh eval session if iter or weights version changed
-    if EVAL_SESSION.az_agent === nothing || EVAL_SESSION.iter != eval_iter ||
+    if EVAL_SESSION.eval_single_oracle === nothing || EVAL_SESSION.iter != eval_iter ||
        EVAL_SESSION.weights_version != weights_version
         setup_eval_session!(eval_iter, weights_version)
     end
