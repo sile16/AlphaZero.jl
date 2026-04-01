@@ -183,6 +183,10 @@ function parse_args()
             help = "Max samples to load from bootstrap file (0 = all, capped at buffer capacity)"
             arg_type = Int
             default = 0
+        "--bootstrap-train-iters"
+            help = "Train this many iters on bootstrap, then clear buffer and switch to pure self-play (0 = never clear)"
+            arg_type = Int
+            default = 0
 
         # Eval
         "--eval-interval"
@@ -1119,6 +1123,27 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     println()
 
     iter_start = time()
+
+    # Bootstrap phase complete — clear buffer to switch to pure self-play
+    if ARGS["bootstrap_train_iters"] > 0 && iter == ARGS["bootstrap_train_iters"] + 1
+        println("\n*** Bootstrap phase complete ($(ARGS["bootstrap_train_iters"]) iters). Clearing buffer for pure self-play. ***")
+        flush(stdout)
+        lock(replay_buffer.lock) do
+            replay_buffer.size = 0
+            replay_buffer.write_pos = 1
+        end
+        # Wait for self-play to fill buffer with at least 1 iter worth of data
+        min_samples = SAMPLES_PER_ITERATION
+        println("Waiting for $min_samples self-play samples before resuming training...")
+        while buf_length(replay_buffer) < min_samples
+            cur = buf_length(replay_buffer)
+            print("\rBuffer refill: $cur / $min_samples ($(round(100*cur/min_samples, digits=1))%)  ")
+            flush(stdout)
+            sleep(5)
+        end
+        println("\nBuffer refilled. Resuming training with pure self-play data.")
+        flush(stdout)
+    end
 
     # Update learning rate
     current_lr = update_lr!(contact_opt_state, iter, ARGS["total_iterations"])
