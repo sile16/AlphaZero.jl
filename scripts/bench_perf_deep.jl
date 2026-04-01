@@ -149,55 +149,56 @@ gemm_time = t_fwd / n_iters * 1e6  # approximate
 @printf("  ~%d GEMM calls, ~%d LN calls per forward\n", n_gemm_calls, n_ln_calls)
 @printf("  Estimated GEMM fraction: %.0f%%\n", 100.0)  # placeholder, will compute below
 
-# Detailed breakdown
-t_gemm_total = 0.0
-t_ln_total = 0.0
-# Input GEMM
-n_rep = 500
-t = @elapsed for _ in 1:n_rep; dense!(fb.h1, fw.W_in, X, fw.b_in, BATCH); end
-t_gemm_total += t / n_rep
-# Res blocks
-for blk in 1:BLOCKS
-    t = @elapsed for _ in 1:n_rep; dense!(fb.h2, fw.res_W1[blk], fb.h1, fw.res_b1[blk], BATCH); end
+# Detailed breakdown (wrapped in let to avoid scoping issues)
+let
+    local t_gemm_total = 0.0
+    local t_ln_total = 0.0
+    local n_rep = 500
+    # Input GEMM
+    local t = @elapsed for _ in 1:n_rep; dense!(fb.h1, fw.W_in, X, fw.b_in, BATCH); end
     t_gemm_total += t / n_rep
-    t = @elapsed for _ in 1:n_rep; dense!(fb.h2, fw.res_W2[blk], fb.h1, fw.res_b2[blk], BATCH); end
+    # Res blocks
+    for blk in 1:BLOCKS
+        t = @elapsed for _ in 1:n_rep; dense!(fb.h2, fw.res_W1[blk], fb.h1, fw.res_b1[blk], BATCH); end
+        t_gemm_total += t / n_rep
+        t = @elapsed for _ in 1:n_rep; dense!(fb.h2, fw.res_W2[blk], fb.h1, fw.res_b2[blk], BATCH); end
+        t_gemm_total += t / n_rep
+    end
+    # Value trunk + policy
+    t = @elapsed for _ in 1:n_rep; dense!(fb.vt, fw.W_vt, fb.h1, fw.b_vt, BATCH); end
     t_gemm_total += t / n_rep
-end
-# Value trunk + policy
-t = @elapsed for _ in 1:n_rep; dense!(fb.vt, fw.W_vt, fb.h1, fw.b_vt, BATCH); end
-t_gemm_total += t / n_rep
-t = @elapsed for _ in 1:n_rep; dense!(fb.p, fw.W_pout, fb.h1, fw.b_pout, BATCH); end
-t_gemm_total += t / n_rep
-# Policy layers
-for i in 1:fw.num_policy_layers
-    t = @elapsed for _ in 1:n_rep; dense!(fb.vt, fw.W_p[i], fb.h1, fw.b_p[i], BATCH); end
+    t = @elapsed for _ in 1:n_rep; dense!(fb.p, fw.W_pout, fb.h1, fw.b_pout, BATCH); end
     t_gemm_total += t / n_rep
-end
+    for i in 1:fw.num_policy_layers
+        t = @elapsed for _ in 1:n_rep; dense!(fb.vt, fw.W_p[i], fb.h1, fw.b_p[i], BATCH); end
+        t_gemm_total += t / n_rep
+    end
 
-# LN calls
-t = @elapsed for _ in 1:n_rep; layernorm_relu!(fb.h2, fb.h1, fw.ln_in_s, fw.ln_in_b, ln_mean, ln_rstd, BATCH); end
-t_ln_total += t / n_rep
-for blk in 1:BLOCKS
-    t = @elapsed for _ in 1:n_rep; layernorm_relu!(fb.h1, fb.h2, fw.res_ln1_s[blk], fw.res_ln1_b[blk], ln_mean, ln_rstd, BATCH); end
+    # LN calls
+    t = @elapsed for _ in 1:n_rep; layernorm_relu!(fb.h2, fb.h1, fw.ln_in_s, fw.ln_in_b, ln_mean, ln_rstd, BATCH); end
     t_ln_total += t / n_rep
-    t = @elapsed for _ in 1:n_rep; layernorm_relu!(fb.h1, fb.h2, fw.res_ln2_s[blk], fw.res_ln2_b[blk], ln_mean, ln_rstd, BATCH); end
+    for blk in 1:BLOCKS
+        t = @elapsed for _ in 1:n_rep; layernorm_relu!(fb.h1, fb.h2, fw.res_ln1_s[blk], fw.res_ln1_b[blk], ln_mean, ln_rstd, BATCH); end
+        t_ln_total += t / n_rep
+        t = @elapsed for _ in 1:n_rep; layernorm_relu!(fb.h1, fb.h2, fw.res_ln2_s[blk], fw.res_ln2_b[blk], ln_mean, ln_rstd, BATCH); end
+        t_ln_total += t / n_rep
+    end
+    t = @elapsed for _ in 1:n_rep; layernorm_relu!(fb.h1, fb.h2, fw.ln_post_s, fw.ln_post_b, ln_mean, ln_rstd, BATCH); end
     t_ln_total += t / n_rep
-end
-t = @elapsed for _ in 1:n_rep; layernorm_relu!(fb.h1, fb.h2, fw.ln_post_s, fw.ln_post_b, ln_mean, ln_rstd, BATCH); end
-t_ln_total += t / n_rep
-t = @elapsed for _ in 1:n_rep; layernorm_relu!(fb.h2, fb.vt, fw.ln_vt_s, fw.ln_vt_b, ln_mean, ln_rstd, BATCH); end
-t_ln_total += t / n_rep
-for i in 1:fw.num_policy_layers
-    t = @elapsed for _ in 1:n_rep; layernorm_relu!(fb.h1, fb.vt, fw.ln_p_s[i], fw.ln_p_b[i], ln_mean, ln_rstd, BATCH); end
+    t = @elapsed for _ in 1:n_rep; layernorm_relu!(fb.h2, fb.vt, fw.ln_vt_s, fw.ln_vt_b, ln_mean, ln_rstd, BATCH); end
     t_ln_total += t / n_rep
-end
+    for i in 1:fw.num_policy_layers
+        t = @elapsed for _ in 1:n_rep; layernorm_relu!(fb.h1, fb.vt, fw.ln_p_s[i], fw.ln_p_b[i], ln_mean, ln_rstd, BATCH); end
+        t_ln_total += t / n_rep
+    end
 
-fwd_total = t_fwd / n_iters
-other = fwd_total - t_gemm_total - t_ln_total
-@printf("  GEMM total:      %7.1f μs (%4.1f%%)\n", t_gemm_total * 1e6, t_gemm_total / fwd_total * 100)
-@printf("  LayerNorm total: %7.1f μs (%4.1f%%)\n", t_ln_total * 1e6, t_ln_total / fwd_total * 100)
-@printf("  Other (value/softmax/skip): %7.1f μs (%4.1f%%)\n", other * 1e6, other / fwd_total * 100)
-@printf("  Total forward:   %7.1f μs\n", fwd_total * 1e6)
+    local fwd_total = t_fwd / n_iters
+    local other = fwd_total - t_gemm_total - t_ln_total
+    @printf("  GEMM total:      %7.1f μs (%4.1f%%)\n", t_gemm_total * 1e6, t_gemm_total / fwd_total * 100)
+    @printf("  LayerNorm total: %7.1f μs (%4.1f%%)\n", t_ln_total * 1e6, t_ln_total / fwd_total * 100)
+    @printf("  Other (value/softmax/skip): %7.1f μs (%4.1f%%)\n", other * 1e6, other / fwd_total * 100)
+    @printf("  Total forward:   %7.1f μs\n", fwd_total * 1e6)
+end
 
 # --- Memory bandwidth estimate ---
 println("\n--- Memory bandwidth estimate ---")
