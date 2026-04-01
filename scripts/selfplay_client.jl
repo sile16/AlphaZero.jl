@@ -1523,27 +1523,39 @@ function process_eval_chunk!(chunk_data::Dict)
         setup_eval_session!(eval_iter, weights_version)
     end
 
-    # Pre-create per-thread resources ON MAIN THREAD (not inside @threads!)
-    # Agents have mutable MCTS tree, wildbg has mutable _cached_target — not shareable.
+    # Pre-create ALL per-thread resources ON MAIN THREAD.
+    # Nothing is shared: agents (mutable MCTS tree), oracles (mutable task buffers),
+    # and wildbg (mutable _cached_target) all get their own per-thread instance.
     n_threads = Threads.nthreads()
-    agents = [EvalAlphaZeroAgent(
-        EVAL_SESSION.eval_single_oracle, EVAL_SESSION.eval_batch_oracle,
-        EVAL_SESSION.eval_mcts_params, INFERENCE_BATCH_SIZE, gspec) for _ in 1:n_threads]
-    wb_backends = [begin
+    agents = Vector{EvalAlphaZeroAgent}(undef, n_threads)
+    wb_backends = Vector{Any}(undef, n_threads)
+    wb_agents = Vector{Any}(undef, n_threads)
+    value_batch_oracles = Vector{Any}(undef, n_threads)
+    for tid in 1:n_threads
+        # Per-thread oracle (own buffers — no sharing)
+        oracles = AlphaZero.BackgammonInference.make_cpu_oracles(
+            CPU_INFERENCE_BACKEND, nothing, EVAL_SESSION.eval_cfg;
+            secondary_net=nothing, batch_size=INFERENCE_BATCH_SIZE,
+            primary_fw=EVAL_SESSION.eval_contact_fw,
+            secondary_fw=EVAL_SESSION.eval_race_fw,
+            nslots=1)
+        agents[tid] = EvalAlphaZeroAgent(
+            oracles[1], oracles[2],
+            EVAL_SESSION.eval_mcts_params, INFERENCE_BATCH_SIZE, gspec)
+        # Per-thread value oracle (batch_size=1 for single position eval)
+        vo = AlphaZero.BackgammonInference.make_cpu_oracles(
+            CPU_INFERENCE_BACKEND, nothing, EVAL_SESSION.eval_cfg;
+            secondary_net=nothing, batch_size=1,
+            primary_fw=EVAL_SESSION.eval_contact_fw,
+            secondary_fw=EVAL_SESSION.eval_race_fw,
+            nslots=1)
+        value_batch_oracles[tid] = vo[2]
+        # Per-thread wildbg
         wb = BackgammonNet.WildbgBackend(; nets=EVAL_SESSION.wildbg_nets_variant, lib_path=WILDBG_LIB_EVAL)
         BackgammonNet.open!(wb)
-        wb
-    end for _ in 1:n_threads]
-    wb_agents = [BackgammonNet.BackendAgent(wb) for wb in wb_backends]
-
-    # Shared value oracle — thread-safe via per-task buffers
-    value_oracles = AlphaZero.BackgammonInference.make_cpu_oracles(
-        CPU_INFERENCE_BACKEND, nothing, EVAL_SESSION.eval_cfg;
-        secondary_net=nothing, batch_size=1,
-        primary_fw=EVAL_SESSION.eval_contact_fw,
-        secondary_fw=EVAL_SESSION.eval_race_fw,
-        nslots=n_threads)
-    value_batch_oracle = value_oracles[2]
+        wb_backends[tid] = wb
+        wb_agents[tid] = BackgammonNet.BackendAgent(wb)
+    end
 
     rewards = Vector{Float64}(undef, n_games)
     # Per-thread value sample collection (no locks needed)
@@ -1560,7 +1572,7 @@ function process_eval_chunk!(chunk_data::Dict)
         end
     end
 
-    # Parallel eval — each thread uses its own agent + wildbg
+    # Parallel eval — each thread uses its own agent + wildbg + oracle (nothing shared)
     Threads.@threads for job in 1:n_games
         tid = Threads.threadid()
         pos_idx = pos_start + job - 1
@@ -1569,7 +1581,7 @@ function process_eval_chunk!(chunk_data::Dict)
         else
             result = eval_game_from_position(
                 agents[tid], wb_agents[tid],
-                EVAL_POSITIONS[pos_idx], value_batch_oracle;
+                EVAL_POSITIONS[pos_idx], value_batch_oracles[tid];
                 seed=chunk_id * 10000 + job, az_is_white=az_is_white)
             rewards[job] = result.reward
             for s in result.value_samples
