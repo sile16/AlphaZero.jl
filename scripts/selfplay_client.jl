@@ -1526,7 +1526,8 @@ function process_eval_chunk!(chunk_data::Dict)
     # Pre-create ALL per-thread resources ON MAIN THREAD.
     # Nothing is shared: agents (mutable MCTS tree), oracles (mutable task buffers),
     # and wildbg (mutable _cached_target) all get their own per-thread instance.
-    n_threads = Threads.nthreads()
+    # Over-allocate: Julia 1.12 threadid() can exceed nthreads() due to interactive pool
+    n_threads = Threads.nthreads() + 2
     agents = Vector{EvalAlphaZeroAgent}(undef, n_threads)
     wb_backends = Vector{Any}(undef, n_threads)
     wb_agents = Vector{Any}(undef, n_threads)
@@ -1572,21 +1573,21 @@ function process_eval_chunk!(chunk_data::Dict)
         end
     end
 
-    # Parallel eval — each thread uses its own agent + wildbg + oracle (nothing shared)
+    # Parallel eval — each thread uses its own resources (nothing shared)
     Threads.@threads for job in 1:n_games
-        tid = Threads.threadid()
+        wid = Threads.threadid()  # safe: n_threads over-allocated for Julia 1.12 interactive pool
         pos_idx = pos_start + job - 1
         if pos_idx > length(EVAL_POSITIONS)
             rewards[job] = 0.0
         else
             result = eval_game_from_position(
-                agents[tid], wb_agents[tid],
-                EVAL_POSITIONS[pos_idx], value_batch_oracles[tid];
+                agents[wid], wb_agents[wid],
+                EVAL_POSITIONS[pos_idx], value_batch_oracles[wid];
                 seed=chunk_id * 10000 + job, az_is_white=az_is_white)
             rewards[job] = result.reward
             for s in result.value_samples
-                push!(thread_val_nn[tid], s.nn_val)
-                push!(thread_val_opp[tid], s.wb_val)
+                push!(thread_val_nn[wid], s.nn_val)
+                push!(thread_val_opp[wid], s.wb_val)
             end
         end
     end
