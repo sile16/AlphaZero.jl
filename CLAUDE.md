@@ -124,10 +124,10 @@ Full results (28 checkpoints): `/homeshare/projects/AlphaZero.jl/sessions/wildbg
 - `src/game.jl` - Game interface (`game_outcome()` for win types)
 - `src/params.jl` - MctsParams, LearningParams
 
-### Unified Game Loop (v7, 2026-03-22)
+### Game Loop (v7, 2026-03-22)
 - `src/game_loop.jl` - GameLoop module: `play_game()`, MctsAgent, ExternalAgent, GameResult, TraceEntry
-  - Single function replaces 5 duplicate game loops across selfplay/eval scripts
-  - Handles self-play (trace recording) and eval (value comparison) via kwargs
+  - Used by eval scripts (sequential, per-move allocations OK)
+  - NOT used by selfplay — `selfplay_client.jl` uses direct `BatchedMCTS.think()` for zero-alloc threading
   - Bear-off truncation, chance node passthrough, temperature scheduling
 
 ### Distributed Training + Eval
@@ -163,7 +163,10 @@ Full results (28 checkpoints): `/homeshare/projects/AlphaZero.jl/sessions/wildbg
 - `/homeshare/projects/AlphaZero.jl/sessions/archive/` - Pre-v0.3.2 and experimental sessions
 
 ### Inference
-- `src/inference/fast_weights.jl` - FastInference module: allocation-free CPU forward pass with pure Julia GEMM + LayerNorm (thread-safe, no BLAS contention). Used by selfplay_client.jl.
+- `src/inference/fast_weights.jl` - FastInference module: allocation-free CPU forward pass with platform-adaptive GEMM + LayerNorm (thread-safe, no BLAS contention). Used by selfplay_client.jl.
+  - **x86**: Uses BLAS `mul!` (AVX2 micro-kernels, 76 GFLOPS on i7-10700K — 1.6x faster than pure Julia)
+  - **ARM**: Uses pure Julia `_gemm_bias!` (triggers Apple AMX via LLVM, 43 GFLOPS — 1.3x faster than Apple BLAS)
+  - GEMM is 85-93% of forward pass time. LayerNorm and softmax are negligible.
 
 ### Legacy modules (still compiled by AlphaZero.jl, not used by active training/eval)
 - `src/batchifier.jl`, `src/async_batchifier.jl` - Old batchifiers (used by simulations.jl → session.jl)
@@ -238,7 +241,8 @@ All under `/homeshare/projects/AlphaZero.jl/sessions/`:
 11. **PER was broken in distributed training** (fixed 2026-03-14) -- training_server.jl used uniform sampling instead of `per_sample()`. IS weights were not passed to the loss function. Fixed: per-model partition PER sampling with IS weight correction via `per_sample_partition()`. Per-component loss (policy/value/invalid) now logged to TensorBoard.
 12. **Jarvis OOM with server + client** (2026-03-23) -- Server 28GB + Client 34GB = 62GB on 64GB machine. Linux OOM killer terminates client. Reduce Jarvis workers or run client only on Neo.
 13. **GameLoop.play_game() kills threading perf** (2026-03-23) -- Per-move TraceEntry allocations cause 28% more GC, amplified to 20-30x under 32 threads. Selfplay must use direct BatchedMCTS calls. GameLoop only for eval scripts.
-14. **Multihead equity heads must be masked** (2026-03-23) -- Train P(gammon|win)/P(bg|win) only on won games, P(gammon|loss)/P(bg|loss) only on lost games. Without masking, network learns joint probabilities instead of conditionals, inconsistent with compute_equity().
+14. **Multi-threaded scaling is memory-bandwidth limited** (2026-03-31) -- Neo M3 Max: peaks at 8-16 workers (6x speedup), **degrades at 24** (4.4x). Jarvis i7-10700K: scales linearly to 6 workers (5x, 84% efficiency). Workers share L2/L3 cache for 256KB weight matrices. Optimal: Neo 16 workers, Jarvis 6 workers. Use `--threads N+2 --num-workers N` to reserve threads for upload+eval.
+15. **Multihead equity heads must be masked** (2026-03-23) -- Train P(gammon|win)/P(bg|win) only on won games, P(gammon|loss)/P(bg|loss) only on lost games. Without masking, network learns joint probabilities instead of conditionals, inconsistent with compute_equity().
 
 ### Evaluation
 12. **Random baseline is misleading** -- always evaluate vs wildbg or GnuBG

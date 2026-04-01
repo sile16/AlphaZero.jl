@@ -8,6 +8,8 @@
 
 module FastInference
 
+using LinearAlgebra
+
 export FastWeights, FastBuffers
 export fast_forward_normalized!, extract_fast_weights, refresh_fast_weights!
 
@@ -264,8 +266,31 @@ function _gemm_bias!(C::AbstractMatrix{Float32}, A::Matrix{Float32},
     end
 end
 
+# Platform-adaptive GEMM: use BLAS on x86 (1.6x faster due to AVX2 micro-kernels),
+# pure Julia on ARM (faster than Apple BLAS at this matrix size, likely AMX auto-use).
+const USE_BLAS_GEMM = Sys.ARCH === :x86_64
+
+function _blas_gemm_bias!(C::AbstractMatrix{Float32}, A::Matrix{Float32},
+                          B::AbstractMatrix{Float32}, bias::Vector{Float32}, n::Int)
+    m = size(A, 1)
+    # Copy bias into output columns
+    @inbounds for j in 1:n
+        @simd for i in 1:m
+            C[i, j] = bias[i]
+        end
+    end
+    # BLAS GEMM: C += A * B  (5-arg mul! with alpha=1, beta=1 adds to existing bias)
+    Cv = @view C[:, 1:n]
+    Bv = @view B[:, 1:n]
+    mul!(Cv, A, Bv, 1.0f0, 1.0f0)
+end
+
 function dense!(out::AbstractMatrix, W::Matrix{Float32}, x::AbstractMatrix, b::Vector{Float32}, n::Int)
-    _gemm_bias!(out, W, x, b, n)
+    if USE_BLAS_GEMM
+        _blas_gemm_bias!(out, W, x, b, n)
+    else
+        _gemm_bias!(out, W, x, b, n)
+    end
 end
 
 function dense_relu!(out::AbstractMatrix, W::Matrix{Float32}, x::AbstractMatrix, b::Vector{Float32}, n::Int)
