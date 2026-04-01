@@ -205,7 +205,8 @@ println("\n--- Memory bandwidth estimate ---")
 # GEMM reads A (m×k) + B (k×n) + writes C (m×n), all Float32
 bytes_per_gemm = (WIDTH * WIDTH + WIDTH * BATCH + WIDTH * BATCH) * 4  # res block gemm
 total_bytes = bytes_per_gemm * (2 * BLOCKS + 3)  # approx
-bw = total_bytes / fwd_total / 1e9
+fwd_total_s = t_fwd / n_iters
+bw = total_bytes / fwd_total_s / 1e9
 @printf("  Approx data moved per forward: %.1f MB\n", total_bytes / 1e6)
 @printf("  Effective bandwidth: %.1f GB/s (single thread)\n", bw)
 
