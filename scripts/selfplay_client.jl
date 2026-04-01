@@ -1497,7 +1497,11 @@ function submit_eval_results(chunk_id::Int, rewards, val_nn, val_opp, val_is_con
     return false
 end
 
-"""Process a single eval chunk using all worker threads in parallel."""
+"""Process eval chunk with all worker threads in parallel.
+
+Pre-creates per-thread agents (mutable MCTS tree) and wildbg backends
+(mutable cached target) on the MAIN thread, then dispatches games via
+Threads.@threads. Shared oracles are thread-safe (per-task buffers)."""
 function process_eval_chunk!(chunk_data::Dict)
     EVAL_POSITIONS === nothing && return
     isempty(WILDBG_LIB_EVAL) && return
@@ -1510,7 +1514,7 @@ function process_eval_chunk!(chunk_data::Dict)
     az_is_white = Bool(chunk_data["az_is_white"])
     n_games = pos_end - pos_start + 1
 
-    println("[EVAL] Chunk $chunk_id: positions $pos_start-$pos_end ($(az_is_white ? "white" : "black")), iter=$eval_iter")
+    println("[EVAL] Chunk $chunk_id: $n_games games ($(az_is_white ? "white" : "black")), iter=$eval_iter, $NUM_WORKERS workers")
     flush(stdout)
 
     # Setup or refresh eval session if iter or weights version changed
@@ -1519,51 +1523,74 @@ function process_eval_chunk!(chunk_data::Dict)
         setup_eval_session!(eval_iter, weights_version)
     end
 
-    # Create agent and wildbg for this chunk (sequential — reused across games)
-    az_agent = EvalAlphaZeroAgent(
+    # Pre-create per-thread resources ON MAIN THREAD (not inside @threads!)
+    # Agents have mutable MCTS tree, wildbg has mutable _cached_target — not shareable.
+    n_threads = Threads.nthreads()
+    agents = [EvalAlphaZeroAgent(
         EVAL_SESSION.eval_single_oracle, EVAL_SESSION.eval_batch_oracle,
-        EVAL_SESSION.eval_mcts_params, INFERENCE_BATCH_SIZE, gspec)
-    wb_backend = BackgammonNet.WildbgBackend(;
-        nets=EVAL_SESSION.wildbg_nets_variant, lib_path=WILDBG_LIB_EVAL)
-    BackgammonNet.open!(wb_backend)
-    wb_agent = BackgammonNet.BackendAgent(wb_backend)
+        EVAL_SESSION.eval_mcts_params, INFERENCE_BATCH_SIZE, gspec) for _ in 1:n_threads]
+    wb_backends = [begin
+        wb = BackgammonNet.WildbgBackend(; nets=EVAL_SESSION.wildbg_nets_variant, lib_path=WILDBG_LIB_EVAL)
+        BackgammonNet.open!(wb)
+        wb
+    end for _ in 1:n_threads]
+    wb_agents = [BackgammonNet.BackendAgent(wb) for wb in wb_backends]
+
+    # Shared value oracle — thread-safe via per-task buffers
     value_oracles = AlphaZero.BackgammonInference.make_cpu_oracles(
         CPU_INFERENCE_BACKEND, nothing, EVAL_SESSION.eval_cfg;
         secondary_net=nothing, batch_size=1,
         primary_fw=EVAL_SESSION.eval_contact_fw,
         secondary_fw=EVAL_SESSION.eval_race_fw,
-        nslots=1)
+        nslots=n_threads)
     value_batch_oracle = value_oracles[2]
 
     rewards = Vector{Float64}(undef, n_games)
-    val_nn = Float64[]
-    val_opp = Float64[]
+    # Per-thread value sample collection (no locks needed)
+    thread_val_nn = [Float64[] for _ in 1:n_threads]
+    thread_val_opp = [Float64[] for _ in 1:n_threads]
     t0 = time()
 
-    for job in 1:n_games
+    # Heartbeat task
+    heartbeat_done = Threads.Atomic{Bool}(false)
+    Threads.@spawn begin
+        while !heartbeat_done[]
+            sleep(10)
+            send_eval_heartbeat(chunk_id)
+        end
+    end
+
+    # Parallel eval — each thread uses its own agent + wildbg
+    Threads.@threads for job in 1:n_games
+        tid = Threads.threadid()
         pos_idx = pos_start + job - 1
         if pos_idx > length(EVAL_POSITIONS)
             rewards[job] = 0.0
-            continue
+        else
+            result = eval_game_from_position(
+                agents[tid], wb_agents[tid],
+                EVAL_POSITIONS[pos_idx], value_batch_oracle;
+                seed=chunk_id * 10000 + job, az_is_white=az_is_white)
+            rewards[job] = result.reward
+            for s in result.value_samples
+                push!(thread_val_nn[tid], s.nn_val)
+                push!(thread_val_opp[tid], s.wb_val)
+            end
         end
-        result = eval_game_from_position(
-            az_agent, wb_agent, EVAL_POSITIONS[pos_idx], value_batch_oracle;
-            seed=chunk_id * 10000 + job, az_is_white=az_is_white)
-        rewards[job] = result.reward
-        for s in result.value_samples
-            push!(val_nn, s.nn_val)
-            push!(val_opp, s.wb_val)
-        end
-        # Heartbeat every 5 games
-        job % 5 == 0 && send_eval_heartbeat(chunk_id)
     end
 
+    Threads.atomic_xchg!(heartbeat_done, true)
+
+    # Merge per-thread results
+    val_nn = reduce(vcat, thread_val_nn)
+    val_opp = reduce(vcat, thread_val_opp)
     val_is_contact = fill(false, length(val_nn))
 
     t_chunk = time() - t0
+    gpm = n_games / t_chunk * 60
     avg_reward = length(rewards) > 0 ? sum(rewards) / length(rewards) : 0.0
     win_pct = length(rewards) > 0 ? count(r -> r > 0, rewards) / length(rewards) * 100 : 0.0
-    println("[EVAL] Chunk $chunk_id done: equity=$(round(avg_reward, digits=3)), win=$(round(win_pct, digits=1))%, $(round(t_chunk, digits=1))s")
+    println("[EVAL] Chunk $chunk_id done: equity=$(round(avg_reward, digits=3)), win=$(round(win_pct, digits=1))%, $(round(t_chunk, digits=1))s ($(round(gpm, digits=0)) games/min)")
     flush(stdout)
 
     submit_eval_results(chunk_id, rewards, val_nn, val_opp, val_is_contact)
