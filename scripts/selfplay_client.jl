@@ -1556,10 +1556,13 @@ function process_eval_chunk!(chunk_data::Dict)
             BackgammonNet.open!(wb_backend)
             thread_wb_backends[tid] = wb_backend
             thread_wb_agents[tid] = BackgammonNet.BackendAgent(wb_backend)
+            # Value oracle uses FastWeights directly (no network needed)
             vo = AlphaZero.BackgammonInference.make_cpu_oracles(
                 CPU_INFERENCE_BACKEND, nothing, EVAL_SESSION.eval_cfg;
                 secondary_net=nothing, batch_size=1,
-                primary_fw=EVAL_SESSION.eval_contact_fw, secondary_fw=EVAL_SESSION.eval_race_fw)
+                primary_fw=EVAL_SESSION.eval_contact_fw,
+                secondary_fw=EVAL_SESSION.eval_race_fw,
+                nslots=1)
             thread_value_oracles[tid] = vo[2]
         end
 
@@ -1580,11 +1583,6 @@ function process_eval_chunk!(chunk_data::Dict)
         end
 
         Threads.atomic_add!(games_done, 1)
-    end
-
-    # Close per-thread wildbg backends
-    for tid in 1:n_threads
-        isassigned(thread_wb_backends, tid) && BackgammonNet.close!(thread_wb_backends[tid])
     end
 
     # Stop heartbeat
