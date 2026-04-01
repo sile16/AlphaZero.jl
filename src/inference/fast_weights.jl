@@ -8,8 +8,6 @@
 
 module FastInference
 
-using LinearAlgebra
-
 export FastWeights, FastBuffers
 export fast_forward_normalized!, extract_fast_weights, refresh_fast_weights!
 
@@ -266,31 +264,14 @@ function _gemm_bias!(C::AbstractMatrix{Float32}, A::Matrix{Float32},
     end
 end
 
-# Platform-adaptive GEMM: use BLAS on x86 (1.6x faster due to AVX2 micro-kernels),
-# pure Julia on ARM (faster than Apple BLAS at this matrix size, likely AMX auto-use).
-const USE_BLAS_GEMM = Sys.ARCH === :x86_64
-
-function _blas_gemm_bias!(C::AbstractMatrix{Float32}, A::Matrix{Float32},
-                          B::AbstractMatrix{Float32}, bias::Vector{Float32}, n::Int)
-    m = size(A, 1)
-    # Copy bias into output columns
-    @inbounds for j in 1:n
-        @simd for i in 1:m
-            C[i, j] = bias[i]
-        end
-    end
-    # BLAS GEMM: C += A * B  (5-arg mul! with alpha=1, beta=1 adds to existing bias)
-    Cv = @view C[:, 1:n]
-    Bv = @view B[:, 1:n]
-    mul!(Cv, A, Bv, 1.0f0, 1.0f0)
-end
+# Pure Julia GEMM is used on all platforms. Benchmarks show:
+# - ARM: 1.3x faster than Apple BLAS (AMX auto-vectorization via LLVM)
+# - x86: BLAS is 1.6x faster single-threaded, but view allocations (96 bytes/call)
+#   cause GC pressure under multi-threading that negates the GEMM speedup.
+# Net result: pure Julia GEMM wins for production multi-worker selfplay on both platforms.
 
 function dense!(out::AbstractMatrix, W::Matrix{Float32}, x::AbstractMatrix, b::Vector{Float32}, n::Int)
-    if USE_BLAS_GEMM
-        _blas_gemm_bias!(out, W, x, b, n)
-    else
-        _gemm_bias!(out, W, x, b, n)
-    end
+    _gemm_bias!(out, W, x, b, n)
 end
 
 function dense_relu!(out::AbstractMatrix, W::Matrix{Float32}, x::AbstractMatrix, b::Vector{Float32}, n::Int)

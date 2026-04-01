@@ -163,9 +163,10 @@ Full results (28 checkpoints): `/homeshare/projects/AlphaZero.jl/sessions/wildbg
 - `/homeshare/projects/AlphaZero.jl/sessions/archive/` - Pre-v0.3.2 and experimental sessions
 
 ### Inference
-- `src/inference/fast_weights.jl` - FastInference module: allocation-free CPU forward pass with platform-adaptive GEMM + LayerNorm (thread-safe, no BLAS contention). Used by selfplay_client.jl.
-  - **x86**: Uses BLAS `mul!` (AVX2 micro-kernels, 76 GFLOPS on i7-10700K — 1.6x faster than pure Julia)
-  - **ARM**: Uses pure Julia `_gemm_bias!` (triggers Apple AMX via LLVM, 43 GFLOPS — 1.3x faster than Apple BLAS)
+- `src/inference/fast_weights.jl` - FastInference module: allocation-free CPU forward pass with pure Julia GEMM + LayerNorm (thread-safe, zero-allocation). Used by selfplay_client.jl.
+  - Pure Julia `_gemm_bias!` beats BLAS for multi-threaded selfplay on both platforms (BLAS `@view` allocations cause GC pressure under threading that negates single-thread GEMM speedup)
+  - **ARM (Neo)**: 43 GFLOPS (triggers Apple AMX via LLVM `@simd`, 1.3x faster than Apple BLAS)
+  - **x86 (Jarvis)**: 47 GFLOPS (BLAS is 1.6x faster single-thread but slower multi-threaded due to 96 bytes/call view allocations)
   - GEMM is 85-93% of forward pass time. LayerNorm and softmax are negligible.
 
 ### Legacy modules (still compiled by AlphaZero.jl, not used by active training/eval)
