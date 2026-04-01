@@ -31,7 +31,9 @@ LinearAlgebra.BLAS.set_num_threads(1)
 using AlphaZero
 using AlphaZero: GI, Network, FluxLib, MctsParams, BatchedMCTS, ConstSchedule
 using AlphaZero.FastInference: FastWeights, FastBuffers, extract_fast_weights,
-    fast_forward_normalized!, _gemm_bias!, dense!, layernorm_relu!
+    fast_forward_normalized!, _gemm_bias!
+const dense! = AlphaZero.FastInference.dense!
+const layernorm_relu! = AlphaZero.FastInference.layernorm_relu!
 using AlphaZero.BackgammonInference: OracleConfig, make_cpu_oracles
 using Random, Statistics, Printf
 
@@ -74,7 +76,7 @@ println("SECTION 1: Micro-benchmarks (single thread)")
 println("=" ^ 70)
 
 # Create buffers for the forward pass
-fb = FastBuffers(WIDTH, state_dim, num_actions, BATCH; num_policy_layers=1)
+fb = FastBuffers(WIDTH, num_actions, BATCH)
 
 # Random input
 X = rand(Float32, state_dim, BATCH)
