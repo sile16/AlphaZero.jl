@@ -1312,6 +1312,9 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         if job !== nothing && EvalManager.is_complete(job)
             result = EvalManager.finalize_eval(job)
             @info "Eval completed iter $(job.iter)" equity=round(result.equity, digits=3) win_pct=round(result.win_pct * 100, digits=1) games=result.num_games
+            # Log to TB at the eval iteration (not the current training iteration)
+            saved_step = TB_LOGGER.global_step
+            TB_LOGGER.global_step = job.iter
             with_logger(TB_LOGGER) do
                 @info "eval/equity" value=result.equity log_step_increment=0
                 @info "eval/win_pct" value=result.win_pct * 100 log_step_increment=0
@@ -1321,6 +1324,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
                 @info "eval/value_corr" value=result.value_corr log_step_increment=0
                 @info "eval/games" value=result.num_games log_step_increment=0
             end
+            TB_LOGGER.global_step = saved_step
             EVAL_JOB[] = nothing
         end
     end
