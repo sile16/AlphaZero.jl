@@ -29,16 +29,22 @@ Julia implementation of AlphaZero for backgammon with:
 julia --threads 16 --project scripts/training_server.jl --port 9090 --data-dir /home/sile/alphazero-server
 ```
 
-### Self-Play Client (Neo)
+### Self-Play Clients
 ```bash
-julia --threads 30 --project scripts/selfplay_client.jl --server http://jarvis:9090 --api-key <key> --num-workers 22
+# Neo (M3 Max) — selfplay + eval
+./start_client.sh --threads 18 --num-workers 16 --eval-capable
+
+# Jarvis (co-located with server) — selfplay only, reduced workers to prevent OOM
+./start_client.sh --threads 8 --num-workers 4
 ```
 
 **Note**: Use `--threads N` (with space) before `--project`. The `--threads=N` form after `--project` leaks into ARGS.
+**Auto-restart**: `start_client.sh` loops with git pull between restarts. Server triggers via `POST /api/restart-clients`.
 
 ### Architecture
-- **Server** (Jarvis): HTTP API, PER buffer, GPU training (RTX 4090), weight serving, eval, TensorBoard
-- **Client** (Neo): self-play with batched MCTS, CPU inference (22 workers), sample upload, weight sync
+- **Server** (Jarvis): HTTP API, PER buffer, GPU training (RTX 4090), weight serving, eval job management, TensorBoard
+- **Client** (Neo, 16 workers): self-play + eval with batched MCTS, CPU inference, sample upload, weight sync
+- **Client** (Jarvis, 4 workers): self-play only (no eval — OOM risk with 6+ workers alongside server)
 - Same HTTP API for Julia clients and future web clients (tavlatalk)
 - Per-component loss logging to TensorBoard (policy, value, invalid)
 - Training uses `AlphaZero.losses()` from `src/learning.jl` (multi-head equity BCE + policy KL)
@@ -344,6 +350,29 @@ Play strength holds at ~even with wildbg despite loss rising from 1.5→2.1. Boo
 **Performance lesson:** Never allocate in per-move inner loops. Julia's stop-the-world GC amplifies small per-move overhead into catastrophic throughput loss under 32+ threads. Profile under realistic concurrency, not single-thread.
 
 **Data:** Eval positions excluded from training set: `race_starts_tuples_no_eval.jls` (96,514 positions, 2000 eval positions removed).
+
+### v10-v12 Infrastructure Fixes (2026-03-30 to 2026-04-02)
+
+**Eval system rebuilt** — eval never completed in any prior run. Fixed:
+- Server: don't replace running eval jobs, one chunk per client, weight pinning by version
+- Client: parallel eval with per-thread resources (oracles+agents+wildbg), session-level caching
+- TB: eval metrics logged at eval iteration step, not finalization step
+
+**FastWeights data race fixed** — shared `FastWeights` mutated via `copyto!` during weight updates while workers read. Caused 18→1 games/sec collapse. Fixed with `Ref{FastWeights}` atomic swap.
+
+**Performance profiled** — GEMM is 90%+ of forward pass. Pure Julia `_gemm_bias!` wins on both platforms (BLAS `@view` allocations kill multi-threaded). Neo peaks at 16 workers (degrades at 24, memory bandwidth saturation).
+
+**Bootstrap phasing** — `--bootstrap-train-iters N` clears replay buffer after N iterations of bootstrap training, switching to pure self-play. Without this, bootstrap data anchors model to bootstrap source's level (~33% of buffer is still bootstrap at iter 20 with 3M buffer).
+
+**v11 results** (20 iters, 4000 games, 600 MCTS, wildbg large):
+
+| Iter | Equity | Win% | Value corr |
+|------|--------|------|------------|
+| 0 (bootstrap) | -0.160 | 43.9% | -0.195 |
+| 5 | -0.046 | 49.0% | 0.976 |
+| 10 | -0.025 | 49.5% | 0.962 |
+| **15 (peak)** | **+0.013** | **49.5%** | 0.954 |
+| 20 | -0.022 | 49.4% | 0.957 |
 
 ### Future
 15. Web-based workers (WASM + WebGPU) via sibling project `/home/sile/github/tavlatalk/`
