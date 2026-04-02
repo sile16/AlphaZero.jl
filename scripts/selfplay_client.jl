@@ -1256,21 +1256,25 @@ end
 ##### Client-side eval mode
 #####
 
-# Eval session — caches weights/config across chunks from same iteration.
-# Per-thread agents are created in process_eval_chunk! (not shared — mutable state).
+# Eval session — caches weights/config AND per-thread resources across chunks.
+# Created once per eval iteration, reused across all chunks.
 mutable struct EvalSession
     iter::Int
     weights_version::Int
-    # Shared immutable components (thread-safe to read)
-    eval_single_oracle::Any
-    eval_batch_oracle::Any
+    # Config
     eval_mcts_params::Any
     eval_cfg::Any
     eval_contact_fw::Any
     eval_race_fw::Any
     wildbg_nets_variant::Symbol
+    # Per-thread resources (created once in setup_eval_session!, reused across chunks)
+    agents::Vector{Any}             # EvalAlphaZeroAgent per thread
+    wb_agents::Vector{Any}          # BackendAgent per thread
+    value_batch_oracles::Vector{Any} # value oracle per thread
+    n_threads::Int
 end
-const EVAL_SESSION = EvalSession(0, 0, nothing, nothing, nothing, nothing, nothing, nothing, :large)
+const EVAL_SESSION = EvalSession(0, 0, nothing, nothing, nothing, nothing, :large,
+                                  Any[], Any[], Any[], 0)
 
 # Load eval positions if eval-capable
 const EVAL_POSITIONS = if EVAL_CAPABLE
@@ -1418,14 +1422,9 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
     eval_race_fw = CPU_INFERENCE_BACKEND == :fast ?
         AlphaZero.FastInference.extract_fast_weights(eval_race_net) : nothing
 
-    # Shared eval oracles (thread-safe via per-task buffers inside make_cpu_oracles)
     eval_cfg = AlphaZero.BackgammonInference.OracleConfig(
         _state_dim, NUM_ACTIONS, gspec;
         route_state=ORACLE_CFG.route_state)
-    eval_oracles = AlphaZero.BackgammonInference.make_cpu_oracles(
-        CPU_INFERENCE_BACKEND, eval_contact_net, eval_cfg;
-        secondary_net=eval_race_net, batch_size=INFERENCE_BATCH_SIZE,
-        primary_fw=eval_contact_fw, secondary_fw=eval_race_fw)
 
     eval_mcts_params = MctsParams(
         num_iters_per_turn=EVAL_MCTS_ITERS,
@@ -1438,18 +1437,46 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
     lib_size = filesize(WILDBG_LIB_EVAL)
     nets_variant = lib_size > 16_000_000 ? :large : :small
 
-    # Store shared components — per-thread agents created in process_eval_chunk!
+    # Auto-detect wildbg nets variant
+    lib_size = filesize(WILDBG_LIB_EVAL)
+    nets_variant = lib_size > 16_000_000 ? :large : :small
+
+    # Create ALL per-thread resources ONCE (reused across all chunks in this eval)
+    n_threads = Threads.nthreads() + 2  # over-allocate for Julia 1.12 threadid range
+    agents = Vector{Any}(undef, n_threads)
+    wb_agents = Vector{Any}(undef, n_threads)
+    value_batch_oracles = Vector{Any}(undef, n_threads)
+    for tid in 1:n_threads
+        oracles = AlphaZero.BackgammonInference.make_cpu_oracles(
+            CPU_INFERENCE_BACKEND, nothing, eval_cfg;
+            secondary_net=nothing, batch_size=INFERENCE_BATCH_SIZE,
+            primary_fw=eval_contact_fw, secondary_fw=eval_race_fw, nslots=1)
+        agents[tid] = EvalAlphaZeroAgent(oracles[1], oracles[2],
+            eval_mcts_params, INFERENCE_BATCH_SIZE, gspec)
+        vo = AlphaZero.BackgammonInference.make_cpu_oracles(
+            CPU_INFERENCE_BACKEND, nothing, eval_cfg;
+            secondary_net=nothing, batch_size=1,
+            primary_fw=eval_contact_fw, secondary_fw=eval_race_fw, nslots=1)
+        value_batch_oracles[tid] = vo[2]
+        wb = BackgammonNet.WildbgBackend(; nets=nets_variant, lib_path=WILDBG_LIB_EVAL)
+        BackgammonNet.open!(wb)
+        wb_agents[tid] = BackgammonNet.BackendAgent(wb)
+    end
+
+    # Store everything in session — reused across chunks
     EVAL_SESSION.iter = eval_iter
     EVAL_SESSION.weights_version = weights_version
-    EVAL_SESSION.eval_single_oracle = eval_oracles[1]
-    EVAL_SESSION.eval_batch_oracle = eval_oracles[2]
     EVAL_SESSION.eval_mcts_params = eval_mcts_params
     EVAL_SESSION.eval_cfg = eval_cfg
     EVAL_SESSION.eval_contact_fw = eval_contact_fw
     EVAL_SESSION.eval_race_fw = eval_race_fw
     EVAL_SESSION.wildbg_nets_variant = nets_variant
+    EVAL_SESSION.agents = agents
+    EVAL_SESSION.wb_agents = wb_agents
+    EVAL_SESSION.value_batch_oracles = value_batch_oracles
+    EVAL_SESSION.n_threads = n_threads
 
-    println("[EVAL] Session ready (iter=$eval_iter, $NUM_WORKERS workers)")
+    println("[EVAL] Session ready (iter=$eval_iter, $n_threads eval slots)")
     flush(stdout)
 end
 
@@ -1518,45 +1545,16 @@ function process_eval_chunk!(chunk_data::Dict)
     flush(stdout)
 
     # Setup or refresh eval session if iter or weights version changed
-    if EVAL_SESSION.eval_single_oracle === nothing || EVAL_SESSION.iter != eval_iter ||
+    if EVAL_SESSION.n_threads == 0 || EVAL_SESSION.iter != eval_iter ||
        EVAL_SESSION.weights_version != weights_version
         setup_eval_session!(eval_iter, weights_version)
     end
 
-    # Pre-create ALL per-thread resources ON MAIN THREAD.
-    # Nothing is shared: agents (mutable MCTS tree), oracles (mutable task buffers),
-    # and wildbg (mutable _cached_target) all get their own per-thread instance.
-    # Over-allocate: Julia 1.12 threadid() can exceed nthreads() due to interactive pool
-    n_threads = Threads.nthreads() + 2
-    agents = Vector{EvalAlphaZeroAgent}(undef, n_threads)
-    wb_backends = Vector{Any}(undef, n_threads)
-    wb_agents = Vector{Any}(undef, n_threads)
-    value_batch_oracles = Vector{Any}(undef, n_threads)
-    for tid in 1:n_threads
-        # Per-thread oracle (own buffers — no sharing)
-        oracles = AlphaZero.BackgammonInference.make_cpu_oracles(
-            CPU_INFERENCE_BACKEND, nothing, EVAL_SESSION.eval_cfg;
-            secondary_net=nothing, batch_size=INFERENCE_BATCH_SIZE,
-            primary_fw=EVAL_SESSION.eval_contact_fw,
-            secondary_fw=EVAL_SESSION.eval_race_fw,
-            nslots=1)
-        agents[tid] = EvalAlphaZeroAgent(
-            oracles[1], oracles[2],
-            EVAL_SESSION.eval_mcts_params, INFERENCE_BATCH_SIZE, gspec)
-        # Per-thread value oracle (batch_size=1 for single position eval)
-        vo = AlphaZero.BackgammonInference.make_cpu_oracles(
-            CPU_INFERENCE_BACKEND, nothing, EVAL_SESSION.eval_cfg;
-            secondary_net=nothing, batch_size=1,
-            primary_fw=EVAL_SESSION.eval_contact_fw,
-            secondary_fw=EVAL_SESSION.eval_race_fw,
-            nslots=1)
-        value_batch_oracles[tid] = vo[2]
-        # Per-thread wildbg
-        wb = BackgammonNet.WildbgBackend(; nets=EVAL_SESSION.wildbg_nets_variant, lib_path=WILDBG_LIB_EVAL)
-        BackgammonNet.open!(wb)
-        wb_backends[tid] = wb
-        wb_agents[tid] = BackgammonNet.BackendAgent(wb)
-    end
+    # Use per-thread resources from session (created once, reused across chunks)
+    agents = EVAL_SESSION.agents
+    wb_agents = EVAL_SESSION.wb_agents
+    value_batch_oracles = EVAL_SESSION.value_batch_oracles
+    n_threads = EVAL_SESSION.n_threads
 
     rewards = Vector{Float64}(undef, n_games)
     # Per-thread value sample collection (no locks needed)
