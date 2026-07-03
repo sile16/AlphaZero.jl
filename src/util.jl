@@ -89,6 +89,11 @@ function rand_categorical(π)
   return rand(Categorical(π))
 end
 
+function rand_categorical(rng::Random.AbstractRNG, π)
+  π = fix_probvec(π)
+  return rand(rng, Categorical(π))
+end
+
 """
     apply_temperature(π, τ)
 

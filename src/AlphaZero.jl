@@ -6,6 +6,7 @@
 module AlphaZero
 
   import Distributed
+  import Random
   using Format
   using Base: @kwdef
   using DataStructures: CircularBuffer

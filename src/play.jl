@@ -167,7 +167,8 @@ end
 
 # Alternative constructor
 function MctsPlayer(
-    game_spec::AbstractGameSpec, oracle, params::MctsParams; timeout=nothing)
+    game_spec::AbstractGameSpec, oracle, params::MctsParams; timeout=nothing,
+    rng::Random.AbstractRNG=Random.Xoshiro(rand(UInt)))
   mcts = MCTS.Env(game_spec, oracle,
     gamma=params.gamma,
     cpuct=params.cpuct,
@@ -176,7 +177,8 @@ function MctsPlayer(
     prior_temperature=params.prior_temperature,
     chance_mode=params.chance_mode,
     progressive_widening_alpha=params.progressive_widening_alpha,
-    prior_virtual_visits=params.prior_virtual_visits)
+    prior_virtual_visits=params.prior_virtual_visits,
+    rng=rng)
   return MctsPlayer(mcts,
     niters=params.num_iters_per_turn,
     τ=params.temperature,
@@ -184,7 +186,8 @@ function MctsPlayer(
 end
 
 # MCTS with random oracle
-function RandomMctsPlayer(game_spec::AbstractGameSpec, params::MctsParams)
+function RandomMctsPlayer(game_spec::AbstractGameSpec, params::MctsParams;
+                          rng::Random.AbstractRNG=Random.Xoshiro(rand(UInt)))
   oracle = MCTS.RandomOracle(game_spec)
   mcts = MCTS.Env(game_spec, oracle,
     cpuct=params.cpuct,
@@ -193,7 +196,8 @@ function RandomMctsPlayer(game_spec::AbstractGameSpec, params::MctsParams)
     noise_α=params.dirichlet_noise_α,
     chance_mode=params.chance_mode,
     progressive_widening_alpha=params.progressive_widening_alpha,
-    prior_virtual_visits=params.prior_virtual_visits)
+    prior_virtual_visits=params.prior_virtual_visits,
+    rng=rng)
   return MctsPlayer(mcts,
     niters=params.num_iters_per_turn,
     τ=params.temperature)
@@ -259,13 +263,15 @@ end
 # Alternative constructor from game spec and oracle
 function TurnProgressiveMctsPlayer(
     game_spec::AbstractGameSpec, oracle, mcts_params::MctsParams;
-    turn_params::TurnProgressiveSimParams, iter::Int, num_iters::Int)
+    turn_params::TurnProgressiveSimParams, iter::Int, num_iters::Int,
+    rng::Random.AbstractRNG=Random.Xoshiro(rand(UInt)))
   mcts = MCTS.Env(game_spec, oracle,
     gamma=mcts_params.gamma,
     cpuct=mcts_params.cpuct,
     noise_ϵ=mcts_params.dirichlet_noise_ϵ,
     noise_α=mcts_params.dirichlet_noise_α,
-    prior_temperature=mcts_params.prior_temperature)
+    prior_temperature=mcts_params.prior_temperature,
+    rng=rng)
   return TurnProgressiveMctsPlayer(mcts,
     τ=mcts_params.temperature,
     params=turn_params,

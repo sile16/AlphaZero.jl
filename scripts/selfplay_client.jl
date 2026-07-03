@@ -891,7 +891,7 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
             bearoff_eval=BEAROFF_EVALUATOR,
             batch_oracle_with_actions=CPU_BATCH_ORACLE,
             sim_budget_fn=SELFPLAY_SIM_BUDGET_FN)
-        player = GameLoop.create_player(az_agent)
+        player = GameLoop.create_player(az_agent; rng=rng)
     end
 
     all_samples = []
@@ -1030,7 +1030,7 @@ function worker_play_games_gpu(worker_id::Int, games_claimed::Threads.Atomic{Int
         sim_budget_fn=SELFPLAY_SIM_BUDGET_FN)
 
     # Create player ONCE and reuse across all games
-    player = GameLoop.create_player(az_agent)
+    player = GameLoop.create_player(az_agent; rng=sub_rng)
 
     all_samples = []
     while Threads.atomic_add!(games_claimed, 1) < total_games
@@ -1251,7 +1251,7 @@ function continuous_worker(worker_id::Int, rng::AbstractRNG)
         bearoff_eval=BEAROFF_EVALUATOR,
         batch_oracle_with_actions=CPU_BATCH_ORACLE,
         sim_budget_fn=SELFPLAY_SIM_BUDGET_FN)
-    player = GameLoop.create_player(az_agent)
+    player = GameLoop.create_player(az_agent; rng=sub_rng)
 
     # Play games forever — one at a time, push samples immediately
     games_played = 0
@@ -1381,6 +1381,7 @@ function eval_game_from_position(az_agent::EvalAlphaZeroAgent,
                                   value_batch_oracle;
                                   seed::Int=1, az_is_white::Bool=true)
     rng = new_selfplay_rng(seed)
+    az_agent.player.benv.env.rng = rng
     p0, p1, cp = position_data
     g = BackgammonNet.BackgammonGame(p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
                                       obs_type=:minimal_flat)

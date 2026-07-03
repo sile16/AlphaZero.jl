@@ -18,6 +18,7 @@ a pair `(P, V)` where:
 module MCTS
 
 using Distributions: Categorical, Dirichlet
+import Random
 
 using ..AlphaZero: GI, Util
 
@@ -172,13 +173,15 @@ by the neural network in the UCT formula, one uses ``(1-ϵ)p + ϵη`` where ``η
 is drawn once per call to [`MCTS.explore!`](@ref) from a Dirichlet distribution
 of parameter ``α``.
 """
-mutable struct Env{State, Oracle}
+mutable struct Env{State, Oracle, R}
   # Store (nonterminal) state statistics assuming the white player is to play
   tree :: Dict{State, StateInfo}
   # Store chance node statistics (for stochastic games)
   chance_tree :: Dict{State, ChanceNodeInfo}
   # External oracle to evaluate positions
   oracle :: Oracle
+  # Random source for search stochasticity (chance sampling and root noise)
+  rng :: R
   # Parameters
   gamma :: Float64 # Discount factor
   cpuct :: Float64
@@ -201,15 +204,16 @@ mutable struct Env{State, Oracle}
 
   function Env(gspec, oracle;
       gamma=1., cpuct=1., noise_ϵ=0., noise_α=1., prior_temperature=1.,
-      chance_mode=:full, progressive_widening_alpha=0.5, prior_virtual_visits=1.0)
+      chance_mode=:full, progressive_widening_alpha=0.5, prior_virtual_visits=1.0,
+      rng::Random.AbstractRNG=Random.Xoshiro(rand(UInt)))
     S = GI.state_type(gspec)
     tree = Dict{S, StateInfo}()
     chance_tree = Dict{S, ChanceNodeInfo}()
     total_simulations = 0
     total_nodes_traversed = 0
     total_chance_nodes_expanded = 0
-    new{S, typeof(oracle)}(
-      tree, chance_tree, oracle, gamma, cpuct, noise_ϵ, noise_α, prior_temperature,
+    new{S, typeof(oracle), typeof(rng)}(
+      tree, chance_tree, oracle, rng, gamma, cpuct, noise_ϵ, noise_α, prior_temperature,
       chance_mode, progressive_widening_alpha, prior_virtual_visits,
       total_simulations, total_nodes_traversed, total_chance_nodes_expanded, gspec,
       1.0 / GI.reward_scale(gspec))
@@ -378,9 +382,8 @@ Four modes controlled by env.chance_mode:
 function run_simulation_chance!(env::Env, game; η, root, depth)
   if env.chance_mode == :passthrough
     # Passthrough: sample one dice outcome, apply, continue to decision node.
-    # Uses default RNG (matching old step! behavior which used Random.default_rng()).
     outcomes = GI.chance_outcomes(game)
-    r_val = rand()
+    r_val = rand(env.rng)
     idx = length(outcomes)
     acc = 0.0
     @inbounds for i in eachindex(outcomes)
@@ -459,7 +462,7 @@ function run_simulation_chance_sampling!(env::Env, game, state, η, depth)
 
   # Sample ONE outcome according to probability distribution
   probs = [o.prob for o in info.outcomes]
-  outcome_idx = Util.rand_categorical(probs)
+  outcome_idx = Util.rand_categorical(env.rng, probs)
 
   outcome, _ = outcomes[outcome_idx]
   game_copy = GI.clone(game)
@@ -536,18 +539,18 @@ function run_simulation_chance_stratified!(env::Env, game, state, η, depth)
 
     if !isempty(unvisited_indices)
       # Pick random unvisited outcome
-      outcome_idx = unvisited_indices[rand(1:length(unvisited_indices))]
+      outcome_idx = unvisited_indices[rand(env.rng, 1:length(unvisited_indices))]
       info.num_expanded += 1  # Track that we're visiting a new outcome
     else
       # All visited, switch to sampling
       info.num_expanded = num_outcomes  # Sync num_expanded
       probs = [o.prob for o in info.outcomes]
-      outcome_idx = Util.rand_categorical(probs)
+      outcome_idx = Util.rand_categorical(env.rng, probs)
     end
   else
     # SAMPLING PHASE: Sample by probability (all outcomes visited at least once)
     probs = [o.prob for o in info.outcomes]
-    outcome_idx = Util.rand_categorical(probs)
+    outcome_idx = Util.rand_categorical(env.rng, probs)
   end
 
   outcome, _ = outcomes[outcome_idx]
@@ -827,10 +830,10 @@ function update_chance_outcome!(info::ChanceNodeInfo, outcome_idx, value)
   info.outcomes[outcome_idx] = ChanceOutcomeStats(old.prob, old.W + value, old.N + 1)
 end
 
-function dirichlet_noise(game, α)
+function dirichlet_noise(rng::Random.AbstractRNG, game, α)
   actions = GI.available_actions(game)
   n = length(actions)
-  return rand(Dirichlet(n, α))
+  return rand(rng, Dirichlet(n, α))
 end
 
 """
@@ -839,7 +842,7 @@ end
 Run `nsims` MCTS simulations from the current state.
 """
 function explore!(env::Env, game, nsims)
-  η = dirichlet_noise(game, env.noise_α)
+  η = dirichlet_noise(env.rng, game, env.noise_α)
   for i in 1:nsims
     env.total_simulations += 1
     run_simulation!(env, GI.clone(game), η=η)

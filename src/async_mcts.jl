@@ -22,6 +22,7 @@ module AsyncMCTS
 
 using Base.Threads
 using Distributions: Dirichlet
+import Random
 using ..AlphaZero: GI, Util, MCTS, Network
 
 export AsyncPipeline, AsyncWorker, start_pipeline!, stop_pipeline!
@@ -247,7 +248,8 @@ mutable struct AsyncWorker{S, G, N}
     gamma::Float64
 end
 
-function AsyncWorker(id::Int, pipeline::AsyncPipeline{S, N}, gspec::G, mcts_params) where {S, G, N}
+function AsyncWorker(id::Int, pipeline::AsyncPipeline{S, N}, gspec::G, mcts_params;
+                     rng::Random.AbstractRNG=Random.Xoshiro(rand(UInt))) where {S, G, N}
     # Create a dummy oracle (we'll use async submission instead)
     dummy_oracle = state -> error("Should not be called directly")
 
@@ -256,7 +258,8 @@ function AsyncWorker(id::Int, pipeline::AsyncPipeline{S, N}, gspec::G, mcts_para
         gamma=mcts_params.gamma,
         noise_ϵ=mcts_params.dirichlet_noise_ϵ,
         noise_α=mcts_params.dirichlet_noise_α,
-        prior_temperature=mcts_params.prior_temperature)
+        prior_temperature=mcts_params.prior_temperature,
+        rng=rng)
 
     _response_queue!(pipeline, id)
 
@@ -323,7 +326,7 @@ function traverse_to_leaf!(worker::AsyncWorker, game, η)
         if GI.is_chance_node(game)
             outcomes = GI.chance_outcomes(game)
             probs = [p for (_, p) in outcomes]
-            idx = Util.rand_categorical(probs)
+            idx = Util.rand_categorical(env.rng, probs)
             outcome, _ = outcomes[idx]
             GI.apply_chance!(game, outcome)
             continue
@@ -475,7 +478,7 @@ function async_explore!(worker::AsyncWorker, game, num_sims=nothing)
 
     # Generate Dirichlet noise for root
     actions = GI.available_actions(game)
-    η = worker.noise_α > 0 ? rand(Dirichlet(length(actions), Float64(worker.noise_α))) : Float64[]
+    η = worker.noise_α > 0 ? rand(env.rng, Dirichlet(length(actions), Float64(worker.noise_α))) : Float64[]
 
     # Evaluate root state first (blocking, to initialize tree)
     root_state = GI.current_state(game)
@@ -587,7 +590,7 @@ function async_play_game(worker::AsyncWorker, temperature_schedule)
         if GI.is_chance_node(game)
             outcomes = GI.chance_outcomes(game)
             probs = [p for (_, p) in outcomes]
-            idx = Util.rand_categorical(probs)
+            idx = Util.rand_categorical(worker.mcts_env.rng, probs)
             outcome, _ = outcomes[idx]
             GI.apply_chance!(game, outcome)
             continue
@@ -608,7 +611,7 @@ function async_play_game(worker::AsyncWorker, temperature_schedule)
         if τ > 0
             π_τ = probs .^ (1/τ)
             π_τ ./= sum(π_τ)
-            action_idx = Util.rand_categorical(π_τ)
+            action_idx = Util.rand_categorical(worker.mcts_env.rng, π_τ)
         else
             action_idx = argmax(probs)
         end

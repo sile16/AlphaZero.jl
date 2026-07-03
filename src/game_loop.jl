@@ -123,7 +123,7 @@ Create an MCTS player for the game. Uses `BatchedMctsPlayer` for the fast
 passthrough chance-mode path and falls back to the classic `MctsPlayer` when
 advanced stochastic chance handling is requested.
 """
-function create_player(agent::MctsAgent)
+function create_player(agent::MctsAgent; rng::Random.AbstractRNG=Random.Xoshiro(rand(UInt)))
     cm = agent.mcts_params.chance_mode
     if cm == :passthrough || cm == :full
         return BatchedMCTS.BatchedMctsPlayer(
@@ -131,11 +131,12 @@ function create_player(agent::MctsAgent)
             batch_size=agent.batch_size, batch_oracle=agent.batch_oracle,
             batch_oracle_with_actions=agent.batch_oracle_with_actions,
             bearoff_evaluator=agent.bearoff_eval,
-            sim_budget_fn=agent.sim_budget_fn)
+            sim_budget_fn=agent.sim_budget_fn,
+            rng=rng)
     end
     # Exotic chance modes (stratified, progressive) need classic MctsPlayer
     MctsPlayer = getfield(parentmodule(@__MODULE__), :MctsPlayer)
-    return MctsPlayer(agent.gspec, agent.oracle, agent.mcts_params)
+    return MctsPlayer(agent.gspec, agent.oracle, agent.mcts_params; rng=rng)
 end
 
 """
@@ -143,7 +144,7 @@ end
 
 External agents don't need a player object; returns `nothing`.
 """
-function create_player(::ExternalAgent)
+function create_player(::ExternalAgent; rng::Random.AbstractRNG=Random.Xoshiro(rand(UInt)))
     return nothing
 end
 
@@ -302,8 +303,8 @@ function play_game(white::GameAgent, black::GameAgent, env;
     # Reuse pre-created players if provided, otherwise create new ones
     own_white = white_player === nothing
     own_black = black_player === nothing
-    white_player = own_white ? create_player(white) : white_player
-    black_player = own_black ? create_player(black) : black_player
+    white_player = own_white ? create_player(white; rng=rng) : white_player
+    black_player = own_black ? create_player(black; rng=rng) : black_player
 
     trace = TraceEntry[]
     value_samples = PositionValueSample[]

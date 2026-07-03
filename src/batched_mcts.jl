@@ -32,6 +32,7 @@ up from child decision nodes.
 module BatchedMCTS
 
 using Distributions: Dirichlet
+import Random
 using ..AlphaZero: GI, Util, MCTS
 
 export BatchedEnv, batched_explore!, BatchedMctsPlayer, think, reset_player!, player_temperature
@@ -68,8 +69,8 @@ end
 
 Wrapper around MCTS.Env that enables batched evaluation.
 """
-mutable struct BatchedEnv{S, O, BO, BOWA, BE, G}
-    env::MCTS.Env{S, O}     # Underlying MCTS environment
+mutable struct BatchedEnv{S, O, R, BO, BOWA, BE, G}
+    env::MCTS.Env{S, O, R}   # Underlying MCTS environment
     batch_size::Int          # Number of simulations to batch
     pending::Vector{PendingSimulation{S}}  # Simulations waiting for evaluation
     batch_oracle::BO         # Optional: (Vector{S}) -> Vector{(P,V)} for batched GPU eval
@@ -87,14 +88,14 @@ mutable struct BatchedEnv{S, O, BO, BOWA, BE, G}
     inv_reward_scale::Float64
 end
 
-function BatchedEnv(env::MCTS.Env{S, O}, batch_size::Int;
+function BatchedEnv(env::MCTS.Env{S, O, R}, batch_size::Int;
                     batch_oracle::BO=nothing, batch_oracle_with_actions::BOWA=nothing,
-                    bearoff_evaluator::BE=nothing) where {S, O, BO, BOWA, BE}
+                    bearoff_evaluator::BE=nothing) where {S, O, R, BO, BOWA, BE}
     game_type = typeof(GI.init(env.gspec))
     eval_states = S[]; sizehint!(eval_states, batch_size)
     eval_actions = Vector{Int}[]; sizehint!(eval_actions, batch_size)
     eval_indices = Int[]; sizehint!(eval_indices, batch_size)
-    BatchedEnv{S, O, BO, BOWA, BE, game_type}(env, batch_size, PendingSimulation{S}[],
+    BatchedEnv{S, O, R, BO, BOWA, BE, game_type}(env, batch_size, PendingSimulation{S}[],
                               batch_oracle, batch_oracle_with_actions,
                               game_type[], PendingSimulation{S}[], eval_states,
                               eval_actions, eval_indices, bearoff_evaluator,
@@ -187,7 +188,7 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
             # Passthrough: sample one outcome, continue to decision node.
             # No tree entry, no backprop path entry. Equivalent to old deterministic wrapper.
             outcomes = GI.chance_outcomes(game)
-            r_val = rand()
+            r_val = rand(env.rng)
             idx = length(outcomes)
             acc = 0.0
             @inbounds for i in eachindex(outcomes)
@@ -449,10 +450,10 @@ function batched_explore!(benv::BatchedEnv, game, nsims)
     # Generate Dirichlet noise using cached actions from tree (avoids GI.available_actions)
     η = if env.noise_α != 0 && root_info !== nothing
         n_actions = length(root_info.actions)
-        rand(Dirichlet(n_actions, Float64(env.noise_α)))
+        rand(env.rng, Dirichlet(n_actions, Float64(env.noise_α)))
     elseif env.noise_α != 0
         n_actions = length(GI.available_actions(game))
-        rand(Dirichlet(n_actions, Float64(env.noise_α)))
+        rand(env.rng, Dirichlet(n_actions, Float64(env.noise_α)))
     else
         Float64[]
     end
@@ -561,7 +562,8 @@ Create a batched MCTS player.
 """
 function BatchedMctsPlayer(game_spec, oracle, params; batch_size=32, batch_oracle=nothing,
                            batch_oracle_with_actions=nothing, bearoff_evaluator=nothing,
-                           sim_budget_fn=nothing)
+                           sim_budget_fn=nothing,
+                           rng::Random.AbstractRNG=Random.Xoshiro(rand(UInt)))
     mcts = MCTS.Env(game_spec, oracle,
         gamma=params.gamma,
         cpuct=params.cpuct,
@@ -570,7 +572,8 @@ function BatchedMctsPlayer(game_spec, oracle, params; batch_size=32, batch_oracl
         prior_temperature=params.prior_temperature,
         chance_mode=params.chance_mode,
         progressive_widening_alpha=params.progressive_widening_alpha,
-        prior_virtual_visits=params.prior_virtual_visits)
+        prior_virtual_visits=params.prior_virtual_visits,
+        rng=rng)
     benv = BatchedEnv(mcts, batch_size; batch_oracle=batch_oracle,
                       batch_oracle_with_actions=batch_oracle_with_actions,
                       bearoff_evaluator=bearoff_evaluator)
