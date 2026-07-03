@@ -247,6 +247,15 @@ function parse_args()
             help = "Resume from checkpoint directory"
             arg_type = String
             default = ""
+
+        # Weight promotion gate
+        "--no-promotion-gate"
+            help = "Disable the weight promotion gate (publish every iteration unconditionally). The gate is otherwise ENABLED whenever the fixed bearoff eval is enabled (it is the gate signal)."
+            action = :store_true
+        "--gate-tolerance"
+            help = "Promotion-gate fractional tolerance: race value MAE may be up to this fraction worse than best-so-far and still publish (e.g. 0.10 = 10%)."
+            arg_type = Float64
+            default = 0.10
     end
 
     return ArgParse.parse_args(s)
@@ -316,6 +325,7 @@ flush(stdout)
 include(joinpath(@__DIR__, "..", "src", "distributed", "buffer.jl"))
 include(joinpath(@__DIR__, "..", "src", "distributed", "protocol.jl"))
 include(joinpath(@__DIR__, "..", "src", "distributed", "server.jl"))
+include(joinpath(@__DIR__, "..", "src", "distributed", "promotion_gate.jl"))
 
 # Game setup
 const GAME_NAME = "backgammon-deterministic"
@@ -445,6 +455,24 @@ if BEAROFF_FIXED_EVAL_ENABLED
     println("Bearoff eval: fixed canonical set, every $(BEAROFF_EVAL_INTERVAL) iters, raw=$(BEAROFF_EVAL_POSITIONS), mcts=$(BEAROFF_EVAL_MCTS_POSITIONS) @ $(BEAROFF_EVAL_MCTS_ITERS)")
 else
     println("Bearoff eval: disabled")
+end
+
+# ── Weight promotion gate ──────────────────────────────────────────────────
+# Gates PUBLICATION (served weight version + race_latest.data) on the fixed
+# bearoff eval's value MAE (lower is better). Training is never gated. See
+# src/distributed/promotion_gate.jl for the full rationale.
+# The gate can only work when the bearoff eval (its signal) is enabled.
+const GATE_ENABLED = BEAROFF_FIXED_EVAL_ENABLED && !ARGS["no_promotion_gate"]
+const GATE_METRIC_NAME = "value_mae"      # race value head MAE vs exact k=7 table (normalized)
+const GATE_TOL_FRAC = ARGS["gate_tolerance"]
+const GATE_TOL_ABS = 0.003                # absolute floor (normalized eq ≈ 0.009 points)
+const GATE_STATE = Ref(GateState())        # persists across iterations; seeded on --resume
+if GATE_ENABLED
+    println("Promotion gate: ENABLED — metric=$(GATE_METRIC_NAME), tol=$(round(100*GATE_TOL_FRAC, digits=1))% + $(GATE_TOL_ABS) abs. Publication held on regression; training never blocks. (race model only; contact publishes with race.)")
+elseif ARGS["no_promotion_gate"]
+    println("Promotion gate: DISABLED (--no-promotion-gate) — publishing every iteration unconditionally.")
+else
+    println("Promotion gate: DISABLED (fixed bearoff eval off — no gate signal available). Publishing every iteration unconditionally.")
 end
 
 # PositionValueSample is now provided by GameLoop module
@@ -890,6 +918,16 @@ if !isempty(ARGS["resume"])
             START_ITER = parse(Int, strip(read(iter_file, String)))
         end
         println("Resumed from $resume_dir at iteration $START_ITER")
+        # Restore promotion-gate best-so-far / last-decision from sidecar (graceful if absent)
+        if GATE_ENABLED
+            gs = load_gate_state(joinpath(resume_dir, "gate_state.json"))
+            if gs !== nothing
+                GATE_STATE[] = gs
+                println("Promotion gate: resumed state — best $(GATE_METRIC_NAME)=$(isfinite(gs.best_metric) ? round(gs.best_metric, digits=5) : "none"), last_published=$(gs.last_published), evals=$(gs.n_evals), blocked=$(gs.n_blocked)")
+            else
+                println("Promotion gate: no gate_state.json in resume dir — starting gate fresh.")
+            end
+        end
         # Buffer loading deferred to after replay_buffer is created (see RESUME_BUFFER_DIR below)
         global RESUME_BUFFER_DIR = joinpath(resume_dir, "..")
     else
@@ -1556,10 +1594,9 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     server_state.contact_loss = contact_loss
     server_state.race_loss = race_loss
 
-    # Update weight cache
-    update_weight_cache!(server_state, contact_network, race_network;
-                         contact_width=CONTACT_WIDTH, contact_blocks=CONTACT_BLOCKS,
-                         race_width=RACE_WIDTH, race_blocks=RACE_BLOCKS)
+    # Weight PUBLICATION is deferred until after the fixed bearoff eval below, so
+    # the promotion gate can act on THIS iteration's eval before serving new
+    # weights. See "Weight publication (gated)" further down.
 
     # Log to console
     grad_steps = train_result.contact.num_batches + train_result.race.num_batches
@@ -1718,9 +1755,54 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
                     end
                 end
                 @info "Fixed bearoff eval" iter=iter value_mae=round(bo_result["value_mae"], digits=4) value_corr=round(bo_result["value_corr"], digits=4) policy_top1=round(100 * bo_result["policy_top1"], digits=1) nn_top1=round(100 * bo_result["nn_top1"], digits=1) mcts_top1=round(100 * get(bo_result, "mcts_top1", NaN), digits=1)
+
+                # ── Promotion gate decision (race model) ────────────────────
+                # Gate on value MAE (lower is better). Updates persistent
+                # GATE_STATE; the publication step below reads GATE_STATE.
+                if GATE_ENABLED
+                    prev_best = GATE_STATE[].best_metric
+                    dec = gate_evaluate(GATE_STATE[], bo_result[GATE_METRIC_NAME];
+                                        tol_frac=GATE_TOL_FRAC, tol_abs=GATE_TOL_ABS)
+                    GATE_STATE[] = dec.state
+                    with_logger(TB_LOGGER) do
+                        @info "gate/metric" value=dec.metric log_step_increment=0
+                        @info "gate/best_metric" value=(isfinite(dec.best_metric) ? dec.best_metric : dec.metric) log_step_increment=0
+                        @info "gate/threshold" value=(isfinite(dec.threshold) ? dec.threshold : dec.metric) log_step_increment=0
+                        @info "gate/n_blocked" value=dec.state.n_blocked log_step_increment=0
+                    end
+                    if dec.publish
+                        @info "Promotion gate PASS — publication allowed" iter=iter metric=round(dec.metric, digits=5) best=round(dec.best_metric, digits=5) threshold=round(dec.threshold, digits=5) improved=dec.improved
+                    else
+                        @warn "Promotion gate BLOCK — regression detected, holding last-good weights" iter=iter metric=round(dec.metric, digits=5) best=round(dec.best_metric, digits=5) threshold=round(dec.threshold, digits=5) n_blocked=dec.state.n_blocked
+                    end
+                    # Save best-so-far checkpoint (for rollback) + sidecar on improvement
+                    if dec.improved
+                        FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "race_best.data"),
+                                             Flux.cpu(race_network))
+                        save_gate_state(joinpath(CHECKPOINT_DIR, "gate_state.json"), GATE_STATE[];
+                                        metric_name=GATE_METRIC_NAME, tol_frac=GATE_TOL_FRAC, tol_abs=GATE_TOL_ABS)
+                        @info "Saved race_best.data (new best $(GATE_METRIC_NAME)=$(round(dec.best_metric, digits=5)), prev=$(isfinite(prev_best) ? round(prev_best, digits=5) : "none"))"
+                    end
+                end
             end
         catch e
             @warn "Fixed bearoff eval failed" exception=e
+        end
+    end
+
+    # ── Weight publication (gated) ─────────────────────────────────────────
+    # Publish = bump served weight version (clients pull + self-play with them).
+    # Held back on a failed gate so a regressed model can't poison the buffer.
+    # When the gate is disabled this is unconditional (original behavior).
+    publish_this_iter = !GATE_ENABLED || GATE_STATE[].last_published
+    if publish_this_iter
+        update_weight_cache!(server_state, contact_network, race_network;
+                             contact_width=CONTACT_WIDTH, contact_blocks=CONTACT_BLOCKS,
+                             race_width=RACE_WIDTH, race_blocks=RACE_BLOCKS)
+    end
+    if GATE_ENABLED
+        with_logger(TB_LOGGER) do
+            @info "gate/published" value=(publish_this_iter ? 1 : 0) log_step_increment=0
         end
     end
 
@@ -1729,16 +1811,28 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
 
     # Checkpoint
     if iter % ARGS["checkpoint_interval"] == 0
+        # iter_N checkpoints are history — always written regardless of the gate.
         FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "contact_iter_$iter.data"),
                              Flux.cpu(contact_network))
         FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "race_iter_$iter.data"),
                              Flux.cpu(race_network))
-        FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "contact_latest.data"),
-                             Flux.cpu(contact_network))
-        FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "race_latest.data"),
-                             Flux.cpu(race_network))
+        # *_latest.data are the PUBLISHED weights — only overwrite when the gate
+        # permits publication this iteration (else keep serving last-good).
+        if publish_this_iter
+            FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "contact_latest.data"),
+                                 Flux.cpu(contact_network))
+            FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "race_latest.data"),
+                                 Flux.cpu(race_network))
+        else
+            @warn "Gate held publication — leaving race_latest.data / contact_latest.data at last-good weights" iter=iter
+        end
         open(joinpath(CHECKPOINT_DIR, "iter.txt"), "w") do f
             print(f, iter)
+        end
+        # Persist gate state alongside checkpoints for --resume.
+        if GATE_ENABLED
+            save_gate_state(joinpath(CHECKPOINT_DIR, "gate_state.json"), GATE_STATE[];
+                            metric_name=GATE_METRIC_NAME, tol_frac=GATE_TOL_FRAC, tol_abs=GATE_TOL_ABS)
         end
         @info "Saved checkpoint at iteration $iter"
     end

@@ -33,6 +33,10 @@ end
   include("test_bearoff_doubles_regression.jl")
 end
 
+@testset "Promotion Gate" begin
+  include("test_promotion_gate.jl")
+end
+
 @testset "Game Loop Integration" begin
   include("test_play_game_integration.jl")
 end
