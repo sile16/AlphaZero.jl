@@ -406,6 +406,14 @@ function handle_eval_submit(req::HTTP.Request, state::ServerState)
         value_opp = Float64.(get(body, "value_opp", Float64[]))
         value_is_contact = Bool.(get(body, "value_is_contact", Bool[]))
 
+        # Reject length-skewed value arrays here, at the boundary. finalize_eval
+        # does `value_nn .- value_opp` and cor(...) over the aggregated arrays; a
+        # single mismatched submission would throw DimensionMismatch inside the
+        # training loop's finalize and could take training down.
+        if length(value_nn) != length(value_opp)
+            return HTTP.Response(400, "value_nn ($(length(value_nn))) and value_opp ($(length(value_opp))) length mismatch")
+        end
+
         eval_complete = false
         accepted = false
         error_status = 409

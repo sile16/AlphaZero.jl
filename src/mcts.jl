@@ -253,7 +253,7 @@ function uct_scores(info::StateInfo, cpuct, ϵ, η)
   sqrtNtot = sqrt(Ntot(info))
   return map(enumerate(info.stats)) do (i, a)
     Q = a.W / max(a.N, 1)
-    P = iszero(ϵ) ? a.P : (1-ϵ) * a.P + ϵ * η[i]
+    P = (iszero(ϵ) || isempty(η)) ? a.P : (1-ϵ) * a.P + ϵ * η[i]
     Q + cpuct * P * sqrtNtot / (a.N + 1)
   end
 end
@@ -265,7 +265,7 @@ function best_uct_action(info::StateInfo, cpuct, ϵ, η)
   best_id = 1
   @inbounds for (i, a) in enumerate(info.stats)
     Q = a.W / max(a.N, 1)
-    P = iszero(ϵ) ? a.P : (1-ϵ) * a.P + ϵ * η[i]
+    P = (iszero(ϵ) || isempty(η)) ? a.P : (1-ϵ) * a.P + ϵ * η[i]
     score = Q + cpuct * P * sqrtNtot / (a.N + 1)
     if score > best_score
       best_score = score

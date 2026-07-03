@@ -1709,7 +1709,9 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         n_bo = length(bearoff_mask)
         if n_bo >= 100
             n_sample = min(1000, n_bo)
-            sample_idx = bearoff_mask[randperm(n_sample)]
+            # Draw a random subset of ALL bearoff slots, not just the first n_sample
+            # (randperm(n_sample) only permutes 1:n_sample → oldest slots only).
+            sample_idx = bearoff_mask[randperm(n_bo)[1:n_sample]]
 
             # Get states and targets
             bo_states = replay_buffer.states[:, sample_idx]
@@ -1910,22 +1912,31 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     lock(EVAL_LOCK) do
         job = EVAL_JOB[]
         if job !== nothing && EvalManager.is_complete(job)
-            result = EvalManager.finalize_eval(job)
-            @info "Eval completed iter $(job.iter)" equity=round(result.equity, digits=3) win_pct=round(result.win_pct * 100, digits=1) games=result.num_games
-            # Log to TB at the eval iteration (not the current training iteration)
-            saved_step = TB_LOGGER.global_step
-            TB_LOGGER.global_step = job.iter
-            with_logger(TB_LOGGER) do
-                @info "eval/equity" value=result.equity log_step_increment=0
-                @info "eval/win_pct" value=result.win_pct * 100 log_step_increment=0
-                @info "eval/white_equity" value=result.white_equity log_step_increment=0
-                @info "eval/black_equity" value=result.black_equity log_step_increment=0
-                @info "eval/value_mse" value=result.value_mse log_step_increment=0
-                @info "eval/value_corr" value=result.value_corr log_step_increment=0
-                @info "eval/games" value=result.num_games log_step_increment=0
+            # finalize_eval aggregates client-submitted value arrays and can throw
+            # (e.g. DimensionMismatch on a malformed submission). This runs inside
+            # the training task — an unguarded throw here KILLS training. Guard it
+            # and ALWAYS clear the job so one bad eval can't wedge or crash the run.
+            try
+                result = EvalManager.finalize_eval(job)
+                @info "Eval completed iter $(job.iter)" equity=round(result.equity, digits=3) win_pct=round(result.win_pct * 100, digits=1) games=result.num_games
+                # Log to TB at the eval iteration (not the current training iteration)
+                saved_step = TB_LOGGER.global_step
+                TB_LOGGER.global_step = job.iter
+                with_logger(TB_LOGGER) do
+                    @info "eval/equity" value=result.equity log_step_increment=0
+                    @info "eval/win_pct" value=result.win_pct * 100 log_step_increment=0
+                    @info "eval/white_equity" value=result.white_equity log_step_increment=0
+                    @info "eval/black_equity" value=result.black_equity log_step_increment=0
+                    @info "eval/value_mse" value=result.value_mse log_step_increment=0
+                    @info "eval/value_corr" value=result.value_corr log_step_increment=0
+                    @info "eval/games" value=result.num_games log_step_increment=0
+                end
+                TB_LOGGER.global_step = saved_step
+            catch e
+                @error "finalize_eval failed; discarding eval job for iter $(job.iter)" exception=(e, catch_backtrace())
+            finally
+                EVAL_JOB[] = nothing
             end
-            TB_LOGGER.global_step = saved_step
-            EVAL_JOB[] = nothing
         end
     end
 

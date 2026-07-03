@@ -136,6 +136,22 @@ function per_add_batch!(buf::PERBuffer, batch_states::AbstractMatrix{Float32},
     n = length(batch_values)
     n == 0 && return
 
+    # Validate dims BEFORE the @inbounds copy below. Batches arrive from
+    # possibly-untrusted / stale clients (a worker on an older git commit or a
+    # different BACKGAMMON_OBS_TYPE can send a wrong state_dim, and a malformed
+    # payload can carry length-skewed columns). Without this, the @inbounds loop
+    # reads out of bounds — silent buffer corruption or a segfault that takes the
+    # whole training process down. Fail loudly so handle_samples returns 400.
+    size(batch_states, 1) == size(buf.states, 1) ||
+        error("per_add_batch!: state_dim $(size(batch_states,1)) != buffer $(size(buf.states,1))")
+    size(batch_policies, 1) == size(buf.policies, 1) ||
+        error("per_add_batch!: num_actions $(size(batch_policies,1)) != buffer $(size(buf.policies,1))")
+    (size(batch_states, 2) == n && size(batch_policies, 2) == n &&
+     size(batch_equities, 1) == 5 && size(batch_equities, 2) == n &&
+     length(batch_has_equity) == n && length(batch_is_chance) == n &&
+     length(batch_is_contact) == n && length(batch_is_bearoff) == n) ||
+        error("per_add_batch!: inconsistent batch column lengths (n=$n)")
+
     lock(buf.lock) do
         for i in 1:n
             pos = buf.write_pos
@@ -390,8 +406,12 @@ function reanalyze_update!(buf::PERBuffer, indices::Vector{Int},
                 buf.equities[5, idx] = (1f0 - α_blend) * buf.equities[5, idx] + α_blend * new_eq_bgl[k]
             end
 
-            # Update PER priority
-            buf.priorities[idx] = abs(new_values[k] - old_val)
+            # Update PER priority. new_values/old_val are RAW equity [-3,3], but the
+            # training path (compute_td_errors in training_server.jl) writes
+            # priorities from the NORMALIZED TD error |V̂/3 - V/3|. Both paths share
+            # buf.priorities, so reanalyze MUST normalize by the same /3 or its
+            # slots get sampled ~3^α ≈ 1.9x too often — a silent PER skew.
+            buf.priorities[idx] = abs(new_values[k] - old_val) / 3f0
         end
     end
     return skipped

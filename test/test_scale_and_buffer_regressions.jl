@@ -312,3 +312,38 @@ end
     @test buf.values[3] == 3.0f0
     @test buf.values[4] == 4.0f0
 end
+
+@testset "Buffer: per_add_batch! rejects dim/length-skewed batches (no @inbounds OOB)" begin
+    # A worker on a stale git commit / different BACKGAMMON_OBS_TYPE can POST a
+    # wrong state_dim; a malformed payload can carry length-skewed columns. The
+    # @inbounds copy would OOB-read (corruption/segfault) — validation rejects it.
+    sd, na, cap = 4, 6, 8
+    buf = PERBuffer(cap, sd, na)
+    g = (rand(Float32, sd, 2), rand(Float32, na, 2), rand(Float32, 2),
+         rand(Float32, 5, 2), fill(true, 2), fill(false, 2), fill(true, 2), fill(false, 2))
+    per_add_batch!(buf, g...)                 # sanity: valid batch accepted
+    @test buf.size == 2
+
+    @test_throws ErrorException per_add_batch!(buf, rand(Float32, sd + 1, 2), g[2:8]...)   # wrong state_dim
+    @test_throws ErrorException per_add_batch!(buf, g[1], rand(Float32, na + 1, 2), g[3:8]...) # wrong num_actions
+    @test_throws ErrorException per_add_batch!(buf, g[1], g[2], rand(Float32, 3), g[4:8]...)   # values col skew
+    @test_throws ErrorException per_add_batch!(buf, g[1:4]..., fill(true, 3), g[6:8]...)       # flag col skew
+    @test buf.size == 2                       # rejected batches left the buffer untouched
+end
+
+@testset "Buffer: reanalyze writes NORMALIZED PER priority (matches training scale)" begin
+    # Reanalyze priority must be on the same /3-normalized scale as
+    # compute_td_errors, or reanalyzed slots are oversampled ~1.9x.
+    sd, na, cap = 4, 6, 2
+    buf = PERBuffer(cap, sd, na)
+    vals = Float32[3.0, -3.0]                  # raw [-3,3] equity
+    per_add_batch!(buf, rand(Float32, sd, 2), rand(Float32, na, 2), vals,
+                   rand(Float32, 5, 2), fill(true, 2), fill(false, 2),
+                   fill(true, 2), fill(false, 2))
+    gens = copy(buf.generation[1:2])
+    z = zeros(Float32, 2)
+    reanalyze_update!(buf, [1, 2], gens, Float32[0.0, 0.0], z, z, z, z, z; α_blend=1.0f0)
+    # slot1: |0 - 3|/3 = 1.0 ; slot2: |0 - (-3)|/3 = 1.0 (would be 3.0 raw without the fix)
+    @test buf.priorities[1] ≈ 1.0f0
+    @test buf.priorities[2] ≈ 1.0f0
+end
