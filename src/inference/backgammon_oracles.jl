@@ -439,6 +439,22 @@ function make_cpu_oracles(backend::Union{Symbol, AbstractString},
     resolved = resolve_cpu_backend(backend)
     dual = secondary_net !== nothing || secondary_fw !== nothing
 
+    # Guard: never silently build a broken oracle out of `nothing`. Each head
+    # needs a source — a network (always, for :flux) or FastWeights (for :fast).
+    # A nothing net + nothing fw used to crash deep inside extract_fast_weights /
+    # evaluate_batch (the eval-oracle bug fixed in 11c46b2); fail loudly here.
+    if resolved == :flux
+        primary_net !== nothing ||
+            error("make_cpu_oracles(:flux): primary_net is required (got nothing)")
+        (!dual || secondary_net !== nothing) ||
+            error("make_cpu_oracles(:flux): secondary_net is required for dual routing (got nothing)")
+    else  # :fast
+        (primary_net !== nothing || primary_fw !== nothing) ||
+            error("make_cpu_oracles(:fast): primary head needs a network or FastWeights (both nothing)")
+        (!dual || secondary_net !== nothing || secondary_fw !== nothing) ||
+            error("make_cpu_oracles(:fast): secondary head needs a network or FastWeights for dual routing (both nothing)")
+    end
+
     if resolved == :flux
         flux_task_buffers = _task_buffer_resolver() do
             OracleScratch(cfg.state_dim, cfg.num_actions, batch_size + 1; dual=dual)

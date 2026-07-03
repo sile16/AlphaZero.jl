@@ -1459,16 +1459,14 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
     lib_size = filesize(WILDBG_LIB_EVAL)
     nets_variant = lib_size > 16_000_000 ? :large : :small
 
-    make_eval_oracles(batch_size) = if CPU_INFERENCE_BACKEND == :fast
-        AlphaZero.BackgammonInference.make_cpu_oracles(
-            CPU_INFERENCE_BACKEND, eval_contact_net, eval_cfg;
-            secondary_net=eval_race_net, batch_size=batch_size,
-            primary_fw=eval_contact_fw, secondary_fw=eval_race_fw, nslots=1)
-    else
-        AlphaZero.BackgammonInference.make_cpu_oracles(
-            CPU_INFERENCE_BACKEND, eval_contact_net, eval_cfg;
-            secondary_net=eval_race_net, batch_size=batch_size, nslots=1)
-    end
+    # One call for both backends: in :flux mode eval_contact_fw/eval_race_fw are
+    # nothing and make_cpu_oracles ignores them (it routes on the net); in :fast
+    # mode they carry the extracted FastWeights. make_cpu_oracles now guards
+    # against a nothing net+fw, so we never silently build a broken oracle.
+    make_eval_oracles(batch_size) = AlphaZero.BackgammonInference.make_cpu_oracles(
+        CPU_INFERENCE_BACKEND, eval_contact_net, eval_cfg;
+        secondary_net=eval_race_net, batch_size=batch_size,
+        primary_fw=eval_contact_fw, secondary_fw=eval_race_fw, nslots=1)
 
     # Create ALL per-thread resources ONCE (reused across all chunks in this eval)
     n_threads = Threads.maxthreadid()
@@ -1599,9 +1597,14 @@ function process_eval_chunk!(chunk_data::Dict)
         end
     end
 
-    # Parallel eval — each thread uses its own resources (nothing shared)
+    # Parallel eval — each thread uses its own resources (nothing shared).
+    # `:static` pins one task per thread for the whole loop, so threadid() is
+    # STABLE within the body (no task migration). This makes the threadid()-keyed
+    # resource access safe even if an oracle ever yields (e.g. a GPU-server
+    # oracle) — the resource stays exclusively owned by this thread's loop task.
+    # The default :dynamic scheduler gives no such guarantee.
     try
-        Threads.@threads for job in 1:n_games
+        Threads.@threads :static for job in 1:n_games
             wid = Threads.threadid()
             if wid > n_threads
                 error("Eval resource slot missing for thread id $wid (n_threads=$n_threads)")

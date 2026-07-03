@@ -480,4 +480,30 @@ end
             @test moves > 0
         end
     end
+
+    @testset "make_cpu_oracles rejects nothing sources (never build broken oracle)" begin
+        # :flux requires the network for every head it will evaluate.
+        @test_throws ErrorException AlphaZero.BackgammonInference.make_cpu_oracles(
+            :flux, nothing, cfg; batch_size=4, nslots=1)
+        @test_throws ErrorException AlphaZero.BackgammonInference.make_cpu_oracles(
+            :flux, nothing, cfg; secondary_net=nothing, secondary_fw=nothing,
+            batch_size=4, nslots=1)
+
+        # :fast needs a network OR FastWeights on each head; nothing+nothing is
+        # the eval-oracle crash the guard now catches at the boundary.
+        @test_throws ErrorException AlphaZero.BackgammonInference.make_cpu_oracles(
+            :fast, nothing, cfg; batch_size=4, nslots=1)
+
+        # Dual routing requested (secondary_net set) but the primary head has no
+        # source — still errors, at the primary guard.
+        contact_net = FluxLib.FCResNetMultiHead(
+            gspec, FluxLib.FCResNetMultiHeadHP(width=16, num_blocks=1))
+        @test_throws ErrorException AlphaZero.BackgammonInference.make_cpu_oracles(
+            :fast, nothing, cfg; secondary_net=contact_net, batch_size=4, nslots=1)
+
+        # Positive control: a valid single-head fast oracle still builds.
+        single, batch = AlphaZero.BackgammonInference.make_cpu_oracles(
+            :fast, contact_net, cfg; batch_size=4, nslots=1)
+        @test single !== nothing && batch !== nothing
+    end
 end
