@@ -1583,7 +1583,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     if !ARGS["bootstrap_only"] && ARGS["bootstrap_train_iters"] > 0 && iter == ARGS["bootstrap_train_iters"] + 1
         println("\n*** Bootstrap phase complete ($(ARGS["bootstrap_train_iters"]) iters). Clearing buffer for pure self-play. ***")
         flush(stdout)
-        reset!(replay_buffer)
+        clear_for_selfplay!(replay_buffer)
         # Wait for self-play to fill buffer with at least 1 iter worth of data
         min_samples = SAMPLES_PER_ITERATION
         println("Waiting for $min_samples self-play samples before resuming training...")

@@ -66,11 +66,28 @@ function PERBuffer(capacity::Int, state_dim::Int, num_actions::Int;
     )
 end
 
-"""Reset a PER buffer to an empty state.
+"""
+    reset!(buf::PERBuffer)
 
-Clears stored columns and metadata under the buffer lock. Slot generations are
-incremented, not zeroed, so any in-flight reanalysis result captured before the
-reset cannot be blended into samples written after the reset.
+Reset a PER buffer to a fully empty state, under the buffer lock.
+
+Post-conditions (the reset invariant):
+- `size == 0`, `write_pos == 1` — logically empty; the next write lands in slot 1.
+- Every stored column is zeroed (states, policies, values, equities) and every
+  boolean flag cleared (has_equity, is_chance, is_contact, is_bearoff), so no
+  stale sample can be read even by a reader that ignores `size`.
+- `priorities` reset to 1.0 (uniform) — a partial reset that left stale
+  priorities would bias PER sampling toward overwritten slots.
+- `generation` is INCREMENTED, not zeroed: an in-flight reanalysis that captured
+  a slot's pre-reset generation fails the generation-match guard and skips, so
+  it can never blend a stale NN prediction into a post-reset sample.
+- PER β-annealing restarts (`beta = beta_init`, `current_iter = 0`).
+
+Design note: we physically zero all columns rather than a two-phase
+"mark-empty, overwrite-lazily" reset. The zeroing is O(capacity) but happens
+only at rare transitions (the bootstrap→self-play flush), never per iteration,
+and it removes an entire class of stale-read bugs regardless of reader
+discipline — worth the one-time cost.
 """
 function reset!(buf::PERBuffer)
     lock(buf.lock) do
@@ -91,6 +108,17 @@ function reset!(buf::PERBuffer)
     end
     return nothing
 end
+
+"""
+    clear_for_selfplay!(buf::PERBuffer)
+
+Semantic alias for [`reset!`](@ref), used at the bootstrap→self-play transition.
+After the bootstrap-training phase the replay buffer still holds bootstrap-
+sourced samples that anchor the model to the teacher's level; clearing it forces
+subsequent training to draw only from fresh self-play data. See `reset!` for the
+exact invariant established.
+"""
+clear_for_selfplay!(buf::PERBuffer) = reset!(buf)
 
 """Add columnar samples directly from a SampleBatch (no NamedTuple allocation).
 

@@ -239,6 +239,28 @@ end
     @test buf.priorities[1:2] == Float32[2.5, 2.5]
 end
 
+@testset "Buffer: clear_for_selfplay! establishes the reset invariant" begin
+    state_dim, num_actions, capacity = 4, 6, 8
+    buf = PERBuffer(capacity, state_dim, num_actions)
+    n = 3
+    s = rand(Float32, state_dim, n); p = rand(Float32, num_actions, n)
+    vals = rand(Float32, n); e = rand(Float32, 5, n)
+    h = fill(true, n); ch = fill(true, n); c = fill(true, n); b = fill(true, n)
+    per_add_batch!(buf, s, p, vals, e, h, ch, c, b; initial_priority=3.0f0)
+    gens = copy(buf.generation)
+
+    clear_for_selfplay!(buf)   # semantic alias for reset! — same invariant
+
+    @test buf.size == 0
+    @test buf.write_pos == 1
+    @test buf.beta == buf.beta_init
+    @test all(buf.priorities .== 1.0f0)
+    @test all(.!buf.is_chance) && all(.!buf.is_contact) && all(.!buf.is_bearoff)
+    @test all(.!buf.has_equity)
+    @test all(buf.generation .== gens .+ UInt32(1))
+    @test partition_indices(buf) == (contact=Int[], race=Int[], all=Int[])
+end
+
 @testset "Buffer: reanalyze skips slots overwritten since extraction" begin
     # reanalyze extracts a batch, runs slow NN inference, then blends predictions
     # back by INDEX. A slot overwritten in between now holds a DIFFERENT sample;
