@@ -21,6 +21,10 @@ end
   include("test_multihead.jl")
 end
 
+@testset "Fast Inference" begin
+  include("test_fast_inference.jl")
+end
+
 @testset "Terminal Bearoff Rewards" begin
   include("test_terminal_bearoff_rewards.jl")
 end
