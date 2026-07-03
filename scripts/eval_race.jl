@@ -144,9 +144,12 @@ function eval_race_game(single_oracle, batch_oracle, wildbg_backend, position_da
     az = GameLoop.MctsAgent(single_oracle, batch_oracle, mcts_params, batch_size, gspec)
     wb = GameLoop.ExternalAgent(wildbg_backend)
 
-    # Value comparison functions
+    # Value comparison functions.
+    # NN oracle V is normalized equity/3 ∈ [-1,1]; wildbg evaluate() returns raw
+    # points ∈ [-3,3]. Scale NN back to raw points so MSE/MAE/bias/corr compare
+    # like with like (in equity units).
     value_oracle_fn = env -> begin
-        Float64(value_batch_oracle([env.game])[1][2])
+        Float64(value_batch_oracle([env.game])[1][2]) * 3.0
     end
     wildbg_value_fn = env -> Float64(BackgammonNet.evaluate(wildbg_backend, env.game))
 

@@ -181,6 +181,21 @@ baselines such as minmax players.
 """
 function heuristic_value end
 
+"""
+    reward_scale(::AbstractGameSpec)
+
+Return the maximum absolute terminal reward for the game (default `1.0`).
+
+MCTS divides rewards by this scale so tree Q-values stay on the same
+`[-1, 1]` scale as network value outputs. Games whose rewards exceed
+`[-1, 1]` (e.g. backgammon: ±1/±2/±3 for win/gammon/backgammon) must
+override this, otherwise raw rewards dominate the normalized NN values
+in the same Q totals and distort the PUCT exploration balance.
+"""
+function reward_scale(::AbstractGameSpec)
+  return 1.0
+end
+
 #####
 ##### Multi-head equity support (for games like backgammon)
 #####

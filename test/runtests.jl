@@ -21,6 +21,18 @@ end
   include("test_multihead.jl")
 end
 
+@testset "Terminal Bearoff Rewards" begin
+  include("test_terminal_bearoff_rewards.jl")
+end
+
+@testset "Scale and Buffer Regressions" begin
+  include("test_scale_and_buffer_regressions.jl")
+end
+
+@testset "Bearoff Doubles Regression" begin
+  include("test_bearoff_doubles_regression.jl")
+end
+
 @testset "Game Loop Integration" begin
   include("test_play_game_integration.jl")
 end

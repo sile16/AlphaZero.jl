@@ -195,6 +195,10 @@ function GI.white_reward(g::GameEnv)
   return Float64(g.game.reward)
 end
 
+# Terminal rewards are ±1/±2/±3 (win/gammon/backgammon). MCTS divides rewards
+# by this so tree Q-values match the NN value output scale (equity/3 ∈ [-1,1]).
+GI.reward_scale(::GameSpec) = 3.0
+
 #####
 ##### Chance Node Interface (stochastic — dice exposed)
 #####

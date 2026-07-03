@@ -237,43 +237,51 @@ end
 """Extract a training batch from buffer at given indices.
 
 Returns columnar data ready for prepare_batch — no NamedTuple allocation.
-Lock-free: safe because training thread is the only mutator of sample data
-(HTTP thread only appends at write_pos, never modifies existing entries).
-Only priorities are written concurrently, but we don't read those here."""
+Holds the buffer lock during the copy: once the circular buffer is full,
+`per_add_batch!` OVERWRITES old entries in place, so a lock-free read could
+see a torn sample (state from the old entry, policy from the new one). The
+copy is O(batch) and cheap relative to a training step."""
 function extract_batch(buf::PERBuffer, indices::Vector{Int})
-    n = length(indices)
-    states = buf.states[:, indices]
-    policies = buf.policies[:, indices]
-    values = buf.values[indices]
-    equities = buf.equities[:, indices]
-    has_equity = buf.has_equity[indices]
-    is_chance = buf.is_chance[indices]
-    is_contact = buf.is_contact[indices]
-    is_bearoff = buf.is_bearoff[indices]
-    return (; states, policies, values, equities, has_equity, is_chance, is_contact, is_bearoff)
+    lock(buf.lock) do
+        states = buf.states[:, indices]
+        policies = buf.policies[:, indices]
+        values = buf.values[indices]
+        equities = buf.equities[:, indices]
+        has_equity = buf.has_equity[indices]
+        is_chance = buf.is_chance[indices]
+        is_contact = buf.is_contact[indices]
+        is_bearoff = buf.is_bearoff[indices]
+        (; states, policies, values, equities, has_equity, is_chance, is_contact, is_bearoff)
+    end
 end
 
 """Get indices for contact vs race samples.
-Lock-free: reads immutable sample flags (only write_pos changes concurrently)."""
+Holds the buffer lock: once the circular buffer is full, `per_add_batch!`
+overwrites entries (including `is_contact`) in place, so a lock-free scan
+could partition an index on a stale flag and later train the wrong model
+on that sample."""
 function partition_indices(buf::PERBuffer)
-    n = buf.size
-    contact_idx = Int[]
-    race_idx = Int[]
-    for i in 1:n
-        if buf.is_contact[i]
-            push!(contact_idx, i)
-        else
-            push!(race_idx, i)
+    lock(buf.lock) do
+        n = buf.size
+        contact_idx = Int[]
+        race_idx = Int[]
+        for i in 1:n
+            if buf.is_contact[i]
+                push!(contact_idx, i)
+            else
+                push!(race_idx, i)
+            end
         end
+        (contact=contact_idx, race=race_idx, all=collect(1:n))
     end
-    return (contact=contact_idx, race=race_idx, all=collect(1:n))
 end
 
 """Vectorized reanalyze update — blends new NN values into buffer at given indices.
 
-Lock-free for value/equity writes (training thread is sole writer).
-Only priorities need atomic-style updates but races are benign (stale priority
-just means slightly suboptimal PER sampling, not correctness issues)."""
+Holds the buffer lock: once the circular buffer is full, `per_add_batch!`
+overwrites entries in place, so an unlocked blend could mix stale NN outputs
+(computed from the OLD sample at that index) into a NEWER sample's targets.
+The lock ensures the blend applies atomically w.r.t. concurrent uploads."""
 function reanalyze_update!(buf::PERBuffer, indices::Vector{Int},
                            new_values::Vector{Float32},
                            new_eq_win::Vector{Float32},
@@ -284,22 +292,24 @@ function reanalyze_update!(buf::PERBuffer, indices::Vector{Int},
                            α_blend::Float32=0.5f0)
     n = length(indices)
 
-    @inbounds for k in 1:n
-        idx = indices[k]
-        old_val = buf.values[idx]
-        buf.values[idx] = (1f0 - α_blend) * old_val + α_blend * new_values[k]
+    lock(buf.lock) do
+        @inbounds for k in 1:n
+            idx = indices[k]
+            old_val = buf.values[idx]
+            buf.values[idx] = (1f0 - α_blend) * old_val + α_blend * new_values[k]
 
-        # Blend equity heads
-        if buf.has_equity[idx]
-            buf.equities[1, idx] = (1f0 - α_blend) * buf.equities[1, idx] + α_blend * new_eq_win[k]
-            buf.equities[2, idx] = (1f0 - α_blend) * buf.equities[2, idx] + α_blend * new_eq_gw[k]
-            buf.equities[3, idx] = (1f0 - α_blend) * buf.equities[3, idx] + α_blend * new_eq_bgw[k]
-            buf.equities[4, idx] = (1f0 - α_blend) * buf.equities[4, idx] + α_blend * new_eq_gl[k]
-            buf.equities[5, idx] = (1f0 - α_blend) * buf.equities[5, idx] + α_blend * new_eq_bgl[k]
+            # Blend equity heads
+            if buf.has_equity[idx]
+                buf.equities[1, idx] = (1f0 - α_blend) * buf.equities[1, idx] + α_blend * new_eq_win[k]
+                buf.equities[2, idx] = (1f0 - α_blend) * buf.equities[2, idx] + α_blend * new_eq_gw[k]
+                buf.equities[3, idx] = (1f0 - α_blend) * buf.equities[3, idx] + α_blend * new_eq_bgw[k]
+                buf.equities[4, idx] = (1f0 - α_blend) * buf.equities[4, idx] + α_blend * new_eq_gl[k]
+                buf.equities[5, idx] = (1f0 - α_blend) * buf.equities[5, idx] + α_blend * new_eq_bgl[k]
+            end
+
+            # Update PER priority
+            buf.priorities[idx] = abs(new_values[k] - old_val)
         end
-
-        # Update PER priority (benign race with per_add_batch!)
-        buf.priorities[idx] = abs(new_values[k] - old_val)
     end
 end
 

@@ -80,6 +80,9 @@ mutable struct BatchedEnv{S, O, BO, BE, G}
     _eval_indices::Vector{Int}
     # Bear-off evaluator: (game) -> Union{Float64, Nothing}
     bearoff_evaluator::BE
+    # 1 / GI.reward_scale(gspec): rewards are multiplied by this so tree Q-values
+    # stay on the same [-1,1] scale as NN value outputs (backgammon: 1/3)
+    inv_reward_scale::Float64
 end
 
 function BatchedEnv(env::MCTS.Env{S, O}, batch_size::Int; batch_oracle::BO=nothing, bearoff_evaluator::BE=nothing) where {S, O, BO, BE}
@@ -88,7 +91,8 @@ function BatchedEnv(env::MCTS.Env{S, O}, batch_size::Int; batch_oracle::BO=nothi
     eval_indices = Int[]; sizehint!(eval_indices, batch_size)
     BatchedEnv{S, O, BO, BE, game_type}(env, batch_size, PendingSimulation{S}[], batch_oracle,
                               game_type[], PendingSimulation{S}[], eval_states,
-                              eval_indices, bearoff_evaluator)
+                              eval_indices, bearoff_evaluator,
+                              1.0 / GI.reward_scale(env.gspec))
 end
 
 """Pre-allocate sim pool with sizehinted vectors (called once, reused forever)."""
@@ -254,7 +258,9 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
         push!(sim.path, (state, action_id))
 
         GI.play!(game, action)
-        wr = GI.white_reward(game)
+        # Normalize by reward scale so terminal rewards (±1/±2/±3 in backgammon)
+        # mix with NN values ([-1,1]) on the same scale in backprop Q totals
+        wr = GI.white_reward(game) * benv.inv_reward_scale
         r = wp ? wr : -wr
         push!(sim.rewards, r)
 

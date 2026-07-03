@@ -262,6 +262,7 @@ end
 
 include(joinpath(BEAROFF_SRC_DIR, "bearoff_k7.jl"))
 using .BearoffK7
+include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
 
 const BEAROFF_SERVER_URL = "http://192.168.20.155:8787"
 
@@ -376,8 +377,11 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
         return nothing
     end
 
-    # Compute in mover's perspective (maximize), then convert to white-relative
-    best_mover_value = -Inf32
+    # Compute in mover's perspective (maximize), then convert to white-relative.
+    # bearoff_turn_value_equity handles terminal (reward carries gammon multiplier),
+    # completed-turn chance nodes (table lookup), AND doubles mid-turn states
+    # (recursion) — see scripts/bearoff_eval_common.jl for the doubles pitfall.
+    best_mover_value = -Inf
     best_mover_equity = nothing  # 5-elem joint vector from mover's perspective
     bg_copy = BackgammonNet.clone(game)
     mover = game.current_player  # 0 (P0/white) or 1 (P1/black)
@@ -385,27 +389,7 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
     for action in actions
         BackgammonNet.copy_state!(bg_copy, game)
         BackgammonNet.apply_action!(bg_copy, action)
-
-        local mover_val::Float32
-        local mover_eq::Vector{Float32}
-
-        if bg_copy.terminated
-            # Mover bore off all checkers — they win (simple win, no gammons at terminal bearoff)
-            mover_val = 1.0f0
-            mover_eq = Float32[1.0, 0.0, 0.0, 0.0, 0.0]
-        elseif BearoffK7.is_bearoff_position(bg_copy.p0, bg_copy.p1)
-            # After move, opponent's turn at a chance node.
-            # lookup() returns from bg_copy.current_player's perspective (the opponent).
-            r_opp = BearoffK7.lookup(table, bg_copy)
-            # Negate for mover's perspective.
-            mover_val = -BearoffK7.compute_equity(r_opp)
-            # k=7 returns joint values directly — convert to 5-head and flip
-            opp_eq = Float32[r_opp.pW, r_opp.pWG, 0.0f0, r_opp.pLG, 0.0f0]
-            mover_eq = AlphaZero.flip_equity_perspective(opp_eq)
-        else
-            continue
-        end
-
+        mover_val, mover_eq = bearoff_turn_value_equity(table, bg_copy, mover)
         if mover_val > best_mover_value
             best_mover_value = mover_val
             best_mover_equity = mover_eq
@@ -415,6 +399,7 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
     if best_mover_equity === nothing
         return nothing
     end
+    best_mover_value = Float32(best_mover_value)
 
     # Convert mover-relative to white-relative
     if mover == 0
@@ -435,7 +420,8 @@ At chance nodes (pre-dice): returns the pre-dice table value directly (exact).
 At decision nodes (post-dice): enumerates all legal moves, looks up each resulting
 position in the bear-off table, and returns the best value (exact post-dice Q-value).
 
-Returns white-relative equity or nothing if not a bear-off position.
+Returns white-relative equity NORMALIZED to [-1,1] (points/3) so tree values are
+on the same scale as NN value output (equity/3), or nothing if not a bear-off position.
 """
 function make_bearoff_evaluator(table)
     return function(game_env)
@@ -449,47 +435,29 @@ function make_bearoff_evaluator(table)
         end
 
         if BackgammonNet.is_chance_node(bg)
-            # Pre-dice: table value is exact (mover-relative → white-relative)
+            # Pre-dice: table value is exact (mover-relative → white-relative).
+            # Normalize points/3 to match NN value scale [-1,1].
             r = BearoffK7.lookup(table, bg)
-            mover_equity = Float64(BearoffK7.compute_equity(r))
+            mover_equity = Float64(BearoffK7.compute_equity(r)) / 3.0
             return bg.current_player == 0 ? mover_equity : -mover_equity
         end
 
-        # Decision node (post-dice): enumerate moves to get exact Q(board, dice)
+        # Decision node (post-dice): enumerate moves to get exact Q(board, dice).
+        # bearoff_best_move_value handles terminal rewards (gammon multiplier) and
+        # doubles mid-turn recursion — see scripts/bearoff_eval_common.jl.
         actions = BackgammonNet.legal_actions(bg)
         if isempty(actions)
             return nothing
         end
 
-        # Allocate per-call (thread-safe; clone is cheap -- just field copies + buffer alloc)
-        bg_copy = BackgammonNet.clone(bg)
-
-        best_value = -Inf
-        for action in actions
-            BackgammonNet.copy_state!(bg_copy, bg)
-            BackgammonNet.apply_action!(bg_copy, action)
-
-            if bg_copy.terminated
-                # Terminal: current player won (bore off all checkers)
-                move_val = 1.0
-            elseif BearoffK7.is_bearoff_position(bg_copy.p0, bg_copy.p1)
-                # Opponent's turn (chance node). Look up their pre-dice equity, negate.
-                r_opp = BearoffK7.lookup(table, bg_copy)
-                move_val = -Float64(BearoffK7.compute_equity(r_opp))
-            else
-                continue
-            end
-
-            if move_val > best_value
-                best_value = move_val
-            end
-        end
-
+        best_value = bearoff_best_move_value(table, bg)
         if best_value == -Inf
             return nothing
         end
 
-        # Convert from current-player-relative to white-relative
+        # Convert from current-player-relative to white-relative,
+        # normalized points/3 to match NN value scale [-1,1]
+        best_value /= 3.0
         return bg.current_player == 0 ? best_value : -best_value
     end
 end
@@ -1374,7 +1342,9 @@ function eval_game_from_position(az_agent::EvalAlphaZeroAgent,
             is_p0_turn = g.current_player == 0
             is_az_turn = is_p0_turn == az_is_white
             if is_az_turn
-                nn_v = Float64(value_batch_oracle([g])[1][2])
+                # NN V is normalized equity/3 ∈ [-1,1]; wildbg returns raw points.
+                # Scale NN ×3 so value MSE/corr compare on the same (points) scale.
+                nn_v = Float64(value_batch_oracle([g])[1][2]) * 3.0
                 wb_v = Float64(BackgammonNet.evaluate(wildbg_agent.backend, g))
                 push!(value_samples, PositionValueSample(nn_v, wb_v))
             end

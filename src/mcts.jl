@@ -65,7 +65,8 @@ function (r::RolloutOracle)(state)
   wp = GI.white_playing(g)
   n = length(GI.available_actions(g))
   P = ones(n) ./ n
-  wr = rollout!(g, r.gamma)
+  # Normalize by reward scale so rollout values match NN value scale [-1,1]
+  wr = rollout!(g, r.gamma) / GI.reward_scale(r.gspec)
   V = wp ? wr : -wr
   return P, V
 end
@@ -195,6 +196,9 @@ mutable struct Env{State, Oracle}
   total_chance_nodes_expanded :: Int64
   # Game specification
   gspec :: GI.AbstractGameSpec
+  # 1 / GI.reward_scale(gspec): rewards are multiplied by this so tree Q-values
+  # stay on the same [-1,1] scale as NN value outputs (backgammon: 1/3)
+  inv_reward_scale :: Float64
 
   function Env(gspec, oracle;
       gamma=1., cpuct=1., noise_ϵ=0., noise_α=1., prior_temperature=1.,
@@ -208,7 +212,8 @@ mutable struct Env{State, Oracle}
     new{S, typeof(oracle)}(
       tree, chance_tree, oracle, gamma, cpuct, noise_ϵ, noise_α, prior_temperature,
       chance_mode, progressive_widening_alpha, prior_virtual_visits,
-      total_simulations, total_nodes_traversed, total_chance_nodes_expanded, gspec)
+      total_simulations, total_nodes_traversed, total_chance_nodes_expanded, gspec,
+      1.0 / GI.reward_scale(gspec))
   end
 end
 
@@ -327,7 +332,9 @@ function run_simulation_decision!(env::Env, game; η, root, depth)
   action = actions[action_id]
   wp = GI.white_playing(game)
   GI.play!(game, action)
-  wr = GI.white_reward(game)
+  # Normalize by reward scale so terminal rewards (±1/±2/±3 in backgammon)
+  # mix with NN values ([-1,1]) on the same scale in Q totals
+  wr = GI.white_reward(game) * env.inv_reward_scale
   r = wp ? wr : -wr
   pswitch = wp != GI.white_playing(game)
   qnext = run_simulation!(env, game, η=η, root=false, depth=depth+1)
