@@ -187,6 +187,9 @@ function parse_args()
             help = "Train this many iters on bootstrap, then clear buffer and switch to pure self-play (0 = never clear)"
             arg_type = Int
             default = 0
+        "--bootstrap-only"
+            help = "Train only on preloaded bootstrap buffer; do not wait for self-play samples"
+            action = :store_true
 
         # Eval
         "--eval-interval"
@@ -209,6 +212,28 @@ function parse_args()
             help = "Path to libwildbg shared library"
             arg_type = String
             default = ""
+
+        # Fixed bearoff eval
+        "--bearoff-eval-interval"
+            help = "Run fixed-set bearoff eval every N iterations (0 = disabled)"
+            arg_type = Int
+            default = 10
+        "--bearoff-eval-positions"
+            help = "Number of fixed bearoff decision states for raw NN bearoff eval"
+            arg_type = Int
+            default = 200
+        "--bearoff-eval-mcts-positions"
+            help = "Number of fixed bearoff decision states for NN+MCTS bearoff eval"
+            arg_type = Int
+            default = 50
+        "--bearoff-eval-mcts-iters"
+            help = "MCTS iterations for fixed bearoff eval"
+            arg_type = Int
+            default = 600
+        "--bearoff-eval-rollouts-per-start"
+            help = "Random rollouts per race start when building fixed bearoff eval cache"
+            arg_type = Int
+            default = 2
 
         # Checkpoints
         "--checkpoint-interval"
@@ -263,6 +288,7 @@ if !isempty(ARGS["bootstrap_file"])
 end
 println("PER: $(ARGS["use_per"])")
 println("Reanalyze: $(ARGS["use_reanalyze"]) (blend=$(ARGS["reanalyze_blend"]))")
+println("Bootstrap only: $(ARGS["bootstrap_only"])")
 println("LR: $(ARGS["learning_rate"]) (schedule=$(ARGS["lr_schedule"]), min=$(ARGS["lr_min"]))")
 println("=" ^ 60)
 flush(stdout)
@@ -271,6 +297,7 @@ flush(stdout)
 using AlphaZero
 using AlphaZero: GI, MCTS, Network, FluxLib, MctsParams, LearningParams, Adam, BatchedMCTS
 using AlphaZero: CONSTANT_WEIGHT, losses, ConstSchedule
+using AlphaZero.BackgammonInference
 # Note: NetLib not needed - using FluxLib directly for network creation
 import Flux
 import CUDA
@@ -324,6 +351,11 @@ const EVAL_INTERVAL = ARGS["eval_interval"]
 const EVAL_GAMES = ARGS["eval_games"]
 const EVAL_MCTS_ITERS = ARGS["eval_mcts_iters"]
 const EVAL_WORKERS = ARGS["eval_workers"]
+const BEAROFF_EVAL_INTERVAL = ARGS["bearoff_eval_interval"]
+const BEAROFF_EVAL_POSITIONS = ARGS["bearoff_eval_positions"]
+const BEAROFF_EVAL_MCTS_POSITIONS = ARGS["bearoff_eval_mcts_positions"]
+const BEAROFF_EVAL_MCTS_ITERS = ARGS["bearoff_eval_mcts_iters"]
+const BEAROFF_EVAL_ROLLOUTS_PER_START = ARGS["bearoff_eval_rollouts_per_start"]
 
 # ── Eval Setup (wildbg on CPU) ─────────────────────────────────────────
 using BackgammonNet
@@ -347,6 +379,11 @@ end
 
 const WILDBG_LIB = find_wildbg_lib_server()
 const EVAL_ENABLED = EVAL_INTERVAL > 0 && !isempty(WILDBG_LIB) && !isempty(ARGS["eval_positions_file"])
+const BEAROFF_START_POSITIONS = if !isempty(ARGS["eval_positions_file"]) && isfile(ARGS["eval_positions_file"])
+    Serialization.deserialize(ARGS["eval_positions_file"])
+else
+    Tuple[]
+end
 
 # Load eval positions
 const EVAL_POSITIONS = if EVAL_ENABLED && isfile(ARGS["eval_positions_file"])
@@ -356,6 +393,34 @@ const EVAL_POSITIONS = if EVAL_ENABLED && isfile(ARGS["eval_positions_file"])
 else
     Tuple[]
 end
+
+const BEAROFF_SRC = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k7.jl")
+if isfile(BEAROFF_SRC)
+    include(BEAROFF_SRC)
+    using .BearoffK7
+    include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
+end
+
+function find_bearoff_dir_server()
+    candidates = [
+        joinpath(dirname(BEAROFF_SRC), "..", "tools", "bearoff_twosided", "bearoff_k7_twosided"),
+        joinpath(homedir(), "bearoff_k7_twosided"),
+        "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
+    ]
+    for dir in candidates
+        if isdir(dir) && isfile(joinpath(dir, "bearoff_k7_c14.bin"))
+            return dir
+        end
+    end
+    return ""
+end
+
+const BEAROFF_DIR = isdefined(Main, :BearoffK7) ? find_bearoff_dir_server() : ""
+const BEAROFF_FIXED_EVAL_ENABLED =
+    ARGS["training_mode"] == "race" &&
+    BEAROFF_EVAL_INTERVAL > 0 &&
+    !isempty(BEAROFF_DIR) &&
+    !isempty(BEAROFF_START_POSITIONS)
 
 if EVAL_ENABLED
     # Set up wildbg
@@ -374,6 +439,12 @@ else
     else
         println("Eval: disabled (eval-interval=0)")
     end
+end
+
+if BEAROFF_FIXED_EVAL_ENABLED
+    println("Bearoff eval: fixed canonical set, every $(BEAROFF_EVAL_INTERVAL) iters, raw=$(BEAROFF_EVAL_POSITIONS), mcts=$(BEAROFF_EVAL_MCTS_POSITIONS) @ $(BEAROFF_EVAL_MCTS_ITERS)")
+else
+    println("Bearoff eval: disabled")
 end
 
 # PositionValueSample is now provided by GameLoop module
@@ -404,6 +475,260 @@ function _eval_forward_network(net, states)
     return results
 end
 
+@inline normalized_points_server(v::Real) = Float64(v) / 3.0
+
+function start_game_from_tuple_server(position_data::Tuple{UInt128, UInt128, Int8}, seed::Int)
+    p0, p1, cp = position_data
+    game = BackgammonNet.BackgammonGame(
+        p0, p1, SVector{2, Int8}(0, 0), Int8(0), cp, false, 0.0f0;
+        obs_type=:minimal_flat)
+    return GameEnv(game, MersenneTwister(seed))
+end
+
+function make_bearoff_state_key(state::BackgammonNet.BackgammonGame)
+    return (state.p0, state.p1, state.dice[1], state.dice[2], state.remaining_actions, state.current_player)
+end
+
+function build_bearoff_eval_positions(cache_path::String)
+    isfile(cache_path) && return Serialization.deserialize(cache_path)
+    isempty(BEAROFF_START_POSITIONS) && return BackgammonNet.BackgammonGame[]
+
+    rng = MersenneTwister(ARGS["seed"])
+    seen = Set{Tuple{UInt128, UInt128, Int8, Int8, Int8, Int8}}()
+    candidates = BackgammonNet.BackgammonGame[]
+    wanted = max(BEAROFF_EVAL_POSITIONS, BEAROFF_EVAL_MCTS_POSITIONS)
+
+    for (i, start_pos) in enumerate(BEAROFF_START_POSITIONS)
+        for r in 1:BEAROFF_EVAL_ROLLOUTS_PER_START
+            env = start_game_from_tuple_server(start_pos, ARGS["seed"] + 100_000 * r + i)
+            while !GI.game_terminated(env)
+                if GI.is_chance_node(env)
+                    BackgammonNet.sample_chance!(env.game, env.rng)
+                    continue
+                end
+                state = GI.current_state(env)
+                if state.phase == BackgammonNet.PHASE_CHECKER_PLAY &&
+                   state.remaining_actions == Int8(1) &&
+                   BearoffK7.is_bearoff_position(state.p0, state.p1) &&
+                   length(BackgammonNet.legal_actions(state)) > 1
+                    key = make_bearoff_state_key(state)
+                    if !(key in seen)
+                        push!(seen, key)
+                        push!(candidates, state)
+                    end
+                end
+                acts = BackgammonNet.legal_actions(env.game)
+                isempty(acts) && break
+                GI.play!(env, rand(rng, acts))
+            end
+        end
+    end
+
+    if length(candidates) < wanted
+        error("Only found $(length(candidates)) canonical bearoff states, need $wanted")
+    end
+    order = randperm(rng, length(candidates))[1:wanted]
+    positions = [candidates[i] for i in order]
+    mkpath(dirname(cache_path))
+    Serialization.serialize(cache_path, positions)
+    return positions
+end
+
+function exact_bearoff_action_values(state::BackgammonNet.BackgammonGame, table)
+    actions = BackgammonNet.legal_actions(state)
+    mover = Int(state.current_player)
+    work = BackgammonNet.clone(state)
+    action_values = Dict{Int, Float64}()
+    for action in actions
+        BackgammonNet.copy_state!(work, state)
+        BackgammonNet.apply_action!(work, action)
+        # Turn-aware exact value: handles terminal rewards (gammon multiplier),
+        # completed turns (opponent pre-dice lookup), and doubles mid-turn states
+        # (recursion) — see scripts/bearoff_eval_common.jl for the doubles pitfall.
+        move_val = normalized_points_server(bearoff_turn_value(table, work, mover))
+        action_values[action] = move_val
+    end
+    isempty(action_values) && error("No exact bearoff move values computed")
+    vals = collect(values(action_values))
+    best = maximum(vals)
+    tol = 1e-8
+    optimal = sort([a for (a, v) in action_values if best - v <= tol])
+    nonbest = [v for v in vals if best - v > tol]
+    second_best = isempty(nonbest) ? best : maximum(nonbest)
+    margin = best - second_best
+    return (action_values=action_values, best_value=best, optimal_actions=optimal, margin=margin)
+end
+
+function nn_greedy_bearoff_action(state, value_oracle)
+    actions = BackgammonNet.legal_actions(state)
+    succs = BackgammonNet.BackgammonGame[]
+    movers = Int[]
+    for action in actions
+        g = BackgammonNet.clone(state)
+        BackgammonNet.apply_action!(g, action)
+        push!(succs, g)
+        push!(movers, Int(state.current_player))
+    end
+    evals = value_oracle(succs)
+    best_action = actions[1]
+    best_value = -Inf
+    for (i, action) in enumerate(actions)
+        g2 = succs[i]
+        v = Float64(evals[i][2])
+        if Int(g2.current_player) != movers[i]
+            v = -v
+        end
+        if v > best_value
+            best_value = v
+            best_action = action
+        end
+    end
+    return best_action
+end
+
+function bearoff_policy_stats(state, policy_oracle, exact)
+    actions = BackgammonNet.legal_actions(state)
+    policy, _ = policy_oracle(state)
+    order = sortperm(policy; rev=true)
+    ranked_actions = actions[order]
+    optimal_set = Set(exact.optimal_actions)
+    opt_mass = 0.0
+    expected_regret = 0.0
+    for (a, p) in zip(actions, policy)
+        p64 = Float64(p)
+        if a in optimal_set
+            opt_mass += p64
+        end
+        expected_regret += p64 * (exact.best_value - exact.action_values[a])
+    end
+    best_rank = length(actions) + 1
+    for (rank, a) in enumerate(ranked_actions)
+        if a in optimal_set
+            best_rank = rank
+            break
+        end
+    end
+    return (
+        top1 = ranked_actions[1] in optimal_set,
+        top3 = any(a in optimal_set for a in ranked_actions[1:min(3, end)]),
+        top5 = any(a in optimal_set for a in ranked_actions[1:min(5, end)]),
+        best_rank = best_rank,
+        opt_mass = opt_mass,
+        expected_regret = expected_regret,
+        top1_prob = Float64(policy[order[1]]),
+    )
+end
+
+function mcts_bearoff_action(state, player, seed::Int)
+    env = GameEnv(BackgammonNet.clone(state), MersenneTwister(seed))
+    try
+        actions, policy = think(player, env)
+        return actions[argmax(policy)]
+    finally
+        reset_player!(player)
+    end
+end
+
+function run_bearoff_eval!(network_to_eval, iter::Int)
+    !BEAROFF_FIXED_EVAL_ENABLED && return nothing
+
+    cache_path = joinpath(DATA_DIR, "bearoff_eval_positions_$(max(BEAROFF_EVAL_POSITIONS, BEAROFF_EVAL_MCTS_POSITIONS))_seed$(ARGS["seed"]).jls")
+    positions = build_bearoff_eval_positions(cache_path)
+    isempty(positions) && return nothing
+    table = BearoffK7.BearoffTable(BEAROFF_DIR)
+    eval_net = Flux.cpu(network_to_eval)
+
+    batch_oracle(states::Vector) = _eval_forward_network(eval_net, states)
+    policy_oracle(s) = batch_oracle([s])[1]
+    value_oracle(states::Vector) = batch_oracle(states)
+    mcts_params = MctsParams(
+        num_iters_per_turn=BEAROFF_EVAL_MCTS_ITERS,
+        cpuct=1.5,
+        temperature=ConstSchedule(0.0),
+        dirichlet_noise_ϵ=0.0,
+        dirichlet_noise_α=1.0)
+    player = MctsPlayer(gspec, policy_oracle, mcts_params)
+
+    n_raw = min(BEAROFF_EVAL_POSITIONS, length(positions))
+    raw_positions = @view positions[1:n_raw]
+    n_mcts = min(BEAROFF_EVAL_MCTS_POSITIONS, length(positions))
+    mcts_positions = @view positions[1:n_mcts]
+
+    exact_values = Float64[]
+    nn_values = Float64[]
+    nn_wrong = Bool[]
+    nn_regret = Float64[]
+    policy_top1 = Bool[]
+    policy_top3 = Bool[]
+    policy_top5 = Bool[]
+    policy_best_rank = Int[]
+    policy_opt_mass = Float64[]
+    policy_expected_regret = Float64[]
+    policy_top1_prob = Float64[]
+    margins = Float64[]
+    n_opt_actions = Int[]
+
+    for (idx, state) in enumerate(raw_positions)
+        exact = exact_bearoff_action_values(state, table)
+        push!(exact_values, exact.best_value)
+        push!(margins, exact.margin)
+        push!(n_opt_actions, length(exact.optimal_actions))
+        push!(nn_values, Float64(value_oracle([state])[1][2]))
+
+        pd = bearoff_policy_stats(state, policy_oracle, exact)
+        push!(policy_top1, pd.top1)
+        push!(policy_top3, pd.top3)
+        push!(policy_top5, pd.top5)
+        push!(policy_best_rank, pd.best_rank)
+        push!(policy_opt_mass, pd.opt_mass)
+        push!(policy_expected_regret, pd.expected_regret)
+        push!(policy_top1_prob, pd.top1_prob)
+
+        nn_move = nn_greedy_bearoff_action(state, value_oracle)
+        regret = exact.best_value - exact.action_values[nn_move]
+        push!(nn_regret, regret)
+        push!(nn_wrong, !(nn_move in exact.optimal_actions))
+    end
+
+    diffs = nn_values .- exact_values
+    result = Dict{String, Float64}(
+        "value_mae" => mean(abs.(diffs)),
+        "value_rmse" => sqrt(mean(diffs .^ 2)),
+        "value_bias" => mean(diffs),
+        "value_corr" => (length(nn_values) >= 3 && std(nn_values) > 0 && std(exact_values) > 0) ? cor(nn_values, exact_values) : 0.0,
+        "policy_top1" => mean(policy_top1),
+        "policy_top3" => mean(policy_top3),
+        "policy_top5" => mean(policy_top5),
+        "policy_best_rank" => mean(policy_best_rank),
+        "policy_opt_mass" => mean(policy_opt_mass),
+        "policy_expected_regret" => mean(policy_expected_regret),
+        "policy_top1_prob" => mean(policy_top1_prob),
+        "nn_top1" => 1 - mean(nn_wrong),
+        "nn_wrong" => mean(nn_wrong),
+        "nn_regret" => mean(nn_regret),
+        "tie_rate" => mean(n_opt_actions .> 1),
+        "avg_margin" => mean(margins),
+    )
+
+    if BEAROFF_EVAL_MCTS_POSITIONS > 0
+        mcts_wrong = Bool[]
+        mcts_regret = Float64[]
+        for (idx, state) in enumerate(mcts_positions)
+            exact = exact_bearoff_action_values(state, table)
+            move = mcts_bearoff_action(state, player, ARGS["seed"] + iter * 10000 + idx)
+            regret = exact.best_value - exact.action_values[move]
+            push!(mcts_regret, regret)
+            push!(mcts_wrong, !(move in exact.optimal_actions))
+        end
+        result["mcts_top1"] = 1 - mean(mcts_wrong)
+        result["mcts_wrong"] = mean(mcts_wrong)
+        result["mcts_regret"] = mean(mcts_regret)
+        result["mcts_regret_gt_001"] = mean(mcts_regret .> 0.01)
+    end
+
+    return result
+end
+
 function eval_race_game_server(single_oracle, batch_oracle, wildbg_backend,
                                position_data::Tuple, eval_net;
                                seed::Int=1, az_is_white::Bool=true,
@@ -418,9 +743,11 @@ function eval_race_game_server(single_oracle, batch_oracle, wildbg_backend,
     az = AlphaZero.GameLoop.MctsAgent(single_oracle, batch_oracle, eval_mcts_params, 50, gspec)
     wb = AlphaZero.GameLoop.ExternalAgent(wildbg_backend)
 
+    # NN V is normalized equity/3 ∈ [-1,1]; wildbg returns raw points ∈ [-3,3].
+    # Scale NN back to raw points so value MSE/corr compare on the same scale.
     value_oracle_fn = function(env)
         result = _eval_forward_network(eval_net, [env.game])
-        return Float64(result[1][2])  # value head output
+        return Float64(result[1][2]) * 3.0  # value head output → raw points
     end
     wildbg_value_fn = function(env)
         return Float64(BackgammonNet.evaluate(wildbg_backend, env.game))
@@ -630,15 +957,11 @@ if !isempty(ARGS["bootstrap_file"])
         flush(stdout)
         bootstrap_samples = Serialization.deserialize(bootstrap_path)
 
-        # Production bootstrap artifacts currently deserialize to
-        # `Vector{NamedTuple}` with fields:
-        #   state, policy, value, equity, has_equity, is_chance, is_contact, is_bearoff
-        #
-        # `value` is already in the same player-relative convention used by the
-        # learner. `equity` contains joint cumulative 5-head values (same
-        # convention as the NN and self-play targets). The loader below preserves
-        # that layout and only repacks it into columnar arrays for the replay buffer.
-        n_bootstrap = length(bootstrap_samples)
+        # Supported bootstrap formats:
+        # 1) Vector of per-sample NamedTuples with state/policy/value/equity/flags
+        # 2) Raw columnar NamedTuple with states/policies/values/equity_postroll
+        is_raw_columnar = bootstrap_samples isa NamedTuple && hasproperty(bootstrap_samples, :states)
+        n_bootstrap = is_raw_columnar ? length(bootstrap_samples.states) : length(bootstrap_samples)
         max_load = ARGS["bootstrap_max_samples"] > 0 ?
             min(ARGS["bootstrap_max_samples"], BUFFER_CAPACITY) : min(n_bootstrap, BUFFER_CAPACITY)
 
@@ -646,22 +969,56 @@ if !isempty(ARGS["bootstrap_file"])
         loaded = 0
         for start_idx in 1:chunk_size:max_load
             end_idx = min(start_idx + chunk_size - 1, max_load)
-            chunk = bootstrap_samples[start_idx:end_idx]
-            n = length(chunk)
+            n = end_idx - start_idx + 1
 
-            states = hcat([s.state for s in chunk]...)
-            policies_raw = hcat([s.policy for s in chunk]...)
-            if size(policies_raw, 1) < NUM_ACTIONS
+            local states, policies, values, equities, has_equity, is_contact, is_bearoff
+            if is_raw_columnar
+                state_chunk = bootstrap_samples.states[start_idx:end_idx]
+                policy_chunk = bootstrap_samples.policies[start_idx:end_idx]
+                value_chunk = bootstrap_samples.values[start_idx:end_idx]
+                equity_chunk = hasproperty(bootstrap_samples, :equity_postroll) ?
+                    bootstrap_samples.equity_postroll[start_idx:end_idx] :
+                    bootstrap_samples.equity[start_idx:end_idx]
+
+                states = Matrix{Float32}(undef, _state_dim, n)
                 policies = zeros(Float32, NUM_ACTIONS, n)
-                policies[1:size(policies_raw, 1), :] .= policies_raw
+                values = Float32.(value_chunk)
+                equities = Matrix{Float32}(undef, 5, n)
+                has_equity = fill(true, n)
+                is_contact = Vector{Bool}(undef, n)
+                is_bearoff = Vector{Bool}(undef, n)
+
+                for j in 1:n
+                    game = state_chunk[j]
+                    states[:, j] .= vec(GI.vectorize_state(gspec, game))
+                    raw_policy = policy_chunk[j]
+                    plen = min(length(raw_policy), NUM_ACTIONS)
+                    for a in 1:plen
+                        @inbounds policies[a, j] = Float32(raw_policy[a])
+                    end
+                    eq = equity_chunk[j]
+                    @inbounds for k in 1:5
+                        equities[k, j] = Float32(eq[k])
+                    end
+                    is_contact[j] = BackgammonNet.is_contact_position(game)
+                    is_bearoff[j] = isdefined(Main, :BearoffK7) ? BearoffK7.is_bearoff_position(game.p0, game.p1) : false
+                end
             else
-                policies = policies_raw[1:NUM_ACTIONS, :]
+                chunk = bootstrap_samples[start_idx:end_idx]
+                states = hcat([s.state for s in chunk]...)
+                policies_raw = hcat([s.policy for s in chunk]...)
+                if size(policies_raw, 1) < NUM_ACTIONS
+                    policies = zeros(Float32, NUM_ACTIONS, n)
+                    policies[1:size(policies_raw, 1), :] .= policies_raw
+                else
+                    policies = policies_raw[1:NUM_ACTIONS, :]
+                end
+                values = Float32[s.value for s in chunk]
+                equities = hcat([s.equity for s in chunk]...)
+                has_equity = Bool[s.has_equity for s in chunk]
+                is_contact = Bool[s.is_contact for s in chunk]
+                is_bearoff = Bool[s.is_bearoff for s in chunk]
             end
-            values = Float32[s.value for s in chunk]
-            equities = hcat([s.equity for s in chunk]...)
-            has_equity = Bool[s.has_equity for s in chunk]
-            is_contact = Bool[s.is_contact for s in chunk]
-            is_bearoff = Bool[s.is_bearoff for s in chunk]
 
             per_add_batch!(replay_buffer, states, policies, values,
                            equities, has_equity, is_contact, is_bearoff)
@@ -673,6 +1030,13 @@ if !isempty(ARGS["bootstrap_file"])
         t_load = time() - t0
         println("  Loaded $loaded / $n_bootstrap bootstrap samples in $(round(t_load, digits=1))s")
         println("  Buffer size: $(buf_length(replay_buffer))")
+        # Log partition counts so contamination (contact samples in race mode) is visible at load time
+        let parts = partition_indices(replay_buffer)
+            println("  Partition: contact=$(length(parts.contact)) race=$(length(parts.race))")
+            if ARGS["training_mode"] == "race" && !isempty(parts.contact)
+                @warn "Race-only mode but bootstrap contains $(length(parts.contact)) contact samples — they will be excluded from training"
+            end
+        end
         flush(stdout)
     end
 end
@@ -769,7 +1133,8 @@ function compute_td_errors(nn, batch_data)
     return Float32.(vec(td))
 end
 
-function _train_model_on_samples!(buf_indices::Vector{Int}, network, opt_state)
+function _train_model_on_samples!(buf_indices::Vector{Int}, network, opt_state;
+                                  expect_contact::Union{Nothing, Bool}=nothing)
     n = length(buf_indices)
     n < BATCH_SIZE && return (avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0, num_batches=0)
 
@@ -798,6 +1163,15 @@ function _train_model_on_samples!(buf_indices::Vector{Int}, network, opt_state)
 
         # Extract columnar data from buffer
         col_data = extract_batch(replay_buffer, batch_buf_indices)
+
+        # Guard against stale partition membership: with a full circular buffer,
+        # an index can be overwritten (race → contact) between partitioning and
+        # extraction. Zero the loss weight of any sample whose CURRENT flag no
+        # longer matches this model's partition instead of training on it.
+        if expect_contact !== nothing && !all(col_data.is_contact .== expect_contact)
+            is_weights = is_weights .* Float32.(col_data.is_contact .== expect_contact)
+        end
+
         batch_data = prepare_batch_columnar(col_data, NUM_ACTIONS, USE_GPU, network)
 
         # IS weights: scale sample weights by importance sampling correction
@@ -845,12 +1219,21 @@ function train_on_buffer!()
     parts = partition_indices(replay_buffer)
 
     if ARGS["training_mode"] == "race"
-        # Race-only mode: train race on ALL samples
+        # Race-only mode: train race ONLY on race samples. Training on parts.all
+        # would contaminate the race net with contact states if the buffer holds
+        # any (e.g. a full-game bootstrap artifact).
+        n_contact = length(parts.contact)
+        if n_contact > 0
+            @warn "Race-only mode: buffer holds $(n_contact) contact samples — excluded from training" maxlog=10
+        end
         contact_result = (avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0, num_batches=0)
-        race_result = _train_model_on_samples!(parts.all, race_network, race_opt_state)
+        race_result = _train_model_on_samples!(parts.race, race_network, race_opt_state;
+                                               expect_contact=false)
     else
-        contact_result = _train_model_on_samples!(parts.contact, contact_network, contact_opt_state)
-        race_result = _train_model_on_samples!(parts.race, race_network, race_opt_state)
+        contact_result = _train_model_on_samples!(parts.contact, contact_network, contact_opt_state;
+                                                  expect_contact=true)
+        race_result = _train_model_on_samples!(parts.race, race_network, race_opt_state;
+                                               expect_contact=false)
     end
 
     return (contact=contact_result, race=race_result)
@@ -980,6 +1363,7 @@ const SERVER_CONFIG = Dict{String, Any}(
     "use_bearoff" => true,  # always enabled
     "bearoff_hard_targets" => ARGS["bearoff_hard_targets"],
     "bearoff_truncation" => ARGS["bearoff_truncation"],
+    "bootstrap_only" => ARGS["bootstrap_only"],
     "training_mode" => ARGS["training_mode"],
     "start_positions_file" => basename(ARGS["start_positions_file"]),
     "eval_positions_file" => basename(ARGS["eval_positions_file"]),
@@ -1111,21 +1495,23 @@ end
 
 for iter in (START_ITER + 1):ARGS["total_iterations"]
     # Wait for enough new samples (offset by START_ITER so resume works)
-    target_samples = (iter - START_ITER) * SAMPLES_PER_ITERATION
-    while server_state.total_samples[] < target_samples
-        cur = server_state.total_samples[]
-        pct = round(100 * cur / target_samples, digits=1)
-        n_clients = length(server_state.clients)
-        print("\rIteration $iter: waiting for samples ($cur / $target_samples = $pct%, $n_clients clients)  ")
-        flush(stdout)
-        sleep(5)
+    if !ARGS["bootstrap_only"]
+        target_samples = (iter - START_ITER) * SAMPLES_PER_ITERATION
+        while server_state.total_samples[] < target_samples
+            cur = server_state.total_samples[]
+            pct = round(100 * cur / target_samples, digits=1)
+            n_clients = length(server_state.clients)
+            print("\rIteration $iter: waiting for samples ($cur / $target_samples = $pct%, $n_clients clients)  ")
+            flush(stdout)
+            sleep(5)
+        end
+        println()
     end
-    println()
 
     iter_start = time()
 
     # Bootstrap phase complete — clear buffer to switch to pure self-play
-    if ARGS["bootstrap_train_iters"] > 0 && iter == ARGS["bootstrap_train_iters"] + 1
+    if !ARGS["bootstrap_only"] && ARGS["bootstrap_train_iters"] > 0 && iter == ARGS["bootstrap_train_iters"] + 1
         println("\n*** Bootstrap phase complete ($(ARGS["bootstrap_train_iters"]) iters). Clearing buffer for pure self-play. ***")
         flush(stdout)
         lock(replay_buffer.lock) do
@@ -1300,6 +1686,42 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         end
     catch e
         @warn "Bearoff accuracy computation failed" exception=e
+    end
+
+    # Fixed-set bearoff eval on canonical post-dice bearoff decision states
+    if BEAROFF_FIXED_EVAL_ENABLED && iter % BEAROFF_EVAL_INTERVAL == 0
+        try
+            bo_result = run_bearoff_eval!(race_network, iter)
+            if bo_result !== nothing
+                with_logger(TB_LOGGER) do
+                    @info "bearoff_fixed/value_mae" value=bo_result["value_mae"] log_step_increment=0
+                    @info "bearoff_fixed/value_rmse" value=bo_result["value_rmse"] log_step_increment=0
+                    @info "bearoff_fixed/value_bias" value=bo_result["value_bias"] log_step_increment=0
+                    @info "bearoff_fixed/value_corr" value=bo_result["value_corr"] log_step_increment=0
+                    @info "bearoff_fixed/policy_top1" value=100 * bo_result["policy_top1"] log_step_increment=0
+                    @info "bearoff_fixed/policy_top3" value=100 * bo_result["policy_top3"] log_step_increment=0
+                    @info "bearoff_fixed/policy_top5" value=100 * bo_result["policy_top5"] log_step_increment=0
+                    @info "bearoff_fixed/policy_best_rank" value=bo_result["policy_best_rank"] log_step_increment=0
+                    @info "bearoff_fixed/policy_opt_mass" value=100 * bo_result["policy_opt_mass"] log_step_increment=0
+                    @info "bearoff_fixed/policy_expected_regret" value=bo_result["policy_expected_regret"] log_step_increment=0
+                    @info "bearoff_fixed/policy_top1_prob" value=100 * bo_result["policy_top1_prob"] log_step_increment=0
+                    @info "bearoff_fixed/nn_top1" value=100 * bo_result["nn_top1"] log_step_increment=0
+                    @info "bearoff_fixed/nn_wrong" value=100 * bo_result["nn_wrong"] log_step_increment=0
+                    @info "bearoff_fixed/nn_regret" value=bo_result["nn_regret"] log_step_increment=0
+                    @info "bearoff_fixed/tie_rate" value=100 * bo_result["tie_rate"] log_step_increment=0
+                    @info "bearoff_fixed/avg_margin" value=bo_result["avg_margin"] log_step_increment=0
+                    if haskey(bo_result, "mcts_top1")
+                        @info "bearoff_fixed/mcts_top1" value=100 * bo_result["mcts_top1"] log_step_increment=0
+                        @info "bearoff_fixed/mcts_wrong" value=100 * bo_result["mcts_wrong"] log_step_increment=0
+                        @info "bearoff_fixed/mcts_regret" value=bo_result["mcts_regret"] log_step_increment=0
+                        @info "bearoff_fixed/mcts_regret_gt_001" value=100 * bo_result["mcts_regret_gt_001"] log_step_increment=0
+                    end
+                end
+                @info "Fixed bearoff eval" iter=iter value_mae=round(bo_result["value_mae"], digits=4) value_corr=round(bo_result["value_corr"], digits=4) policy_top1=round(100 * bo_result["policy_top1"], digits=1) nn_top1=round(100 * bo_result["nn_top1"], digits=1) mcts_top1=round(100 * get(bo_result, "mcts_top1", NaN), digits=1)
+            end
+        catch e
+            @warn "Fixed bearoff eval failed" exception=e
+        end
     end
 
     # Save client stats
