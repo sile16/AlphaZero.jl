@@ -156,3 +156,54 @@ end
     @test all(contact_batch.values .== 1.0f0)
     @test all(contact_batch.is_contact)
 end
+
+@testset "Buffer: reanalyze skips slots overwritten since extraction" begin
+    # reanalyze extracts a batch, runs slow NN inference, then blends predictions
+    # back by INDEX. A slot overwritten in between now holds a DIFFERENT sample;
+    # its blend value is stale. The generation check must skip those slots.
+    state_dim, num_actions, capacity = 4, 6, 8
+    buf = PERBuffer(capacity, state_dim, num_actions)
+
+    function mkbatch(vals::Vector{Float32})
+        n = length(vals)
+        states = repeat(vals', state_dim, 1)
+        policies = repeat(vals', num_actions, 1)
+        equities = zeros(Float32, 5, n)
+        has_eq = fill(false, n)          # no equity blend — isolate the value path
+        is_contact = fill(false, n)
+        is_bearoff = fill(false, n)
+        (states, policies, copy(vals), equities, has_eq, is_contact, is_bearoff)
+    end
+
+    # Write 4 samples into slots 1..4 (generation → 1 each).
+    let (s, p, v, e, h, c, b) = mkbatch(Float32[10, 20, 30, 40])
+        per_add_batch!(buf, s, p, v, e, h, c, b)
+    end
+    idx = [1, 2, 3, 4]
+    col = extract_batch(buf, idx)
+    gens = copy(col.generations)         # [1,1,1,1]
+    @test all(gens .== UInt32(1))
+
+    # Overwrite slots 5,6,7,8 then 1,2 (write_pos wraps): slots 1 and 2 get gen 2.
+    let (s, p, v, e, h, c, b) = mkbatch(Float32[55, 66, 77, 88, 111, 222])
+        per_add_batch!(buf, s, p, v, e, h, c, b)
+    end
+    @test buf.generation[1] == UInt32(2)
+    @test buf.generation[2] == UInt32(2)
+    @test buf.values[1] == 111.0f0       # slot 1 now holds the overwrite sample
+    @test buf.values[2] == 222.0f0
+
+    # Reanalyze with the STALE generation snapshot: slots 1,2 mismatch (skip),
+    # slots 3,4 still match (blend). new_values length matches idx.
+    new_vals = Float32[1, 2, 3, 4]
+    z = zeros(Float32, 4)
+    skipped = reanalyze_update!(buf, idx, gens, new_vals, z, z, z, z, z; α_blend=1.0f0)
+    @test skipped == 2                   # slots 1 and 2 skipped
+
+    # Overwritten slots left untouched by the stale blend.
+    @test buf.values[1] == 111.0f0
+    @test buf.values[2] == 222.0f0
+    # Matching slots blended (α=1.0 → replaced by new value).
+    @test buf.values[3] == 3.0f0
+    @test buf.values[4] == 4.0f0
+end

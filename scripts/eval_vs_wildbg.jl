@@ -217,7 +217,10 @@ function eval_game(single_oracle, batch_oracle, wildbg_backend,
     value_oracle_fn = nothing
     wildbg_value_fn = nothing
     if value_batch_oracle !== nothing
-        value_oracle_fn = env -> Float64(value_batch_oracle([env.game])[1][2])
+        # NN oracle V is normalized equity/3 ∈ [-1,1]; wildbg evaluate() returns raw
+        # points ∈ [-3,3]. Scale NN back to raw points so MSE/MAE/bias/corr compare
+        # like with like (in equity units).
+        value_oracle_fn = env -> Float64(value_batch_oracle([env.game])[1][2]) * 3.0
         wildbg_value_fn = env -> Float64(BackgammonNet.evaluate(wildbg_backend, env.game))
     end
 

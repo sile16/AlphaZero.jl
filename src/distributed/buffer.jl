@@ -26,6 +26,12 @@ mutable struct PERBuffer
     # PER priorities
     priorities::Vector{Float32}   # (capacity,)
 
+    # Per-slot write generation: incremented every time a slot is (re)written by
+    # per_add_batch!. Lets reanalyze detect a slot that was overwritten between
+    # its extract and its (slow, unlocked) NN inference, so it does not blend a
+    # stale prediction into a newer sample.
+    generation::Vector{UInt32}    # (capacity,)
+
     # Circular buffer state
     capacity::Int
     size::Int                     # Current number of valid samples (≤ capacity)
@@ -53,6 +59,7 @@ function PERBuffer(capacity::Int, state_dim::Int, num_actions::Int;
         fill(false, capacity),
         fill(false, capacity),
         ones(Float32, capacity),     # Initial priority = 1.0
+        zeros(UInt32, capacity),     # generation (0 = never written)
         capacity, 0, 1,
         beta_init, beta_init, annealing_iters, 0,
         ReentrantLock(),
@@ -95,6 +102,7 @@ function per_add_batch!(buf::PERBuffer, batch_states::AbstractMatrix{Float32},
                 buf.is_contact[pos] = batch_is_contact[i]
                 buf.is_bearoff[pos] = batch_is_bearoff[i]
                 buf.priorities[pos] = initial_priority
+                buf.generation[pos] += UInt32(1)
             end
 
             # Advance circular pointer
@@ -170,12 +178,18 @@ function per_sample_partition(buf::PERBuffer, subset_indices::Vector{Int},
     n = length(subset_indices)
     n < batch_size && error("Subset too small ($n < $batch_size)")
 
-    # Compute priorities^alpha and cumulative sum over the subset
+    # Compute priorities^alpha and cumulative sum over the subset. The priority
+    # snapshot is taken UNDER the buffer lock (per_update_priorities! /
+    # per_add_batch! mutate priorities concurrently); the sampling math below runs
+    # on the local snapshot outside the lock. buf.lock is reentrant, so nesting
+    # under a caller that already holds it is safe.
     cumsum_pα = Vector{Float32}(undef, n)
-    @inbounds begin
-        cumsum_pα[1] = (buf.priorities[subset_indices[1]] + epsilon) ^ alpha
-        for i in 2:n
-            cumsum_pα[i] = cumsum_pα[i-1] + (buf.priorities[subset_indices[i]] + epsilon) ^ alpha
+    lock(buf.lock) do
+        @inbounds begin
+            cumsum_pα[1] = (buf.priorities[subset_indices[1]] + epsilon) ^ alpha
+            for i in 2:n
+                cumsum_pα[i] = cumsum_pα[i-1] + (buf.priorities[subset_indices[i]] + epsilon) ^ alpha
+            end
         end
     end
     total = cumsum_pα[n]
@@ -251,7 +265,8 @@ function extract_batch(buf::PERBuffer, indices::Vector{Int})
         is_chance = buf.is_chance[indices]
         is_contact = buf.is_contact[indices]
         is_bearoff = buf.is_bearoff[indices]
-        (; states, policies, values, equities, has_equity, is_chance, is_contact, is_bearoff)
+        generations = buf.generation[indices]
+        (; states, policies, values, equities, has_equity, is_chance, is_contact, is_bearoff, generations)
     end
 end
 
@@ -281,8 +296,15 @@ end
 Holds the buffer lock: once the circular buffer is full, `per_add_batch!`
 overwrites entries in place, so an unlocked blend could mix stale NN outputs
 (computed from the OLD sample at that index) into a NEWER sample's targets.
-The lock ensures the blend applies atomically w.r.t. concurrent uploads."""
+The lock ensures the blend applies atomically w.r.t. concurrent uploads.
+
+`expected_generations` is the per-slot generation captured at `extract_batch`
+time. The NN inference between extract and this write is slow and unlocked; a
+slot overwritten in between now carries a DIFFERENT sample, and the blend value
+was computed from the OLD one. Under the lock we skip any index whose current
+generation no longer matches its expectation. Returns the number skipped."""
 function reanalyze_update!(buf::PERBuffer, indices::Vector{Int},
+                           expected_generations::Vector{UInt32},
                            new_values::Vector{Float32},
                            new_eq_win::Vector{Float32},
                            new_eq_gw::Vector{Float32},
@@ -291,10 +313,16 @@ function reanalyze_update!(buf::PERBuffer, indices::Vector{Int},
                            new_eq_bgl::Vector{Float32};
                            α_blend::Float32=0.5f0)
     n = length(indices)
+    skipped = 0
 
     lock(buf.lock) do
         @inbounds for k in 1:n
             idx = indices[k]
+            # Skip slots overwritten since extraction — the NN blend is stale.
+            if buf.generation[idx] != expected_generations[k]
+                skipped += 1
+                continue
+            end
             old_val = buf.values[idx]
             buf.values[idx] = (1f0 - α_blend) * old_val + α_blend * new_values[k]
 
@@ -311,6 +339,7 @@ function reanalyze_update!(buf::PERBuffer, indices::Vector{Int},
             buf.priorities[idx] = abs(new_values[k] - old_val)
         end
     end
+    return skipped
 end
 
 """Save buffer state to disk. Only saves the valid portion (buf.size samples)."""

@@ -111,6 +111,47 @@ end
     @test !blocked.last_published               # → intermediate iters hold
 end
 
+@testset "eval-error cold start fails OPEN (never calibrated)" begin
+    # No eval has ever succeeded (best == Inf): a signal failure must not stall the
+    # run before a baseline exists, so publish (fail-open).
+    s = GateState()
+    @test !isfinite(s.best_metric)
+    d = gate_on_eval_error(s)
+    @test d.publish                                # fail-open
+    @test d.state.last_published
+    @test d.state.n_eval_failures == 1
+    @test d.state.n_blocked == 0                    # a publish is not a block
+    # Consecutive failures accumulate.
+    d2 = gate_on_eval_error(d.state)
+    @test d2.publish
+    @test d2.state.n_eval_failures == 2
+end
+
+@testset "eval-error after calibration fails CLOSED" begin
+    # At least one eval has succeeded (finite best): a broken signal must hold the
+    # last-good published weights rather than publish untested ones.
+    s = step(GateState(), 0.05).state              # calibrated: best = 0.05
+    @test isfinite(s.best_metric)
+    d = gate_on_eval_error(s)
+    @test !d.publish                               # fail-closed
+    @test !d.state.last_published
+    @test d.state.best_metric == 0.05              # best preserved for rollback
+    @test d.state.n_eval_failures == 1
+    @test d.state.n_blocked == 1
+    # A later successful finite eval resets the consecutive-failure streak.
+    recovered = step(d.state, 0.05)
+    @test recovered.state.n_eval_failures == 0
+end
+
+@testset "non-finite metric also counts as an eval failure" begin
+    s = step(GateState(), 0.10).state
+    d = step(s, NaN)
+    @test !d.publish
+    @test d.state.n_eval_failures == 1             # non-finite → failure streak
+    # Recover: finite eval resets the streak.
+    @test step(d.state, 0.10).state.n_eval_failures == 0
+end
+
 @testset "JSON sidecar round-trips" begin
     # Drive a short sequence, save, reload, and confirm the state is identical.
     s = GateState()
@@ -128,6 +169,7 @@ end
     @test loaded.last_published == s.last_published
     @test loaded.n_evals == s.n_evals
     @test loaded.n_blocked == s.n_blocked
+    @test loaded.n_eval_failures == s.n_eval_failures
 end
 
 @testset "sidecar graceful fallback" begin

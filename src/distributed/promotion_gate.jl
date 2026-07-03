@@ -60,15 +60,21 @@ import JSON
 
 """Persistent gate state. `best_metric` is the lowest gated metric seen so far
 (`Inf` until the first eval). `last_published` is the most recent decision, reused
-by iterations between evals."""
+by iterations between evals. `n_eval_failures` counts CONSECUTIVE eval-signal
+failures (exceptions/non-finite); reset to 0 by any finite eval."""
 struct GateState
     best_metric::Float64
     last_published::Bool
     n_evals::Int
     n_blocked::Int
+    n_eval_failures::Int
 end
 
-GateState() = GateState(Inf, true, 0, 0)
+GateState() = GateState(Inf, true, 0, 0, 0)
+
+# Backwards-compatible 4-arg constructor (pre-failure-counter call sites / tests).
+GateState(best_metric, last_published, n_evals, n_blocked) =
+    GateState(best_metric, last_published, n_evals, n_blocked, 0)
 
 """Result of one gate evaluation. `state` is the next `GateState` to carry forward."""
 struct GateDecision
@@ -102,7 +108,8 @@ Pure gate step. `metric` is lower-is-better (bearoff value MAE, normalized).
 function gate_evaluate(state::GateState, metric::Real; tol_frac::Real, tol_abs::Real)
     m = Float64(metric)
     if !isfinite(m)
-        ns = GateState(state.best_metric, false, state.n_evals + 1, state.n_blocked + 1)
+        ns = GateState(state.best_metric, false, state.n_evals + 1, state.n_blocked + 1,
+                       state.n_eval_failures + 1)
         return GateDecision(false, false, m, state.best_metric,
                             gate_threshold(state.best_metric, tol_frac, tol_abs), ns)
     end
@@ -111,8 +118,34 @@ function gate_evaluate(state::GateState, metric::Real; tol_frac::Real, tol_abs::
     improved = publish && m < state.best_metric
     new_best = publish ? min(state.best_metric, m) : state.best_metric
     n_blocked = state.n_blocked + (publish ? 0 : 1)
-    ns = GateState(new_best, publish, state.n_evals + 1, n_blocked)
+    # A finite eval breaks any consecutive-failure streak.
+    ns = GateState(new_best, publish, state.n_evals + 1, n_blocked, 0)
     return GateDecision(publish, improved, m, new_best, thr, ns)
+end
+
+"""
+    gate_on_eval_error(state) -> GateDecision
+
+Decision for when the eval SIGNAL ITSELF failed (the eval threw an exception, as
+opposed to returning a finite or non-finite metric). Policy — "calibrated
+fail-closed":
+
+- If at least one eval has ever succeeded (`best_metric` is finite → the gate
+  signal was calibrated), BLOCK: keep serving the last-good published weights.
+  A persistently broken eval must NOT keep publishing fresh (untested) weights.
+- If no eval has ever succeeded (cold start, `best_metric == Inf` → signal never
+  calibrated, no last-good to protect), PUBLISH (fail-open) so a broken signal at
+  startup does not stall the run before any baseline exists.
+
+Increments the consecutive `n_eval_failures` counter either way. `metric` is set
+to `NaN` and `threshold` to `Inf` (neither is meaningful on a signal failure)."""
+function gate_on_eval_error(state::GateState)
+    calibrated = isfinite(state.best_metric)
+    publish = !calibrated                    # calibrated → fail-closed; cold start → fail-open
+    n_blocked = state.n_blocked + (publish ? 0 : 1)
+    ns = GateState(state.best_metric, publish, state.n_evals, n_blocked,
+                   state.n_eval_failures + 1)
+    return GateDecision(publish, false, NaN, state.best_metric, Inf, ns)
 end
 
 # ── JSON sidecar (resume) ──────────────────────────────────────────────────
@@ -125,6 +158,7 @@ function gate_state_to_dict(state::GateState; metric_name::String="value_mae",
         "last_published" => state.last_published,
         "n_evals"        => state.n_evals,
         "n_blocked"      => state.n_blocked,
+        "n_eval_failures" => state.n_eval_failures,
         "metric_name"    => metric_name,
         "tol_frac"       => (isfinite(tol_frac) ? tol_frac : nothing),
         "tol_abs"        => (isfinite(tol_abs) ? tol_abs : nothing),
@@ -139,7 +173,8 @@ function gate_state_from_dict(d::AbstractDict)
     GateState(best,
               Bool(get(d, "last_published", true)),
               Int(get(d, "n_evals", 0)),
-              Int(get(d, "n_blocked", 0)))
+              Int(get(d, "n_blocked", 0)),
+              Int(get(d, "n_eval_failures", 0)))
 end
 
 """Write the gate state to `path` (JSON). Overwrites atomically enough for a

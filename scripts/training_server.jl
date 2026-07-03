@@ -907,12 +907,25 @@ end
 START_ITER = 0
 if !isempty(ARGS["resume"])
     resume_dir = ARGS["resume"]
-    # Try dual-model checkpoints first
+    # Try dual-model checkpoints first. Prefer the TRAINING-state weights
+    # (*_train_latest.data) over the PUBLISHED weights (*_latest.data): under a
+    # gate BLOCK the published files hold last-good weights while training and
+    # iter.txt advance, so resuming from *_latest would silently rewind the model
+    # under a newer START_ITER. Fall back to *_latest.data for pre-gate sessions.
     contact_path = joinpath(resume_dir, "contact_latest.data")
     race_path = joinpath(resume_dir, "race_latest.data")
+    contact_train = joinpath(resume_dir, "contact_train_latest.data")
+    race_train = joinpath(resume_dir, "race_train_latest.data")
+    using_train_weights = isfile(contact_train) && isfile(race_train)
+    if using_train_weights
+        contact_path, race_path = contact_train, race_train
+    end
     if isfile(contact_path) && isfile(race_path)
         FluxLib.load_weights(contact_path, contact_network)
         FluxLib.load_weights(race_path, race_network)
+        println(using_train_weights ?
+            "Resume: loaded TRAINING-state weights (*_train_latest.data)" :
+            "Resume: loaded PUBLISHED weights (*_latest.data) — no *_train_latest.data (pre-gate session)")
         iter_file = joinpath(resume_dir, "iter.txt")
         if isfile(iter_file)
             START_ITER = parse(Int, strip(read(iter_file, String)))
@@ -1186,6 +1199,7 @@ function _train_model_on_samples!(buf_indices::Vector{Int}, network, opt_state;
     total_Lp = 0.0
     total_Lv = 0.0
     total_Linv = 0.0
+    n_masked_skipped = 0
 
     for _ in 1:num_batches
         # PER: sample proportional to priorities within this model's partition
@@ -1208,6 +1222,16 @@ function _train_model_on_samples!(buf_indices::Vector{Int}, network, opt_state;
         # longer matches this model's partition instead of training on it.
         if expect_contact !== nothing && !all(col_data.is_contact .== expect_contact)
             is_weights = is_weights .* Float32.(col_data.is_contact .== expect_contact)
+            # If the mask zeroed EVERY sample, Wmean would be 0 and the loss would
+            # divide by it (NaN). Skip this batch instead. (Normal path — no
+            # partition mismatch — never enters this branch, so it stays alloc-free.)
+            if !any(!iszero, is_weights)
+                n_masked_skipped += 1
+                if n_masked_skipped == 1 || n_masked_skipped % 100 == 0
+                    @warn "Skipped all-stale-partition batch (every sample masked out)" expect_contact n_masked_skipped
+                end
+                continue
+            end
         end
 
         batch_data = prepare_batch_columnar(col_data, NUM_ACTIONS, USE_GPU, network)
@@ -1240,9 +1264,11 @@ function _train_model_on_samples!(buf_indices::Vector{Int}, network, opt_state;
         end
     end
 
-    return (avg_loss=total_loss / num_batches, avg_Lp=total_Lp / num_batches,
-            avg_Lv=total_Lv / num_batches, avg_Linv=total_Linv / num_batches,
-            num_batches=num_batches)
+    # Divide by batches actually trained on (skipped all-masked batches excluded).
+    processed = max(1, num_batches - n_masked_skipped)
+    return (avg_loss=total_loss / processed, avg_Lp=total_Lp / processed,
+            avg_Lv=total_Lv / processed, avg_Linv=total_Linv / processed,
+            num_batches=processed)
 end
 
 function train_on_buffer!()
@@ -1287,6 +1313,7 @@ function reanalyze_buffer!()
 
     batch_size = min(2048, length(reanalyze_indices))
     total_updated = 0
+    total_skipped = 0
 
     for batch_start in 1:batch_size:length(reanalyze_indices)
         batch_end = min(batch_start + batch_size - 1, length(reanalyze_indices))
@@ -1303,6 +1330,9 @@ function reanalyze_buffer!()
 
             sub_local_idx = findall(sub_mask)
             sub_buf_indices = batch_indices[sub_local_idx]
+            # Generation snapshot captured at extract time — reanalyze_update!
+            # skips any of these slots overwritten during the NN inference below.
+            sub_generations = col_data.generations[sub_local_idx]
 
             # Slice from already-extracted data (no second buffer read)
             sub_col = (
@@ -1334,18 +1364,22 @@ function reanalyze_buffer!()
             new_eq_gl = Float32.(vec(Flux.cpu(V̂_gl)))
             new_eq_bgl = Float32.(vec(Flux.cpu(V̂_bgl)))
 
-            # Write blended values back (lock-free)
-            reanalyze_update!(replay_buffer, sub_buf_indices,
+            # Write blended values back (skips slots overwritten since extraction)
+            skipped = reanalyze_update!(replay_buffer, sub_buf_indices, sub_generations,
                               new_values, new_eq_win, new_eq_gw, new_eq_bgw, new_eq_gl, new_eq_bgl;
                               α_blend=REANALYZE_BLEND)
 
-            total_updated += length(sub_buf_indices)
+            total_skipped += skipped
+            total_updated += length(sub_buf_indices) - skipped
         end
 
         # Let GC clean up batch temporaries
         col_data = nothing
     end
 
+    if total_skipped > 0
+        @info "Reanalyze skipped stale slots (overwritten during inference)" total_skipped total_updated
+    end
     return total_updated
 end
 
@@ -1727,6 +1761,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
 
     # Fixed-set bearoff eval on canonical post-dice bearoff decision states
     if BEAROFF_FIXED_EVAL_ENABLED && iter % BEAROFF_EVAL_INTERVAL == 0
+        gate_updated_this_eval = false   # did a gate decision run before any throw?
         try
             bo_result = run_bearoff_eval!(race_network, iter)
             if bo_result !== nothing
@@ -1764,11 +1799,13 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
                     dec = gate_evaluate(GATE_STATE[], bo_result[GATE_METRIC_NAME];
                                         tol_frac=GATE_TOL_FRAC, tol_abs=GATE_TOL_ABS)
                     GATE_STATE[] = dec.state
+                    gate_updated_this_eval = true   # eval produced a decision; catch must not override
                     with_logger(TB_LOGGER) do
                         @info "gate/metric" value=dec.metric log_step_increment=0
                         @info "gate/best_metric" value=(isfinite(dec.best_metric) ? dec.best_metric : dec.metric) log_step_increment=0
                         @info "gate/threshold" value=(isfinite(dec.threshold) ? dec.threshold : dec.metric) log_step_increment=0
                         @info "gate/n_blocked" value=dec.state.n_blocked log_step_increment=0
+                        @info "gate/n_eval_failures" value=dec.state.n_eval_failures log_step_increment=0
                     end
                     if dec.publish
                         @info "Promotion gate PASS — publication allowed" iter=iter metric=round(dec.metric, digits=5) best=round(dec.best_metric, digits=5) threshold=round(dec.threshold, digits=5) improved=dec.improved
@@ -1787,6 +1824,25 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
             end
         catch e
             @warn "Fixed bearoff eval failed" exception=e
+            # The eval SIGNAL itself failed before producing a gate decision.
+            # Calibrated fail-closed (finding 2): if the gate has EVER been
+            # calibrated (a finite best exists), BLOCK — a persistently broken
+            # eval must not keep publishing untested weights. If never calibrated
+            # (cold start), publish (fail-open) so a startup failure doesn't stall
+            # the run before any baseline exists.
+            if GATE_ENABLED && !gate_updated_this_eval
+                dec = gate_on_eval_error(GATE_STATE[])
+                GATE_STATE[] = dec.state
+                with_logger(TB_LOGGER) do
+                    @info "gate/n_eval_failures" value=dec.state.n_eval_failures log_step_increment=0
+                    @info "gate/n_blocked" value=dec.state.n_blocked log_step_increment=0
+                end
+                if dec.publish
+                    @warn "Promotion gate: eval signal FAILED, no baseline yet (cold start) — publishing (fail-open)" iter=iter n_eval_failures=dec.state.n_eval_failures
+                else
+                    @warn "Promotion gate: eval signal FAILED — holding last-good published weights (calibrated fail-closed)" iter=iter n_eval_failures=dec.state.n_eval_failures best=round(dec.best_metric, digits=5)
+                end
+            end
         end
     end
 
@@ -1815,6 +1871,15 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "contact_iter_$iter.data"),
                              Flux.cpu(contact_network))
         FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "race_iter_$iter.data"),
+                             Flux.cpu(race_network))
+        # *_train_latest.data are the current TRAINING-state weights — written
+        # UNCONDITIONALLY every checkpoint (in lock-step with iter.txt). On a gate
+        # BLOCK the published *_latest.data stays at last-good while training and
+        # iter.txt advance; --resume prefers these so it restores the true current
+        # training state, not stale published weights under a newer iter count.
+        FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "contact_train_latest.data"),
+                             Flux.cpu(contact_network))
+        FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "race_train_latest.data"),
                              Flux.cpu(race_network))
         # *_latest.data are the PUBLISHED weights — only overwrite when the gate
         # permits publication this iteration (else keep serving last-good).

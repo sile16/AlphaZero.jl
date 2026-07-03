@@ -115,6 +115,50 @@ checkpoint. On `--resume`, `GATE_STATE` is seeded from
 starts the gate fresh if the file is absent or unparseable (graceful — a
 pre-gate checkpoint just re-seeds `best` on its first post-resume eval).
 
+## Resume semantics (added 2026-07-03, Round 3 §1)
+
+The original resume path loaded `race_latest.data` (the PUBLISHED weights) with
+`START_ITER` from `iter.txt`. But under a gate BLOCK those diverge: `*_latest.data`
+stays pinned at the last-good weights while training — and `iter.txt` — advance.
+Resuming then silently loaded STALE published weights under a NEWER iteration
+count, rewinding the model without any indication.
+
+Fix — separate TRAINING state from PUBLISHED state on disk:
+
+- Every checkpoint write ALSO saves the current training weights UNCONDITIONALLY
+  to `contact_train_latest.data` / `race_train_latest.data` (in lock-step with
+  `iter.txt`), alongside the gated `*_latest.data`.
+- `--resume` PREFERS `*_train_latest.data` when both are present (restores the
+  true current training state), and falls back to `*_latest.data` for pre-gate
+  sessions, printing which set was loaded.
+- Gate state (`gate_state.json`) is still seeded on resume as before.
+- `race_best.data` semantics are UNCHANGED — it remains the best-by-gated-metric
+  race net for manual rollback (written only on a publishing improvement).
+
+So after resume: weights = latest TRAINING state, iter = matching `iter.txt`,
+gate best-so-far/last-decision = seeded from sidecar. The published `*_latest.data`
+files remain the (possibly older) served weights and are untouched by resume.
+
+## Eval-signal failure policy (added 2026-07-03, Round 3 §2)
+
+The bearoff-eval block is wrapped in try/catch. Previously an exception left
+`GATE_STATE` untouched, so the gate reused `last_published` (initialized `true`) —
+a persistently broken eval signal would publish fresh weights forever.
+
+Fix — "calibrated fail-closed" (`gate_on_eval_error` in `promotion_gate.jl`):
+
+- If the gate has EVER been calibrated (`best_metric` finite → at least one eval
+  succeeded), an eval-signal failure BLOCKS (keep last-good published, do not
+  publish new weights) with a loud `@warn`.
+- If NO eval has ever succeeded (cold start, `best_metric == Inf` → signal never
+  calibrated, no last-good to protect), it PUBLISHES (fail-open) with a `@warn`,
+  so a startup eval failure doesn't stall the run before any baseline exists.
+
+`GateState` gained `n_eval_failures` — a CONSECUTIVE failure counter (incremented
+on both exceptions and non-finite metrics, reset to 0 by any finite eval), logged
+to TB as `gate/n_eval_failures`. Both branches are unit-tested against the pure
+`gate_on_eval_error`/`gate_evaluate` functions (no server needed).
+
 ## Escape hatches
 
 - `--no-promotion-gate` — disable; publish every iteration unconditionally.

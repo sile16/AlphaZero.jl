@@ -531,7 +531,14 @@ function main()
         println("bearoff; try --gammon-starts or more games for a sharper signal.")
     end
     for wb in backends
-        try BackgammonNet.close!(wb) catch end
+        # WildbgBackend implements Base.close (frees the handle + dlclose); there
+        # is no BackgammonNet.close! — the old call silently no-op'd under the
+        # swallow-everything catch, leaking each backend's native handle.
+        try
+            close(wb)
+        catch e
+            @warn "Failed to close wildbg backend" exception=e
+        end
     end
 end
 

@@ -145,3 +145,113 @@ call sites now use them. Regression test: `test/test_bearoff_doubles_regression.
   terminal rewards 14, scale/buffer 14, doubles 11)
 - Empirical gammon-multiplier check on constructed c15 positions: pass
 - Table-vs-wildbg paired harness: -0.0225 (bug) → +0.003 (fixed), CI ±0.006
+
+## Round 3 findings (2026-07-03)
+
+Seven review findings, all verified against current code before acting, all fixed
+this session. Full suite green afterward: 1799 assertions (Promotion Gate 71,
+Scale/Buffer 24, Identity Staircase 1071, etc.).
+
+### 1. HIGH — gate resume inconsistency (training_server.jl) — FIXED
+
+**Verify**: confirmed. Resume loaded `race_latest.data` (gated/published weights)
+with `START_ITER` from `iter.txt`. On a gate BLOCK `*_latest.data` stays at
+last-good while `iter.txt` advances → resume silently loads stale weights under a
+newer iter count.
+
+**Fix**: TRAINING vs PUBLISHED state split on disk. Checkpoint block now
+unconditionally writes `contact_train_latest.data` / `race_train_latest.data`
+(lock-step with `iter.txt`) alongside the gated `*_latest.data`. `--resume` prefers
+`*_train_latest.data`, falls back to `*_latest.data` for pre-gate sessions, prints
+which was used. Gate-state seeding and `race_best.data` semantics unchanged.
+Documented in a new "Resume semantics" section of the gate design note.
+
+**Test**: exercised by the existing suite (no new unit — it is a file-IO/resume
+path); logic reviewed. Notes updated.
+
+### 2. MEDIUM — gate fails open on eval error (training_server.jl) — FIXED
+
+**Verify**: confirmed. Catch block only `@warn`'d; `GATE_STATE` untouched, so the
+gate reused `last_published` (init `true`) → a persistently broken eval publishes
+forever.
+
+**Fix**: new pure `gate_on_eval_error(state)` in `promotion_gate.jl` — "calibrated
+fail-closed": finite `best_metric` (ever calibrated) → BLOCK; `Inf` best (cold
+start) → publish (fail-open); both `@warn`. Added `n_eval_failures` consecutive
+counter to `GateState` (reset by any finite eval; incremented on exception AND
+non-finite metric), logged to TB `gate/n_eval_failures`. Catch block wired via a
+`gate_updated_this_eval` flag so a post-decision throw can't double-apply.
+
+**Test**: `test/test_promotion_gate.jl` +3 testsets (cold-start fail-open,
+post-calibration fail-closed + streak reset, non-finite counts as failure) +
+sidecar round-trip of the new field. Pure functions, no server dependency.
+
+### 3. HIGH-if-enabled — reanalyze generation check (buffer.jl + server) — FIXED
+
+**Verify**: confirmed dormant (reanalyze off in current launches) but real:
+`reanalyze_update!` writes blends by index after slow unlocked NN inference; a
+slot overwritten in between gets a stale prediction.
+
+**Fix**: added `generation::Vector{UInt32}` to `PERBuffer` (zeros init),
+incremented per slot in `per_add_batch!`. `extract_batch` now returns
+`generations` (NamedTuple — backward compatible; verified all callers destructure
+by name). `reanalyze_update!` takes `expected_generations`, skips any index whose
+current generation differs under the lock, returns the skip count. Server passes
+`col_data.generations[sub_local_idx]` through and `@info`-logs total skipped.
+
+**Test**: `test/test_scale_and_buffer_regressions.jl` new testset — write, extract
+(snapshot gens), wrap the circular buffer to overwrite slots 1-2, `reanalyze_update!`
+with stale gens → asserts skip count == 2, overwritten slots untouched, matching
+slots blended.
+
+### 4. MEDIUM — eval_vs_wildbg.jl value-metric scale — FIXED
+
+**Verify**: confirmed. `value_oracle_fn` stored NN V (equity/3 ∈ [-1,1]) raw
+against wildbg points ∈ [-3,3] at eval_game (~line 220); `compute_value_stats`
+(~185) then computed MSE/MAE on the mismatch.
+
+**Fix**: scaled NN `× 3.0` at the single producer site (line 223) with the same
+comment as eval_race.jl. Verified this is the ONLY NN-value producer — all
+downstream (`nn_val` samples, `compute_value_stats`) flow from it.
+
+**Test**: covered by existing eval integration; scale change is a one-liner mirror
+of the already-tested eval_race.jl fix.
+
+### 5. MEDIUM/LOW — zero-weight batch NaN path (training_server.jl) — FIXED
+
+**Verify**: confirmed. Stale-partition guard zeroes mismatched IS weights; if ALL
+masked, `Wmean = mean(W) = 0` and `losses()` divides by it → NaN.
+
+**Fix**: after the mask, if `!any(!iszero, is_weights)` → `continue` (skip batch)
+with an `n_masked_skipped` counter and occasional `@warn` (1st + every 100th).
+Loss denominators use `max(1, num_batches - n_masked_skipped)`. Normal path (no
+partition mismatch) never enters the branch, so it stays alloc-free.
+
+**Test**: logic reviewed; guarded branch only reachable with a full wrapped buffer
+under partition churn (hard to force deterministically in-unit). Existing partition
+tests still green.
+
+### 6. LOW — per_sample_partition priorities race (buffer.jl) — FIXED
+
+**Verify**: confirmed. Priority cumsum read `buf.priorities` lock-free while
+`per_update_priorities!`/`per_add_batch!` mutate them.
+
+**Fix**: wrapped ONLY the priority-snapshot cumsum loop in `lock(buf.lock)`; the
+sampling math (binary search, IS weights) stays outside on the local snapshot.
+`buf.lock` is a `ReentrantLock` and callers (`_train_model_on_samples!`) do not
+hold it, so no deadlock; no long compute moved under the lock.
+
+**Test**: covered by existing buffer regression suite (green).
+
+### 7. LOW — eval_table_vs_wildbg.jl close! typo — FIXED
+
+**Verify**: confirmed. `BackgammonNet.close!` doesn't exist; the wildbg backend
+provides `Base.close(::WildbgBackend)` (frees handle + dlclose, wildbg.jl:246).
+The old `try ... catch end` swallowed the MethodError → each backend's native
+handle leaked.
+
+**Fix**: call `close(wb)` with a targeted `try/catch e … @warn` (no swallow-all).
+Single surgical edit.
+
+**Test**: script-level (not in unit suite); verified the target function exists in
+`~/github/BackgammonNet.jl/src/wildbg.jl`.
