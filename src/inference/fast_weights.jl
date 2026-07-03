@@ -235,20 +235,40 @@ function _gemm_bias!(C::AbstractMatrix{Float32}, A::Matrix{Float32},
         end
     end
 
+    # muladd is required for FMA codegen (@simd does not add the contract flag),
+    # and the 4-step k-unroll amortizes the C load/store over 16 FMAs — without it
+    # the kernel is store-port-bound and FMA capacity is unreachable. Summation
+    # order matches the pre-unroll kernel (ascending p), modulo FMA rounding.
     tile_k = 64
     @inbounds for pk in 1:tile_k:k
         pk_end = min(pk + tile_k - 1, k)
         j = 1
         while j + 3 <= n
-            for p in pk:pk_end
+            p = pk
+            while p + 3 <= pk_end
+                b11 = B[p, j];   b12 = B[p, j+1];   b13 = B[p, j+2];   b14 = B[p, j+3]
+                b21 = B[p+1, j]; b22 = B[p+1, j+1]; b23 = B[p+1, j+2]; b24 = B[p+1, j+3]
+                b31 = B[p+2, j]; b32 = B[p+2, j+1]; b33 = B[p+2, j+2]; b34 = B[p+2, j+3]
+                b41 = B[p+3, j]; b42 = B[p+3, j+1]; b43 = B[p+3, j+2]; b44 = B[p+3, j+3]
+                @simd for i in 1:m
+                    a1 = A[i, p]; a2 = A[i, p+1]; a3 = A[i, p+2]; a4 = A[i, p+3]
+                    C[i, j]   = muladd(a4, b41, muladd(a3, b31, muladd(a2, b21, muladd(a1, b11, C[i, j]))))
+                    C[i, j+1] = muladd(a4, b42, muladd(a3, b32, muladd(a2, b22, muladd(a1, b12, C[i, j+1]))))
+                    C[i, j+2] = muladd(a4, b43, muladd(a3, b33, muladd(a2, b23, muladd(a1, b13, C[i, j+2]))))
+                    C[i, j+3] = muladd(a4, b44, muladd(a3, b34, muladd(a2, b24, muladd(a1, b14, C[i, j+3]))))
+                end
+                p += 4
+            end
+            while p <= pk_end
                 b1 = B[p, j]; b2 = B[p, j+1]; b3 = B[p, j+2]; b4 = B[p, j+3]
                 @simd for i in 1:m
                     a = A[i, p]
-                    C[i, j]   += a * b1
-                    C[i, j+1] += a * b2
-                    C[i, j+2] += a * b3
-                    C[i, j+3] += a * b4
+                    C[i, j]   = muladd(a, b1, C[i, j])
+                    C[i, j+1] = muladd(a, b2, C[i, j+1])
+                    C[i, j+2] = muladd(a, b3, C[i, j+2])
+                    C[i, j+3] = muladd(a, b4, C[i, j+3])
                 end
+                p += 1
             end
             j += 4
         end
@@ -256,7 +276,7 @@ function _gemm_bias!(C::AbstractMatrix{Float32}, A::Matrix{Float32},
             for p in pk:pk_end
                 bp = B[p, j]
                 @simd for i in 1:m
-                    C[i, j] += A[i, p] * bp
+                    C[i, j] = muladd(A[i, p], bp, C[i, j])
                 end
             end
             j += 1
@@ -269,6 +289,11 @@ end
 # - x86: BLAS is 1.6x faster single-threaded, but view allocations (96 bytes/call)
 #   cause GC pressure under multi-threading that negates the GEMM speedup.
 # Net result: pure Julia GEMM wins for production multi-worker selfplay on both platforms.
+#
+# FMA + k-unroll kernel (2026-07-03): the previous kernel emitted no FMA instructions
+# and was store-port-bound reloading C every k-step. muladd + 4-step k-unroll measured
+# 1.7-2.2x per layer shape on both i7-10700K (43→75-94 GFLOPS) and M1 Pro (32→63-73
+# GFLOPS); 6-worker aggregate forward throughput 1.64x (x86) / 2.27x (ARM).
 
 function dense!(out::AbstractMatrix, W::Matrix{Float32}, x::AbstractMatrix, b::Vector{Float32}, n::Int)
     _gemm_bias!(out, W, x, b, n)
