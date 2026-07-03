@@ -42,6 +42,11 @@ using Dates
 using Random
 using Statistics
 
+const SelfPlayRNG = Random.Xoshiro
+
+new_selfplay_rng(seed::Integer) = SelfPlayRNG(seed)
+new_selfplay_rng() = SelfPlayRNG(rand(UInt))
+
 function parse_args()
     s = ArgParseSettings(
         description="Self-play client for distributed AlphaZero training",
@@ -534,7 +539,7 @@ end
 """Initialize a game environment from configured starting positions or default opening."""
 function init_game(rng::AbstractRNG)
     env = GI.init(gspec)
-    if hasproperty(env, :rng)
+    if hasproperty(env, :rng) && rng isa typeof(env.rng)
         env.rng = rng
     end
     if START_POSITIONS !== nothing
@@ -869,7 +874,7 @@ Bypasses GameLoop.play_game() to avoid per-move TraceEntry allocations and
 contact detection overhead that cause GC pressure under 32+ threads.
 This matches the v6 inline game loop that achieved 200-400 games/min."""
 function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
-                          rng::MersenneTwister;
+                          rng::AbstractRNG;
                           player=nothing)
     n_bearoff_truncated = 0
 
@@ -995,8 +1000,8 @@ end
 
 """Play games on a worker thread with the shared CPU inference backend."""
 function worker_play_games(worker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
-                           rng::MersenneTwister)
-    sub_rng = MersenneTwister(rand(rng, UInt))
+                           rng::AbstractRNG)
+    sub_rng = new_selfplay_rng(rand(rng, UInt))
 
     result = _play_games_loop(worker_id, games_claimed, total_games, sub_rng)
     return result.samples
@@ -1004,8 +1009,8 @@ end
 
 """Play games on a worker thread with GPU inference (Metal, serialized via lock)."""
 function worker_play_games_gpu(worker_id::Int, games_claimed::Threads.Atomic{Int}, total_games::Int,
-                                rng::MersenneTwister)
-    sub_rng = MersenneTwister(rand(rng, UInt))
+                                rng::AbstractRNG)
+    sub_rng = new_selfplay_rng(rand(rng, UInt))
 
     n_bearoff_truncated = 0
 
@@ -1095,7 +1100,7 @@ const GPU_GAMES_COUNT = Threads.Atomic{Int}(0)
 if USE_GPU
     for w in 1:GPU_WORKERS
         wid = NUM_WORKERS + w
-        rng = MersenneTwister(isnothing(MAIN_SEED) ? rand(UInt) : MAIN_SEED + wid * 104729)
+        rng = isnothing(MAIN_SEED) ? new_selfplay_rng() : new_selfplay_rng(MAIN_SEED + wid * 104729)
         Threads.@spawn begin
             # Infinite game loop — GPU workers never stop
             games_claimed_inf = Threads.Atomic{Int}(0)
@@ -1134,7 +1139,7 @@ function parallel_self_play(num_games::Int)
 
     tasks = Task[]
     for w in 1:NUM_WORKERS
-        rng = MersenneTwister(isnothing(MAIN_SEED) ? rand(UInt) : MAIN_SEED + w * 104729)
+        rng = isnothing(MAIN_SEED) ? new_selfplay_rng() : new_selfplay_rng(MAIN_SEED + w * 104729)
         t = Threads.@spawn worker_play_games(w, games_claimed, num_games, rng)
         push!(tasks, t)
     end
@@ -1228,10 +1233,10 @@ end
 const SAMPLE_CHANNEL = Channel{Vector{Any}}(NUM_WORKERS * 2)
 
 """Continuous worker: plays games forever, pushing samples into SAMPLE_CHANNEL."""
-function continuous_worker(worker_id::Int, rng::MersenneTwister)
+function continuous_worker(worker_id::Int, rng::AbstractRNG)
     println("  Worker $worker_id starting on thread $(Threads.threadid())")
     flush(stdout)
-    sub_rng = MersenneTwister(rand(rng, UInt))
+    sub_rng = new_selfplay_rng(rand(rng, UInt))
 
     # Create agent and player ONCE per worker — reused across all games
     mcts_params = MctsParams(
@@ -1375,7 +1380,7 @@ function eval_game_from_position(az_agent::EvalAlphaZeroAgent,
                                   position_data::Tuple,
                                   value_batch_oracle;
                                   seed::Int=1, az_is_white::Bool=true)
-    rng = MersenneTwister(seed)
+    rng = new_selfplay_rng(seed)
     p0, p1, cp = position_data
     g = BackgammonNet.BackgammonGame(p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
                                       obs_type=:minimal_flat)
@@ -1628,7 +1633,7 @@ function main_loop()
     # Start all workers as continuous background threads
     tasks = Task[]
     for w in 1:NUM_WORKERS
-        rng = MersenneTwister(isnothing(MAIN_SEED) ? rand(UInt) : MAIN_SEED + w * 104729)
+        rng = isnothing(MAIN_SEED) ? new_selfplay_rng() : new_selfplay_rng(MAIN_SEED + w * 104729)
         t = Threads.@spawn continuous_worker(w, rng)
         push!(tasks, t)
     end
