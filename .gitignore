@@ -18,3 +18,8 @@ wandb
 archive
 
 TODO.md
+
+# Local-only data and tool caches
+.CondaPkg/
+eval_data/
+log.txt

@@ -229,6 +229,18 @@ All under `/homeshare/projects/AlphaZero.jl/sessions/`:
 
 ## Key Lessons
 
+### External Review Fixes (2026-07-03)
+All five High findings from external engineer review verified and four fixed (see `notes/review_fixes_20260703.md`):
+- **Terminal bearoff = simple win bug FIXED** — selfplay_client.jl hard-coded terminal bearoff moves as 1.0/[1,0,0,0,0], discarding gammon value (opponent 0-off = gammon 2.0, exactly the c15 states). Both training-target and MCTS-evaluator paths now derive value + 5-head target from `bg.reward` (carries the multiplier). Regression test: `test/test_terminal_bearoff_rewards.jl`.
+- **MCTS value scale FIXED** — NN emits equity/3 ∈ [-1,1] but game rewards (±1/±2/±3) and bearoff evaluator (raw points) mixed into the same Q totals. New `GI.reward_scale(gspec)` (backgammon: 3.0); MCTS (both mcts.jl and batched_mcts.jl) divides rewards by it; bearoff evaluator normalized /3. Convention: **buffer/training targets raw [-3,3]; MCTS-internal [-1,1]** (compute_td_errors already normalized). cpuct=2.0 was tuned under mixed scales — worth re-checking near-bearoff behavior.
+- **Race mode trained on parts.all FIXED** — now parts.race only, with contamination warning + partition counts logged at bootstrap load.
+- **Buffer torn-read race FIXED** — extract_batch/partition_indices now hold the lock (circular overwrite after buffer fills could tear samples). Residual benign race: a sample can be swapped between partition and extract (valid sample, possibly wrong partition).
+- **No promotion gate (OPEN)** — server publishes weights every iteration unconditionally; regressions propagate into self-play. Planned: gate on fixed bearoff eval + race eval within confidence bounds.
+
+### v11/v12 Self-Play Diagnosis (2026-07-03, from TB analysis)
+- **v11 value head DRIFTED during self-play**: bearoff corr vs exact table fell 0.974→0.875 while value loss fell 0.94→0.48 — fitting biased self-generated targets away from truth. v12's k=7 table anchoring + bootstrap buffer flush fixed it (corr 0.999 by iter 50).
+- **v12 play strength is FLAT at wildbg parity** (+0.004 equity at iters 30-45). Self-play holds the model at teacher level, never past it. The plateau lives in pre-bearoff race positions where nothing measures ground truth — hence the one-sided rollout ground-truth plan (memory: race-ground-truth-rollouts).
+
 ### Critical Bug (2026-02-14)
 0. **ALWAYS verify board encoding against external reference** -- `_to_gnubg_board` had 3 bugs (off-by-one, bar position, opponent perspective) that made GnuBG evaluate wrong positions. All pre-fix results showed 65-92% win rates when reality was 3-10%. Self-consistency checks are NOT sufficient; verify against gnubg's known position IDs.
 
@@ -266,43 +278,52 @@ All under `/homeshare/projects/AlphaZero.jl/sessions/`:
 21. **GPU inference on M3 Max (Metal.jl)** -- 4.12x raw speedup at batch=500, but 12ms kernel launch overhead means crossover at batch≈20-30. Best end-to-end: GPU-Lock with 6 workers = 2.36x (30 games/min). Metal is NOT thread-safe. Adding CPU workers alongside GPU HURTS. Speculative prefetch failed (0.09x). GPU is useful only when batch sizes are guaranteed large.
 22. **Value error vs wildbg not yet measured** -- Need to track NN value prediction accuracy against wildbg equity to understand when chance expansion will start helping. TODO: build eval script with per-position value comparison.
 
-## Next Steps
+## Shipping Constraint
 
-### Eval Improvements (immediate)
+**The final delivered engine ships with a SMALL bear-off table (< 50 MB).** The large
+exact tables (k=7: 88 GB) are TRAINING-ONLY infrastructure — used for training targets,
+MCTS value overrides during self-play, and ground-truth eval. The trained network must
+absorb the table's knowledge; do not build runtime dependencies on the large tables
+into the engine we deliver.
 
-1. **Value error tracking vs wildbg** -- Build eval script that compares NN value predictions against wildbg equity on positions from self-play games. Track MSE/correlation separately for contact vs race model. Script: `scripts/eval_value_accuracy.jl` (TODO).
+## Next Steps (updated 2026-07-03)
 
-2. **GPU eval (revisit after model is stronger)** -- GPU-Lock with 6 workers = 2.36x speedup on Neo. Worth revisiting when model strength justifies longer eval runs. Scripts: `scripts/bench_gpu_eval.jl`.
+### Immediate (before v13 launch)
 
-### Phase 1: Training Efficiency (before scaling)
+1. **Promotion gate** -- Only publish weights when fixed bearoff eval + race eval don't
+   regress beyond confidence bounds; keep `race_best.data` for rollback. Design in
+   `notes/review_fixes_20260703.md` (finding 5, the one open review item).
 
-4. **Bear-off MCTS value override at decision nodes** -- DONE (2026-03-19). Bear-off evaluator now fires at both chance nodes (pre-dice, exact table value) and decision nodes (post-dice, exact via move enumeration). Also fixed perspective bug and training target mismatch. Retest bear-off with this fix to see if previous regression reverses.
+2. **Pre-bearoff ground-truth eval** -- One-sided rollouts with 3 personalities
+   (efficiency / gammon-go / gammon-save) + analytic combine, k=7 truncation. Makes
+   the plateau band (pre-bearoff race positions) measurable against truth. Design in
+   memory `race-ground-truth-rollouts`. Validate vs small two-sided rollout sample.
 
-5. **Progressive MCTS budget** -- Early iterations (1-20): 100 sims. Mid (20-100): 200 sims. Late (100+): 400 sims. Early network is random so deep search is wasted compute. 4x more games/iter in early training. Trivial: parameterize `num_iters_per_turn` as a schedule.
+3. **v13 race run with the 2026-07-03 review fixes** -- terminal gammon fix + MCTS
+   value scale fix change search behavior near bearoff. Consider a fixed-checkpoint
+   A/B (same weights, old vs new code, race eval) to isolate the fix effect.
 
-6. **Bear-off backward equity propagation** -- For games that reach bear-off, use first bear-off position's exact equity as target for ALL preceding contact positions (not final game outcome). Already partially coded (lines 1425-1435 in train_distributed.jl). Previous "bearoff hurt" finding was pre-board-fix — needs retesting.
+### Phase 1: Training Efficiency
 
-7. **CPUCT tuning** -- Try 1.0, 1.5, 3.0 (default 2.0, never tuned with correct eval). Cheap parallel experiment.
+4. **Progressive MCTS budget** -- Early iterations (1-20): 100 sims. Mid (20-100): 200 sims. Late (100+): 400 sims. Early network is random so deep search is wasted compute. Trivial: parameterize `num_iters_per_turn` as a schedule.
 
-### Phase 2: Curriculum Learning (after Phase 1 results)
+5. **CPUCT tuning** -- Try 1.0, 1.5, 3.0 (default 2.0). Re-tune AFTER the value-scale fix (2026-07-03) since Q magnitudes near bearoff changed.
 
-8. **Race-only pre-training** -- Train race network (128w×3b) exclusively on race positions for 50-100 iters. Use games starting from near-bearoff positions. Race phase is simpler, network learns faster.
+### Phase 2: Curriculum Learning
 
-9. **Contact training with frozen race evaluator** -- After race network is solid, train contact network (256w×10b). When MCTS reaches a race position, use trained race network as exact endgame evaluator instead of continuing rollout. Clean signal propagation from known endpoints.
+6. **Contact training with frozen race evaluator** -- After race network is solid, train contact network (256w×10b). When MCTS reaches a race position, use trained race network as exact endgame evaluator instead of continuing rollout. Clean signal propagation from known endpoints.
 
 ### Phase 3: Advanced Techniques
 
-10. **Re-test progressive widening** -- When model is strong enough to consistently beat wildbg/GnuBG 0-ply, re-test chance node expansion. Progressive widening (α=0.25) was best alternative at -1.220 equity. As NN accuracy improves, proper chance averaging should cross over passthrough.
+7. **Re-test progressive widening** -- When model is strong enough to consistently beat wildbg, re-test chance node expansion. As NN accuracy improves, proper chance averaging should cross over passthrough.
 
-11. **Gumbel MCTS** -- Replace standard MCTS with Gumbel-top-k for training. Code exists in `gumbel_mcts.jl` but isn't wired into training. Sequential halving focuses compute on top-k candidates instead of spreading across 50+ legal moves.
+8. **Gumbel MCTS** -- Replace standard MCTS with Gumbel-top-k for training. Sequential halving focuses compute on top-k candidates instead of spreading across 50+ legal moves.
 
-12. **External position bootstrapping** -- Generate 50-100K positions, evaluate with wildbg, pre-fill replay buffer before self-play starts. Solves cold-start problem (early games are random noise).
-
-13. **Full game training** -- Switch from SHORT_GAME to standard opening. Short games skip opening/midgame strategic depth. May need bear-off truncation to compensate for longer games.
+9. **Full game training** -- Switch from SHORT_GAME to standard opening. May need bear-off truncation to compensate for longer games.
 
 ### Scaling (after efficiency gains proven)
 
-14. **Scale up model + iterations** -- 256w×10b + PER for 500+ iterations, using Phase 1-2 efficiency improvements.
+10. **Scale up model + iterations** -- 256w×10b + PER for 500+ iterations, using Phase 1-2 efficiency improvements.
 
 ### v7 Distributed Eval (2026-03-22)
 
