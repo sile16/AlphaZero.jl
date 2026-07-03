@@ -82,4 +82,30 @@ else
         # Sign check from black's perspective: white's gammon is -2 for black.
         @test bearoff_turn_value(nothing, mid, 1) == -2.0
     end
+
+    @testset "Raw-points → NN-scale normalization + Float64 unification" begin
+        # bearoff_value_to_nn_scale is the SINGLE raw-points → [-1,1] mapping the
+        # tree-facing evaluator uses. Backgammon reward_scale is 3.0 (asserted in
+        # test_terminal_bearoff_rewards.jl); check the mapping and its types.
+        @test bearoff_value_to_nn_scale(3.0, 3.0) == 1.0
+        @test bearoff_value_to_nn_scale(-3.0, 3.0) == -1.0
+        @test bearoff_value_to_nn_scale(2.0, 3.0) ≈ 2 / 3
+        @test bearoff_value_to_nn_scale(-1.5, 3.0) == -0.5
+        @test bearoff_value_to_nn_scale(0.0, 3.0) == 0.0
+        # Accepts Int / Float32 inputs, always returns Float64 (no scale drift).
+        @test bearoff_value_to_nn_scale(2, 3) isa Float64
+        @test bearoff_value_to_nn_scale(2.0f0, 3.0f0) ≈ 2 / 3
+        @test bearoff_value_to_nn_scale(2.0f0, 3.0f0) isa Float64
+
+        # End-to-end: a terminal gammon (+2 raw) the evaluator would feed MCTS
+        # becomes +2/3 on the NN scale — the same number the NN head emits.
+        # The terminal branch reads only reward+terminated, so the board is moot.
+        gammon_win = BackgammonGame(UInt128(0), UInt128(0), SVector{2, Int8}(0, 0),
+                                    Int8(0), Int8(0), true, 2.0f0; obs_type=:minimal_flat)
+        v_win, eq_win = bearoff_turn_value_equity(nothing, gammon_win, 0)
+        @test v_win == 2.0
+        @test v_win isa Float64                 # Float32/Float64 unification
+        @test eq_win == Float32[1, 1, 0, 0, 0]
+        @test bearoff_value_to_nn_scale(v_win, 3.0) ≈ 2 / 3
+    end
 end

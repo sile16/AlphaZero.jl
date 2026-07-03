@@ -445,6 +445,9 @@ Returns white-relative equity NORMALIZED to [-1,1] (points/3) so tree values are
 on the same scale as NN value output (equity/3), or nothing if not a bear-off position.
 """
 function make_bearoff_evaluator(table)
+    # Single normalization point: raw bear-off points [-reward_scale, reward_scale]
+    # → MCTS/NN value scale [-1,1]. Tied to GI.reward_scale so it can't drift.
+    rs = Float64(GI.reward_scale(gspec))
     return function(game_env)
         # No local table → skip bearoff eval entirely (NN handles it).
         # Remote HTTP is far too slow for per-MCTS-iteration lookups.
@@ -456,10 +459,10 @@ function make_bearoff_evaluator(table)
         end
 
         if BackgammonNet.is_chance_node(bg)
-            # Pre-dice: table value is exact (mover-relative → white-relative).
-            # Normalize points/3 to match NN value scale [-1,1].
+            # Pre-dice: table value is exact (mover-relative → white-relative),
+            # normalized to the NN value scale [-1,1] via reward_scale.
             r = BearoffK7.lookup(table, bg)
-            mover_equity = Float64(BearoffK7.compute_equity(r)) / 3.0
+            mover_equity = bearoff_value_to_nn_scale(BearoffK7.compute_equity(r), rs)
             return bg.current_player == 0 ? mover_equity : -mover_equity
         end
 
@@ -477,8 +480,8 @@ function make_bearoff_evaluator(table)
         end
 
         # Convert from current-player-relative to white-relative,
-        # normalized points/3 to match NN value scale [-1,1]
-        best_value /= 3.0
+        # normalized to the NN value scale [-1,1] via reward_scale.
+        best_value = bearoff_value_to_nn_scale(best_value, rs)
         return bg.current_player == 0 ? best_value : -best_value
     end
 end
@@ -1394,9 +1397,10 @@ function eval_game_from_position(az_agent::EvalAlphaZeroAgent,
             is_p0_turn = g.current_player == 0
             is_az_turn = is_p0_turn == az_is_white
             if is_az_turn
-                # NN V is normalized equity/3 ∈ [-1,1]; wildbg returns raw points.
-                # Scale NN ×3 so value MSE/corr compare on the same (points) scale.
-                nn_v = Float64(value_batch_oracle([g])[1][2]) * 3.0
+                # NN V is normalized equity/reward_scale ∈ [-1,1]; wildbg returns
+                # raw points. Scale NN back ×reward_scale so value MSE/corr compare
+                # on the same (points) scale.
+                nn_v = Float64(value_batch_oracle([g])[1][2]) * Float64(GI.reward_scale(gspec))
                 wb_v = Float64(BackgammonNet.evaluate(wildbg_agent.backend, g))
                 push!(value_samples, PositionValueSample(nn_v, wb_v))
             end

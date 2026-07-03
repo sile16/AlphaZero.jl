@@ -129,13 +129,15 @@ if ARGS["bearoff_eval"]
     global TABLE = BearoffTable(_table_candidates[_tdir])
 
     # Mirrors selfplay_client.jl's make_bearoff_evaluator (money weights).
+    # Single normalization point tied to GI.reward_scale (raw points → [-1,1]).
+    _bo_rs = Float64(GI.reward_scale(gspec))
     global BEAROFF_EVALUATOR = function(game_env)
         bg = game_env.game
         BearoffK7.is_bearoff_position(bg.p0, bg.p1) || return nothing
         if BackgammonNet.is_chance_node(bg)
-            # Pre-dice: exact table value, mover-relative → white-relative, /3.
+            # Pre-dice: exact table value, mover-relative → white-relative.
             r = BearoffK7.lookup(TABLE, bg)
-            mover_equity = Float64(BearoffK7.compute_equity(r)) / 3.0
+            mover_equity = bearoff_value_to_nn_scale(BearoffK7.compute_equity(r), _bo_rs)
             return bg.current_player == 0 ? mover_equity : -mover_equity
         end
         # Decision node (post-dice): exact Q via move enumeration (doubles-safe).
@@ -143,7 +145,7 @@ if ARGS["bearoff_eval"]
         isempty(actions) && return nothing
         best_value = bearoff_best_move_value(TABLE, bg)
         best_value == -Inf && return nothing
-        best_value /= 3.0  # normalize points → NN value scale [-1,1]
+        best_value = bearoff_value_to_nn_scale(best_value, _bo_rs)  # → NN scale [-1,1]
         return bg.current_player == 0 ? best_value : -best_value
     end
     println("Exact bear-off evaluator: ENABLED")

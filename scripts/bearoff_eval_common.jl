@@ -27,6 +27,23 @@
 """Money weights: reproduce `compute_equity` and raw `reward` exactly."""
 const BEAROFF_MONEY_WEIGHTS = (1.0, 2.0, -1.0, -2.0)
 
+"""
+    bearoff_value_to_nn_scale(v_points, reward_scale) -> Float64
+
+Normalize a RAW bear-off value in points ([-reward_scale, +reward_scale], i.e.
+[-3, 3] for backgammon) to the MCTS/NN value scale [-1, 1]. This is the SINGLE
+place the raw→[-1,1] division lives, so the bear-off EVALUATOR (which feeds the
+MCTS tree) stays tied to `GI.reward_scale(gspec)` and cannot drift from a
+hard-coded constant.
+
+NOTE the asymmetry: training TARGETS deliberately keep RAW points (the buffer
+convention — see CLAUDE.md) and must NOT call this; only tree-facing evaluators
+normalize. Every helper in this file returns RAW points; normalization is a
+caller (evaluator) concern, applied here explicitly and once.
+"""
+@inline bearoff_value_to_nn_scale(v_points::Real, reward_scale::Real)::Float64 =
+    Float64(v_points) / Float64(reward_scale)
+
 """Objective value of a `BearoffResult` (mover-perspective) in points.
 For money weights this equals `compute_equity(r)` (bit-exact fast path)."""
 @inline function _bearoff_objective_value(r, weights)::Float64
@@ -101,19 +118,22 @@ vector from `mover`'s perspective (for training targets). Value in raw points.
 """
 function bearoff_turn_value_equity(table, game, mover::Integer)
     if game.terminated
-        white_r = Float32(game.reward)
+        # Compute the scalar value in Float64 (consistent with bearoff_turn_value);
+        # only the 5-head equity target is Float32. reward is an exact small int,
+        # so this is bit-identical to the prior Float32 path.
+        white_r = Float64(game.reward)
         mval = mover == 0 ? white_r : -white_r  # > 0: mover just won
         abs_mval = abs(mval)
-        is_g = abs_mval >= 2.0f0
-        is_bg = abs_mval >= 3.0f0
-        eq = if mval > 0.0f0
-            Float32[1.0, is_g ? 1.0 : 0.0, is_bg ? 1.0 : 0.0, 0.0, 0.0]
-        elseif mval < 0.0f0
-            Float32[0.0, 0.0, 0.0, is_g ? 1.0 : 0.0, is_bg ? 1.0 : 0.0]
+        is_g = abs_mval >= 2.0
+        is_bg = abs_mval >= 3.0
+        eq = if mval > 0.0
+            Float32[1, is_g ? 1 : 0, is_bg ? 1 : 0, 0, 0]
+        elseif mval < 0.0
+            Float32[0, 0, 0, is_g ? 1 : 0, is_bg ? 1 : 0]
         else
             zeros(Float32, 5)
         end
-        return (Float64(mval), eq)
+        return (mval, eq)
     elseif BackgammonNet.is_chance_node(game)
         r = BearoffK7.lookup(table, game)
         v = Float64(BearoffK7.compute_equity(r))
