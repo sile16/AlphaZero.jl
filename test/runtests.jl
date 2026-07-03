@@ -33,6 +33,10 @@ end
   include("test_bearoff_doubles_regression.jl")
 end
 
+@testset "MCTS Identity Staircase" begin
+  include("test_mcts_identity_staircase.jl")
+end
+
 @testset "Promotion Gate" begin
   include("test_promotion_gate.jl")
 end
