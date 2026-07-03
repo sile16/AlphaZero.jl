@@ -103,9 +103,16 @@ function bearoff_turn_value_equity(table, game, mover::Integer)
     if game.terminated
         white_r = Float32(game.reward)
         mval = mover == 0 ? white_r : -white_r  # > 0: mover just won
-        is_g = mval >= 2.0f0
-        is_bg = mval >= 3.0f0
-        eq = Float32[1.0, is_g ? 1.0 : 0.0, is_bg ? 1.0 : 0.0, 0.0, 0.0]
+        abs_mval = abs(mval)
+        is_g = abs_mval >= 2.0f0
+        is_bg = abs_mval >= 3.0f0
+        eq = if mval > 0.0f0
+            Float32[1.0, is_g ? 1.0 : 0.0, is_bg ? 1.0 : 0.0, 0.0, 0.0]
+        elseif mval < 0.0f0
+            Float32[0.0, 0.0, 0.0, is_g ? 1.0 : 0.0, is_bg ? 1.0 : 0.0]
+        else
+            zeros(Float32, 5)
+        end
         return (Float64(mval), eq)
     elseif BackgammonNet.is_chance_node(game)
         r = BearoffK7.lookup(table, game)

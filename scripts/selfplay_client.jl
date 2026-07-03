@@ -1459,26 +1459,27 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
     lib_size = filesize(WILDBG_LIB_EVAL)
     nets_variant = lib_size > 16_000_000 ? :large : :small
 
-    # Auto-detect wildbg nets variant
-    lib_size = filesize(WILDBG_LIB_EVAL)
-    nets_variant = lib_size > 16_000_000 ? :large : :small
+    make_eval_oracles(batch_size) = if CPU_INFERENCE_BACKEND == :fast
+        AlphaZero.BackgammonInference.make_cpu_oracles(
+            CPU_INFERENCE_BACKEND, eval_contact_net, eval_cfg;
+            secondary_net=eval_race_net, batch_size=batch_size,
+            primary_fw=eval_contact_fw, secondary_fw=eval_race_fw, nslots=1)
+    else
+        AlphaZero.BackgammonInference.make_cpu_oracles(
+            CPU_INFERENCE_BACKEND, eval_contact_net, eval_cfg;
+            secondary_net=eval_race_net, batch_size=batch_size, nslots=1)
+    end
 
     # Create ALL per-thread resources ONCE (reused across all chunks in this eval)
-    n_threads = Threads.nthreads() + 2  # over-allocate for Julia 1.12 threadid range
+    n_threads = Threads.maxthreadid()
     agents = Vector{Any}(undef, n_threads)
     wb_agents = Vector{Any}(undef, n_threads)
     value_batch_oracles = Vector{Any}(undef, n_threads)
     for tid in 1:n_threads
-        oracles = AlphaZero.BackgammonInference.make_cpu_oracles(
-            CPU_INFERENCE_BACKEND, nothing, eval_cfg;
-            secondary_net=nothing, batch_size=INFERENCE_BATCH_SIZE,
-            primary_fw=eval_contact_fw, secondary_fw=eval_race_fw, nslots=1)
+        oracles = make_eval_oracles(INFERENCE_BATCH_SIZE)
         agents[tid] = EvalAlphaZeroAgent(oracles[1], oracles[2],
             eval_mcts_params, INFERENCE_BATCH_SIZE, gspec)
-        vo = AlphaZero.BackgammonInference.make_cpu_oracles(
-            CPU_INFERENCE_BACKEND, nothing, eval_cfg;
-            secondary_net=nothing, batch_size=1,
-            primary_fw=eval_contact_fw, secondary_fw=eval_race_fw, nslots=1)
+        vo = make_eval_oracles(1)
         value_batch_oracles[tid] = vo[2]
         wb = BackgammonNet.WildbgBackend(; nets=nets_variant, lib_path=WILDBG_LIB_EVAL)
         BackgammonNet.open!(wb)
@@ -1567,7 +1568,8 @@ function process_eval_chunk!(chunk_data::Dict)
     flush(stdout)
 
     # Setup or refresh eval session if iter or weights version changed
-    if EVAL_SESSION.n_threads == 0 || EVAL_SESSION.iter != eval_iter ||
+    if EVAL_SESSION.n_threads == 0 || EVAL_SESSION.n_threads < Threads.maxthreadid() ||
+       EVAL_SESSION.iter != eval_iter ||
        EVAL_SESSION.weights_version != weights_version
         setup_eval_session!(eval_iter, weights_version)
     end
@@ -1586,33 +1588,43 @@ function process_eval_chunk!(chunk_data::Dict)
 
     # Heartbeat task
     heartbeat_done = Threads.Atomic{Bool}(false)
-    Threads.@spawn begin
+    heartbeat_task = Threads.@spawn begin
+        next_heartbeat = time() + 10
         while !heartbeat_done[]
-            sleep(10)
-            send_eval_heartbeat(chunk_id)
+            if time() >= next_heartbeat
+                send_eval_heartbeat(chunk_id)
+                next_heartbeat = time() + 10
+            end
+            sleep(1)
         end
     end
 
     # Parallel eval — each thread uses its own resources (nothing shared)
-    Threads.@threads for job in 1:n_games
-        wid = Threads.threadid()  # safe: n_threads over-allocated for Julia 1.12 interactive pool
-        pos_idx = pos_start + job - 1
-        if pos_idx > length(EVAL_POSITIONS)
-            rewards[job] = 0.0
-        else
-            result = eval_game_from_position(
-                agents[wid], wb_agents[wid],
-                EVAL_POSITIONS[pos_idx], value_batch_oracles[wid];
-                seed=chunk_id * 10000 + job, az_is_white=az_is_white)
-            rewards[job] = result.reward
-            for s in result.value_samples
-                push!(thread_val_nn[wid], s.nn_val)
-                push!(thread_val_opp[wid], s.wb_val)
+    try
+        Threads.@threads for job in 1:n_games
+            wid = Threads.threadid()
+            if wid > n_threads
+                error("Eval resource slot missing for thread id $wid (n_threads=$n_threads)")
+            end
+            pos_idx = pos_start + job - 1
+            if pos_idx > length(EVAL_POSITIONS)
+                rewards[job] = 0.0
+            else
+                result = eval_game_from_position(
+                    agents[wid], wb_agents[wid],
+                    EVAL_POSITIONS[pos_idx], value_batch_oracles[wid];
+                    seed=chunk_id * 10000 + job, az_is_white=az_is_white)
+                rewards[job] = result.reward
+                for s in result.value_samples
+                    push!(thread_val_nn[wid], s.nn_val)
+                    push!(thread_val_opp[wid], s.wb_val)
+                end
             end
         end
+    finally
+        Threads.atomic_xchg!(heartbeat_done, true)
+        wait(heartbeat_task)
     end
-
-    Threads.atomic_xchg!(heartbeat_done, true)
 
     # Merge per-thread results
     val_nn = reduce(vcat, thread_val_nn)

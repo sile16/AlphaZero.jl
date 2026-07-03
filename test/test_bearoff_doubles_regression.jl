@@ -66,6 +66,15 @@ else
         @test v2 == 2.0
         @test eq == Float32[1, 1, 0, 0, 0]
 
+        # Terminal equity is mover-relative in both directions. The negative
+        # case is rare in normal post-move scoring, but callers of the shared
+        # helper should not get a win vector when the requested mover lost.
+        lost = BackgammonGame(p0, p1, SVector{2, Int8}(0, 0), Int8(0), Int8(0), true, -2.0f0;
+                              obs_type=:minimal_flat)
+        v_loss, eq_loss = bearoff_turn_value_equity(nothing, lost, 0)
+        @test v_loss == -2.0
+        @test eq_loss == Float32[0, 0, 0, 1, 0]
+
         # Full post-dice move evaluation from the doubles start: every playout
         # bears off all 4 checkers this turn -> exact Q is the gammon win.
         @test bearoff_best_move_value(nothing, g) == 2.0

@@ -181,6 +181,64 @@ end
 
 end
 
+@testset "Buffer: reset clears bootstrap data and invalidates stale generations" begin
+    state_dim, num_actions, capacity = 4, 6, 8
+    buf = PERBuffer(capacity, state_dim, num_actions; beta_init=0.4f0, annealing_iters=10)
+
+    n = capacity
+    states = fill(7.0f0, state_dim, n)
+    policies = fill(3.0f0, num_actions, n)
+    values = fill(2.0f0, n)
+    equities = fill(0.5f0, 5, n)
+    has_eq = fill(true, n)
+    is_chance = fill(true, n)
+    is_contact = [isodd(i) for i in 1:n]
+    is_bearoff = fill(true, n)
+    per_add_batch!(buf, states, policies, values, equities, has_eq,
+                   is_chance, is_contact, is_bearoff; initial_priority=4.0f0)
+    per_anneal_beta!(buf)
+
+    old_generations = copy(buf.generation)
+    reset!(buf)
+
+    @test buf.size == 0
+    @test buf.write_pos == 1
+    @test buf.beta == buf.beta_init
+    @test buf.current_iter == 0
+    @test all(buf.states .== 0.0f0)
+    @test all(buf.policies .== 0.0f0)
+    @test all(buf.values .== 0.0f0)
+    @test all(buf.equities .== 0.0f0)
+    @test all(.!buf.has_equity)
+    @test all(.!buf.is_chance)
+    @test all(.!buf.is_contact)
+    @test all(.!buf.is_bearoff)
+    @test all(buf.priorities .== 1.0f0)
+    @test all(buf.generation .== old_generations .+ UInt32(1))
+    @test partition_indices(buf) == (contact=Int[], race=Int[], all=Int[])
+    @test_throws ErrorException per_sample(buf, 1, 0.6f0, 1.0f-6)
+
+    # Refill starts from slot 1 with clean flags and priorities.
+    let
+        vals = Float32[11, 22]
+        s = repeat(vals', state_dim, 1)
+        p = repeat(vals', num_actions, 1)
+        e = zeros(Float32, 5, 2)
+        h = Bool[false, true]
+        ch = Bool[false, false]
+        c = Bool[true, false]
+        b = Bool[false, true]
+        per_add_batch!(buf, s, p, vals, e, h, ch, c, b; initial_priority=2.5f0)
+    end
+    @test buf.size == 2
+    @test buf.write_pos == 3
+    batch = extract_batch(buf, [1, 2])
+    @test batch.values == Float32[11, 22]
+    @test batch.is_contact == Bool[true, false]
+    @test batch.is_bearoff == Bool[false, true]
+    @test buf.priorities[1:2] == Float32[2.5, 2.5]
+end
+
 @testset "Buffer: reanalyze skips slots overwritten since extraction" begin
     # reanalyze extracts a batch, runs slow NN inference, then blends predictions
     # back by INDEX. A slot overwritten in between now holds a DIFFERENT sample;

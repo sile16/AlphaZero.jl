@@ -66,6 +66,32 @@ function PERBuffer(capacity::Int, state_dim::Int, num_actions::Int;
     )
 end
 
+"""Reset a PER buffer to an empty state.
+
+Clears stored columns and metadata under the buffer lock. Slot generations are
+incremented, not zeroed, so any in-flight reanalysis result captured before the
+reset cannot be blended into samples written after the reset.
+"""
+function reset!(buf::PERBuffer)
+    lock(buf.lock) do
+        fill!(buf.states, 0.0f0)
+        fill!(buf.policies, 0.0f0)
+        fill!(buf.values, 0.0f0)
+        fill!(buf.equities, 0.0f0)
+        fill!(buf.has_equity, false)
+        fill!(buf.is_chance, false)
+        fill!(buf.is_contact, false)
+        fill!(buf.is_bearoff, false)
+        fill!(buf.priorities, 1.0f0)
+        buf.generation .+= UInt32(1)
+        buf.size = 0
+        buf.write_pos = 1
+        buf.beta = buf.beta_init
+        buf.current_iter = 0
+    end
+    return nothing
+end
+
 """Add columnar samples directly from a SampleBatch (no NamedTuple allocation).
 
 Copies columns from the batch into the circular buffer. O(n) memcpy, O(1) amortized
