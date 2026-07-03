@@ -111,10 +111,10 @@ mutable struct FCResNetMultiHead <: FluxNetwork
   common        # Shared trunk (input -> hidden)
   vhead_trunk   # Shared value trunk (if share_value_trunk=true)
   vhead_win     # P(win) head
-  vhead_gw      # P(gammon | win) head
-  vhead_bgw     # P(backgammon | win) head
-  vhead_gl      # P(gammon | loss) head
-  vhead_bgl     # P(backgammon | loss) head
+  vhead_gw      # P(win and gammon+) head
+  vhead_bgw     # P(win and backgammon) head
+  vhead_gl      # P(lose and gammon+) head
+  vhead_bgl     # P(lose and backgammon) head
   phead         # Policy head
 end
 

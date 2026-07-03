@@ -384,7 +384,7 @@ function find_wildbg_lib_server()
     for c in candidates
         isfile(c) && return c
     end
-    return ""  # No wildbg found — eval disabled
+    error("wildbg library not found. Pass --wildbg-lib or build it at one of: $(join(candidates, ", "))")
 end
 
 const WILDBG_LIB = find_wildbg_lib_server()
@@ -405,11 +405,9 @@ else
 end
 
 const BEAROFF_SRC = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k7.jl")
-if isfile(BEAROFF_SRC)
-    include(BEAROFF_SRC)
-    using .BearoffK7
-    include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
-end
+include(BEAROFF_SRC)
+using .BearoffK7
+include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
 
 function find_bearoff_dir_server()
     candidates = [
@@ -422,10 +420,10 @@ function find_bearoff_dir_server()
             return dir
         end
     end
-    return ""
+    error("Bearoff k7 directory not found. Checked: $(join(candidates, ", "))")
 end
 
-const BEAROFF_DIR = isdefined(Main, :BearoffK7) ? find_bearoff_dir_server() : ""
+const BEAROFF_DIR = find_bearoff_dir_server()
 const BEAROFF_FIXED_EVAL_ENABLED =
     ARGS["training_mode"] == "race" &&
     BEAROFF_EVAL_INTERVAL > 0 &&
@@ -907,57 +905,24 @@ end
 START_ITER = 0
 if !isempty(ARGS["resume"])
     resume_dir = ARGS["resume"]
-    # Try dual-model checkpoints first. Prefer the TRAINING-state weights
-    # (*_train_latest.data) over the PUBLISHED weights (*_latest.data): under a
-    # gate BLOCK the published files hold last-good weights while training and
-    # iter.txt advance, so resuming from *_latest would silently rewind the model
-    # under a newer START_ITER. Fall back to *_latest.data for pre-gate sessions.
-    contact_path = joinpath(resume_dir, "contact_latest.data")
-    race_path = joinpath(resume_dir, "race_latest.data")
-    contact_train = joinpath(resume_dir, "contact_train_latest.data")
-    race_train = joinpath(resume_dir, "race_train_latest.data")
-    using_train_weights = isfile(contact_train) && isfile(race_train)
-    if using_train_weights
-        contact_path, race_path = contact_train, race_train
+    contact_path = joinpath(resume_dir, "contact_train_latest.data")
+    race_path = joinpath(resume_dir, "race_train_latest.data")
+    iter_file = joinpath(resume_dir, "iter.txt")
+
+    FluxLib.load_weights(contact_path, contact_network)
+    FluxLib.load_weights(race_path, race_network)
+    START_ITER = parse(Int, strip(read(iter_file, String)))
+    println("Resume: loaded TRAINING-state weights (*_train_latest.data)")
+    println("Resumed from $resume_dir at iteration $START_ITER")
+
+    if GATE_ENABLED
+        gs = load_gate_state(joinpath(resume_dir, "gate_state.json"))
+        GATE_STATE[] = gs
+        println("Promotion gate: resumed state — best $(GATE_METRIC_NAME)=$(isfinite(gs.best_metric) ? round(gs.best_metric, digits=5) : "none"), last_published=$(gs.last_published), evals=$(gs.n_evals), blocked=$(gs.n_blocked)")
     end
-    if isfile(contact_path) && isfile(race_path)
-        FluxLib.load_weights(contact_path, contact_network)
-        FluxLib.load_weights(race_path, race_network)
-        println(using_train_weights ?
-            "Resume: loaded TRAINING-state weights (*_train_latest.data)" :
-            "Resume: loaded PUBLISHED weights (*_latest.data) — no *_train_latest.data (pre-gate session)")
-        iter_file = joinpath(resume_dir, "iter.txt")
-        if isfile(iter_file)
-            START_ITER = parse(Int, strip(read(iter_file, String)))
-        end
-        println("Resumed from $resume_dir at iteration $START_ITER")
-        # Restore promotion-gate best-so-far / last-decision from sidecar (graceful if absent)
-        if GATE_ENABLED
-            gs = load_gate_state(joinpath(resume_dir, "gate_state.json"))
-            if gs !== nothing
-                GATE_STATE[] = gs
-                println("Promotion gate: resumed state — best $(GATE_METRIC_NAME)=$(isfinite(gs.best_metric) ? round(gs.best_metric, digits=5) : "none"), last_published=$(gs.last_published), evals=$(gs.n_evals), blocked=$(gs.n_blocked)")
-            else
-                println("Promotion gate: no gate_state.json in resume dir — starting gate fresh.")
-            end
-        end
-        # Buffer loading deferred to after replay_buffer is created (see RESUME_BUFFER_DIR below)
-        global RESUME_BUFFER_DIR = joinpath(resume_dir, "..")
-    else
-        # Try single-model checkpoint
-        single_path = joinpath(resume_dir, "latest.data")
-        if isfile(single_path)
-            FluxLib.load_weights(single_path, contact_network)
-            FluxLib.load_weights(single_path, race_network)
-            iter_file = joinpath(resume_dir, "iter.txt")
-            if isfile(iter_file)
-                START_ITER = parse(Int, strip(read(iter_file, String)))
-            end
-            println("Resumed single-model from $resume_dir at iteration $START_ITER")
-        else
-            error("No checkpoint found at $resume_dir")
-        end
-    end
+
+    # Buffer loading deferred to after replay_buffer is created (see RESUME_BUFFER_DIR below)
+    global RESUME_BUFFER_DIR = joinpath(resume_dir, "..")
 end
 
 # Optimizers
@@ -1022,7 +987,7 @@ if !isempty(ARGS["bootstrap_file"])
             end_idx = min(start_idx + chunk_size - 1, max_load)
             n = end_idx - start_idx + 1
 
-            local states, policies, values, equities, has_equity, is_contact, is_bearoff
+            local states, policies, values, equities, has_equity, is_chance, is_contact, is_bearoff
             if is_raw_columnar
                 state_chunk = bootstrap_samples.states[start_idx:end_idx]
                 policy_chunk = bootstrap_samples.policies[start_idx:end_idx]
@@ -1036,6 +1001,7 @@ if !isempty(ARGS["bootstrap_file"])
                 values = Float32.(value_chunk)
                 equities = Matrix{Float32}(undef, 5, n)
                 has_equity = fill(true, n)
+                is_chance = Vector{Bool}(undef, n)
                 is_contact = Vector{Bool}(undef, n)
                 is_bearoff = Vector{Bool}(undef, n)
 
@@ -1051,8 +1017,9 @@ if !isempty(ARGS["bootstrap_file"])
                     @inbounds for k in 1:5
                         equities[k, j] = Float32(eq[k])
                     end
+                    is_chance[j] = BackgammonNet.is_chance_node(game)
                     is_contact[j] = BackgammonNet.is_contact_position(game)
-                    is_bearoff[j] = isdefined(Main, :BearoffK7) ? BearoffK7.is_bearoff_position(game.p0, game.p1) : false
+                    is_bearoff[j] = BearoffK7.is_bearoff_position(game.p0, game.p1)
                 end
             else
                 chunk = bootstrap_samples[start_idx:end_idx]
@@ -1067,12 +1034,13 @@ if !isempty(ARGS["bootstrap_file"])
                 values = Float32[s.value for s in chunk]
                 equities = hcat([s.equity for s in chunk]...)
                 has_equity = Bool[s.has_equity for s in chunk]
+                is_chance = Bool[s.is_chance for s in chunk]
                 is_contact = Bool[s.is_contact for s in chunk]
                 is_bearoff = Bool[s.is_bearoff for s in chunk]
             end
 
             per_add_batch!(replay_buffer, states, policies, values,
-                           equities, has_equity, is_contact, is_bearoff)
+                           equities, has_equity, is_chance, is_contact, is_bearoff)
             loaded += n
         end
 
@@ -1095,26 +1063,8 @@ end
 # Load buffer checkpoint if resuming (must happen after replay_buffer is created)
 if @isdefined(RESUME_BUFFER_DIR)
     buf_path = joinpath(RESUME_BUFFER_DIR, "buffer", "buffer_iter_$START_ITER.jls")
-    if isfile(buf_path)
-        load_buffer!(replay_buffer, buf_path)
-        println("Loaded buffer checkpoint from $buf_path")
-    else
-        buf_dir = joinpath(RESUME_BUFFER_DIR, "buffer")
-        if isdir(buf_dir)
-            buf_files = filter(f -> startswith(f, "buffer_iter_") && endswith(f, ".jls"), readdir(buf_dir))
-            buf_iters = [parse(Int, match(r"buffer_iter_(\d+)\.jls", f)[1]) for f in buf_files]
-            valid = filter(i -> i <= START_ITER, buf_iters)
-            if !isempty(valid)
-                best_iter = maximum(valid)
-                load_buffer!(replay_buffer, joinpath(buf_dir, "buffer_iter_$best_iter.jls"))
-                println("Loaded buffer checkpoint from iteration $best_iter")
-            else
-                println("No buffer checkpoint found, starting with empty buffer")
-            end
-        else
-            println("No buffer directory found, starting with empty buffer")
-        end
-    end
+    load_buffer!(replay_buffer, buf_path)
+    println("Loaded buffer checkpoint from $buf_path")
 end
 
 # Training functions (extracted from train_distributed.jl)
@@ -1126,7 +1076,7 @@ a Vector of NamedTuples — avoids per-sample allocation entirely.
 
 The returned batch matches the same learner-side contract as
 `AlphaZero.convert_samples`:
-- `V` is the scalar player-relative target used by the single-head fallback and
+- `V` is the scalar player-relative target used by the single-head value path and
   for TD error computation
 - `EqWin/EqGW/EqBGW/EqGL/EqBGL` are the five joint cumulative equity heads
 - `HasEquity` gates whether the multi-head BCEWithLogits losses apply to that sample

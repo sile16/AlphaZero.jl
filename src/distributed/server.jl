@@ -161,7 +161,8 @@ function handle_samples(req::HTTP.Request, state::ServerState, buffer::PERBuffer
         # Add columnar data directly to buffer (no NamedTuple allocation)
         per_add_batch!(buffer,
             batch.states, batch.policies, batch.values,
-            batch.equities, batch.has_equity, batch.is_contact, batch.is_bearoff)
+            batch.equities, batch.has_equity, batch.is_chance,
+            batch.is_contact, batch.is_bearoff)
 
         # Update stats
         Threads.atomic_add!(state.total_samples, Int(batch.n))

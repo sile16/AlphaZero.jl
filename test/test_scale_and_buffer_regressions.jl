@@ -89,14 +89,15 @@ end
         values = copy(ids)
         equities = repeat(ids', 5, 1)
         has_eq = fill(true, n)
+        is_chance = fill(false, n)
         is_contact = fill(false, n)
         is_bearoff = fill(false, n)
-        (states, policies, values, equities, has_eq, is_contact, is_bearoff)
+        (states, policies, values, equities, has_eq, is_chance, is_contact, is_bearoff)
     end
 
     # Fill past capacity so the circular pointer wraps before the stress phase
-    let (s, p, v, e, h, c, b) = sentinel_batch(0, capacity + 8)
-        per_add_batch!(buf, s, p, v, e, h, c, b)
+    let (s, p, v, e, h, ch, c, b) = sentinel_batch(0, capacity + 8)
+        per_add_batch!(buf, s, p, v, e, h, ch, c, b)
     end
 
     stop = Threads.Atomic{Bool}(false)
@@ -119,8 +120,8 @@ end
 
     # Writer keeps overwriting wrapped entries with fresh sentinel ids
     for round in 1:300
-        (s, p, v, e, h, c, b) = sentinel_batch(round * 1000, 32)
-        per_add_batch!(buf, s, p, v, e, h, c, b)
+        (s, p, v, e, h, ch, c, b) = sentinel_batch(round * 1000, 32)
+        per_add_batch!(buf, s, p, v, e, h, ch, c, b)
     end
     stop[] = true
     wait(reader)
@@ -140,8 +141,10 @@ end
     values = Float32[c ? 1.0 : -1.0 for c in is_contact]
     equities = zeros(Float32, 5, n)
     has_eq = fill(true, n)
+    is_chance = fill(false, n)
     is_bearoff = fill(false, n)
-    per_add_batch!(buf, states, policies, values, equities, has_eq, is_contact, is_bearoff)
+    per_add_batch!(buf, states, policies, values, equities, has_eq,
+                   is_chance, is_contact, is_bearoff)
 
     parts = partition_indices(buf)
     @test length(parts.contact) == count(is_contact)
@@ -157,6 +160,28 @@ end
     @test all(contact_batch.is_contact)
 end
 
+@testset "Buffer: preserves chance-node flags" begin
+    state_dim, num_actions, capacity = 4, 6, 16
+    buf = PERBuffer(capacity, state_dim, num_actions)
+
+    n = 6
+    states = zeros(Float32, state_dim, n)
+    policies = zeros(Float32, num_actions, n)
+    values = Float32.(1:n)
+    equities = zeros(Float32, 5, n)
+    has_eq = fill(true, n)
+    is_chance = Bool[true, false, true, false, false, true]
+    is_contact = fill(false, n)
+    is_bearoff = fill(false, n)
+
+    per_add_batch!(buf, states, policies, values, equities, has_eq,
+                   is_chance, is_contact, is_bearoff)
+
+    batch = extract_batch(buf, collect(1:n))
+    @test batch.is_chance == is_chance
+
+end
+
 @testset "Buffer: reanalyze skips slots overwritten since extraction" begin
     # reanalyze extracts a batch, runs slow NN inference, then blends predictions
     # back by INDEX. A slot overwritten in between now holds a DIFFERENT sample;
@@ -170,14 +195,15 @@ end
         policies = repeat(vals', num_actions, 1)
         equities = zeros(Float32, 5, n)
         has_eq = fill(false, n)          # no equity blend — isolate the value path
+        is_chance = fill(false, n)
         is_contact = fill(false, n)
         is_bearoff = fill(false, n)
-        (states, policies, copy(vals), equities, has_eq, is_contact, is_bearoff)
+        (states, policies, copy(vals), equities, has_eq, is_chance, is_contact, is_bearoff)
     end
 
     # Write 4 samples into slots 1..4 (generation → 1 each).
-    let (s, p, v, e, h, c, b) = mkbatch(Float32[10, 20, 30, 40])
-        per_add_batch!(buf, s, p, v, e, h, c, b)
+    let (s, p, v, e, h, ch, c, b) = mkbatch(Float32[10, 20, 30, 40])
+        per_add_batch!(buf, s, p, v, e, h, ch, c, b)
     end
     idx = [1, 2, 3, 4]
     col = extract_batch(buf, idx)
@@ -185,8 +211,8 @@ end
     @test all(gens .== UInt32(1))
 
     # Overwrite slots 5,6,7,8 then 1,2 (write_pos wraps): slots 1 and 2 get gen 2.
-    let (s, p, v, e, h, c, b) = mkbatch(Float32[55, 66, 77, 88, 111, 222])
-        per_add_batch!(buf, s, p, v, e, h, c, b)
+    let (s, p, v, e, h, ch, c, b) = mkbatch(Float32[55, 66, 77, 88, 111, 222])
+        per_add_batch!(buf, s, p, v, e, h, ch, c, b)
     end
     @test buf.generation[1] == UInt32(2)
     @test buf.generation[2] == UInt32(2)

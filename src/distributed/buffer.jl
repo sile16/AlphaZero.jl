@@ -75,6 +75,7 @@ function per_add_batch!(buf::PERBuffer, batch_states::AbstractMatrix{Float32},
                         batch_values::AbstractVector{Float32},
                         batch_equities::AbstractMatrix{Float32},
                         batch_has_equity::AbstractVector{Bool},
+                        batch_is_chance::AbstractVector{Bool},
                         batch_is_contact::AbstractVector{Bool},
                         batch_is_bearoff::AbstractVector{Bool};
                         initial_priority::Float32=1.0f0)
@@ -98,7 +99,7 @@ function per_add_batch!(buf::PERBuffer, batch_states::AbstractMatrix{Float32},
                     buf.equities[j, pos] = batch_equities[j, i]
                 end
                 buf.has_equity[pos] = batch_has_equity[i]
-                buf.is_chance[pos] = false
+                buf.is_chance[pos] = batch_is_chance[i]
                 buf.is_contact[pos] = batch_is_contact[i]
                 buf.is_bearoff[pos] = batch_is_bearoff[i]
                 buf.priorities[pos] = initial_priority

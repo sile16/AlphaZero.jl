@@ -14,6 +14,7 @@ function batches_equal(a::SampleBatch, b::SampleBatch)
     a.values ≈ b.values &&
     a.equities ≈ b.equities &&
     a.has_equity == b.has_equity &&
+    a.is_chance == b.is_chance &&
     a.is_contact == b.is_contact &&
     a.is_bearoff == b.is_bearoff
 end
@@ -25,6 +26,7 @@ function make_batch(n; state_dim=344, num_actions=676)
         rand(Float32, num_actions, n),
         rand(Float32, n),
         rand(Float32, 5, n),
+        rand(Bool, n),
         rand(Bool, n),
         rand(Bool, n),
         rand(Bool, n),
@@ -41,6 +43,7 @@ end
     @test size(recovered.equities) == (5, 10)
     @test length(recovered.values) == 10
     @test length(recovered.has_equity) == 10
+    @test length(recovered.is_chance) == 10
     @test length(recovered.is_contact) == 10
     @test length(recovered.is_bearoff) == 10
 end
@@ -68,6 +71,7 @@ end
         zeros(Float32, n),
         eq,
         fill(true, n),
+        fill(false, n),
         fill(true, n),
         fill(false, n),
     )
@@ -111,6 +115,7 @@ end
         fill(false, n),
         fill(false, n),
         fill(false, n),
+        fill(false, n),
     )
     bytes = pack_samples(batch)
     recovered = unpack_samples(bytes)
@@ -127,6 +132,7 @@ end
         ones(Float32, 676, n),
         ones(Float32, n),
         ones(Float32, 5, n),
+        fill(true, n),
         fill(true, n),
         fill(true, n),
         fill(true, n),
@@ -153,6 +159,7 @@ end
         rand(Float32, n),
         eq,
         has_eq,
+        rand(Bool, n),
         rand(Bool, n),
         rand(Bool, n),
     )
@@ -207,6 +214,7 @@ end
     @test size(batch.policies) == (676, 3)
     @test batch.values == Float32[0.5, -0.3, 1.0]
     @test batch.has_equity == Bool[true, false, true]
+    @test batch.is_chance == Bool[false, false, true]
     @test batch.is_contact == Bool[true, false, true]
     @test batch.is_bearoff == Bool[false, true, false]
     # State/policy columns match input
@@ -218,10 +226,13 @@ end
     @test batch.equities[:, 3] ≈ Float32[0.9, 0.3, 0.05, 0.0, 0.0]
     # Equity zeroed for has_equity=false
     @test all(batch.equities[:, 2] .== 0f0)
+
+    recovered_samples = batch_to_samples(batch)
+    @test recovered_samples[1].is_chance == false
+    @test recovered_samples[3].is_chance == true
 end
 
-@testset "samples_to_batch without is_bearoff field" begin
-    # Old samples may not have is_bearoff
+@testset "samples_to_batch requires current sample schema" begin
     samples = [
         (
             state = rand(Float32, 10),
@@ -229,12 +240,10 @@ end
             value = 0.0f0,
             equity = zeros(Float32, 5),
             has_equity = false,
-            is_chance = false,
             is_contact = true,
         ),
     ]
-    batch = samples_to_batch(samples)
-    @test batch.is_bearoff == Bool[false]
+    @test_throws ErrorException samples_to_batch(samples)
 end
 
 @testset "samples_to_batch -> pack -> unpack round-trip" begin
@@ -245,7 +254,7 @@ end
             value = Float32(i / 10),
             equity = rand(Float32, 5),
             has_equity = isodd(i),
-            is_chance = false,
+            is_chance = i % 3 == 0,
             is_contact = i <= 5,
             is_bearoff = i > 8,
         )
@@ -263,7 +272,8 @@ end
     d = MsgPack.unpack(bytes)
     # Verify all expected keys are present
     expected_keys = Set(["n", "states", "state_dim", "policies", "num_actions",
-                         "values", "equities", "has_equity", "is_contact", "is_bearoff"])
+                         "values", "equities", "has_equity", "is_chance",
+                         "is_contact", "is_bearoff"])
     @test Set(keys(d)) == expected_keys
     # Verify dimension metadata
     @test d["n"] == 2
@@ -274,6 +284,7 @@ end
     @test length(d["values"]) == 2
     @test length(d["equities"]) == 5 * 2
     @test length(d["has_equity"]) == 2
+    @test length(d["is_chance"]) == 2
     @test length(d["is_contact"]) == 2
     @test length(d["is_bearoff"]) == 2
 end
@@ -283,7 +294,8 @@ end
     json_str = pack_samples_json(batch)
     d = JSON.parse(json_str)
     expected_keys = Set(["n", "states", "state_dim", "policies", "num_actions",
-                         "values", "equities", "has_equity", "is_contact", "is_bearoff"])
+                         "values", "equities", "has_equity", "is_chance",
+                         "is_contact", "is_bearoff"])
     @test Set(keys(d)) == expected_keys
 end
 

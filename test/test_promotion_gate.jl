@@ -164,7 +164,6 @@ end
     save_gate_state(path, s; metric_name="value_mae", tol_frac=TOL_FRAC, tol_abs=TOL_ABS)
     @test isfile(path)
     loaded = load_gate_state(path)
-    @test loaded !== nothing
     @test loaded.best_metric == s.best_metric
     @test loaded.last_published == s.last_published
     @test loaded.n_evals == s.n_evals
@@ -172,19 +171,26 @@ end
     @test loaded.n_eval_failures == s.n_eval_failures
 end
 
-@testset "sidecar graceful fallback" begin
-    # Missing file → nothing (server starts gate fresh).
-    @test load_gate_state(joinpath(mktempdir(), "absent.json")) === nothing
-    # Corrupt file → nothing, not a crash.
+@testset "sidecar requires current valid schema" begin
+    @test_throws Exception load_gate_state(joinpath(mktempdir(), "absent.json"))
+
     dir = mktempdir()
     bad = joinpath(dir, "gate_state.json")
     open(bad, "w") do io; print(io, "{not valid json"); end
-    @test load_gate_state(bad) === nothing
+    @test_throws Exception load_gate_state(bad)
+
+    missing_field = Dict{String,Any}(
+        "best_metric" => 0.1,
+        "last_published" => true,
+        "n_evals" => 1,
+        "n_blocked" => 0,
+    )
+    @test_throws KeyError gate_state_from_dict(missing_field)
+
     # A fresh (Inf best) state stores best as null and reloads to Inf.
     fresh_path = joinpath(dir, "fresh.json")
     save_gate_state(fresh_path, GateState())
     reloaded = load_gate_state(fresh_path)
-    @test reloaded !== nothing
     @test !isfinite(reloaded.best_metric)
     @test reloaded.last_published
 end

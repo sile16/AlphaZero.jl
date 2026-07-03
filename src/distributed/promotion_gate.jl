@@ -72,10 +72,6 @@ end
 
 GateState() = GateState(Inf, true, 0, 0, 0)
 
-# Backwards-compatible 4-arg constructor (pre-failure-counter call sites / tests).
-GateState(best_metric, last_published, n_evals, n_blocked) =
-    GateState(best_metric, last_published, n_evals, n_blocked, 0)
-
 """Result of one gate evaluation. `state` is the next `GateState` to carry forward."""
 struct GateDecision
     publish::Bool        # may weights be published this eval?
@@ -165,16 +161,15 @@ function gate_state_to_dict(state::GateState; metric_name::String="value_mae",
     )
 end
 
-"""Reconstruct a `GateState` from a parsed dict. Missing/`null` fields fall back
-to fresh-state defaults (best = Inf, published = true)."""
+"""Reconstruct a `GateState` from a parsed dict."""
 function gate_state_from_dict(d::AbstractDict)
-    bm = get(d, "best_metric", nothing)
+    bm = d["best_metric"]
     best = (bm === nothing) ? Inf : Float64(bm)
     GateState(best,
-              Bool(get(d, "last_published", true)),
-              Int(get(d, "n_evals", 0)),
-              Int(get(d, "n_blocked", 0)),
-              Int(get(d, "n_eval_failures", 0)))
+              Bool(d["last_published"]),
+              Int(d["n_evals"]),
+              Int(d["n_blocked"]),
+              Int(d["n_eval_failures"]))
 end
 
 """Write the gate state to `path` (JSON). Overwrites atomically enough for a
@@ -188,14 +183,7 @@ function save_gate_state(path::String, state::GateState; metric_name::String="va
     return path
 end
 
-"""Load a gate state from `path`, or `nothing` if absent/unreadable (graceful
-resume — a missing sidecar just starts the gate fresh)."""
+"""Load a gate state from `path`."""
 function load_gate_state(path::String)
-    isfile(path) || return nothing
-    try
-        return gate_state_from_dict(JSON.parsefile(path))
-    catch e
-        @warn "Could not parse gate state sidecar; starting gate fresh" path=path exception=e
-        return nothing
-    end
+    gate_state_from_dict(JSON.parsefile(path))
 end

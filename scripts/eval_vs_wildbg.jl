@@ -41,6 +41,8 @@ Options:
     --mcts-iters=100       MCTS iterations per move
     --wildbg-lib=PATH      Path to libwildbg.so/.dylib
     --batch                Batch mode: eval all latest.data in session dir
+    --allow-race-checkpoint
+                           Allow full-game eval of a race-only checkpoint
 """
 
 using ArgParse
@@ -96,6 +98,9 @@ function parse_eval_args()
         "--batch"
             help = "Batch mode: eval all checkpoints in session directory"
             action = :store_true
+        "--allow-race-checkpoint"
+            help = "Allow evaluating a race-only checkpoint from full-game opening positions"
+            action = :store_true
         "--inference-batch-size"
             help = "Inference batch size for MCTS"
             arg_type = Int
@@ -110,6 +115,23 @@ function parse_eval_args()
 end
 
 const ARGS = parse_eval_args()
+
+function looks_like_race_only_checkpoint(path::AbstractString)::Bool
+    base = lowercase(basename(path))
+    dir = lowercase(dirname(path))
+
+    return base == "race_latest.data" ||
+           base == "race_train_latest.data" ||
+           base == "race_best.data" ||
+           occursin(r"^race_iter_\d+\.data$", base) ||
+           (base == "latest.data" && occursin(r"(^|[/_-])race([/_-]|$)", dir))
+end
+
+function race_checkpoint_guard_message(path::AbstractString)::String
+    return "Refusing full-game eval of likely race-only checkpoint: $path. " *
+           "Use scripts/eval_race.jl for race checkpoints, pass contact_latest.data " *
+           "for dual-model full-game eval, or override with --allow-race-checkpoint."
+end
 
 # Load packages
 using AlphaZero
@@ -512,6 +534,14 @@ function main()
             println("Evaluating: $name ($iters iterations)")
             println("  Checkpoint: $ckpt_path")
 
+            if race_ckpt_path === nothing &&
+               !ARGS["allow_race_checkpoint"] &&
+               looks_like_race_only_checkpoint(ckpt_path)
+                println("  SKIP: $(race_checkpoint_guard_message(ckpt_path))")
+                flush(stdout)
+                continue
+            end
+
             arch = detect_architecture(ckpt_path)
             if arch === nothing
                 println("  SKIP: Could not detect contact/main architecture")
@@ -671,6 +701,12 @@ function main()
         blocks = ARGS["blocks"]
         race_width = ARGS["race_width"]
         race_blocks = ARGS["race_blocks"]
+
+        if race_ckpt_path === nothing &&
+           !ARGS["allow_race_checkpoint"] &&
+           looks_like_race_only_checkpoint(ckpt_path)
+            error(race_checkpoint_guard_message(ckpt_path))
+        end
 
         if race_ckpt_path !== nothing
             println("Evaluating (dual-model): $ckpt_path")

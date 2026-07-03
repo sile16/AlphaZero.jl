@@ -189,12 +189,12 @@ julia --project -e 'using Pkg; Pkg.test()'
 ## Session Directories
 
 All training artifacts (sessions, logs, results, wandb) are stored on the NFS-shared directory
-`/homeshare/projects/AlphaZero.jl/` so they are accessible from all machines. Symlinks exist
-in the git repo for backward compatibility.
+`/homeshare/projects/AlphaZero.jl/` so they are accessible from all machines.
 
 Sessions saved to `/homeshare/projects/AlphaZero.jl/sessions/distributed_YYYYMMDD_HHMMSS/` containing:
-- `checkpoints/latest.data` - Latest network weights
-- `checkpoints/iter_N.data` - Checkpoint at iteration N
+- `checkpoints/contact_latest.data` / `checkpoints/race_latest.data` - Published gated weights
+- `checkpoints/contact_train_latest.data` / `checkpoints/race_train_latest.data` - Current training-state weights for resume
+- `checkpoints/contact_iter_N.data` / `checkpoints/race_iter_N.data` - Checkpoint history at iteration N
 - `tb/` - TensorBoard logs
 - `final_eval_results.txt` - Final evaluation results
 
@@ -230,12 +230,13 @@ All under `/homeshare/projects/AlphaZero.jl/sessions/`:
 ## Key Lessons
 
 ### External Review Fixes (2026-07-03)
-All five High findings from external engineer review verified and four fixed (see `notes/review_fixes_20260703.md`):
+High-priority external-review findings verified and fixed (see `notes/review_fixes_20260703.md`):
 - **Terminal bearoff = simple win bug FIXED** — selfplay_client.jl hard-coded terminal bearoff moves as 1.0/[1,0,0,0,0], discarding gammon value (opponent 0-off = gammon 2.0, exactly the c15 states). Both training-target and MCTS-evaluator paths now derive value + 5-head target from `bg.reward` (carries the multiplier). Regression test: `test/test_terminal_bearoff_rewards.jl`.
 - **MCTS value scale FIXED** — NN emits equity/3 ∈ [-1,1] but game rewards (±1/±2/±3) and bearoff evaluator (raw points) mixed into the same Q totals. New `GI.reward_scale(gspec)` (backgammon: 3.0); MCTS (both mcts.jl and batched_mcts.jl) divides rewards by it; bearoff evaluator normalized /3. Convention: **buffer/training targets raw [-3,3]; MCTS-internal [-1,1]** (compute_td_errors already normalized). cpuct=2.0 was tuned under mixed scales — worth re-checking near-bearoff behavior.
 - **Race mode trained on parts.all FIXED** — now parts.race only, with contamination warning + partition counts logged at bootstrap load.
 - **Buffer torn-read race FIXED** — extract_batch/partition_indices now hold the lock (circular overwrite after buffer fills could tear samples). Residual benign race: a sample can be swapped between partition and extract (valid sample, possibly wrong partition).
-- **No promotion gate (OPEN)** — server publishes weights every iteration unconditionally; regressions propagate into self-play. Planned: gate on fixed bearoff eval + race eval within confidence bounds.
+- **Promotion gate FIXED for bearoff anchor** — server writes `*_train_latest.data` every checkpoint for resume, publishes `*_latest.data` only when the gate passes, and saves `race_best.data` for rollback. Next: extend the gate with race/pre-bearoff metrics once those are measured.
+- **Distributed chance-node flags FIXED** — `SampleBatch`, MsgPack/JSON round-trips, server upload, bootstrap load, and `PERBuffer` now preserve `is_chance` so chance samples cannot accidentally receive policy loss if they enter training.
 
 ### v11/v12 Self-Play Diagnosis (2026-07-03, from TB analysis)
 - **v11 value head DRIFTED during self-play**: bearoff corr vs exact table fell 0.974→0.875 while value loss fell 0.94→0.48 — fitting biased self-generated targets away from truth. v12's k=7 table anchoring + bootstrap buffer flush fixed it (corr 0.999 by iter 50).
@@ -261,7 +262,7 @@ All five High findings from external engineer review verified and four fixed (se
 12. **Jarvis OOM with server + client** (2026-03-23) -- Server 28GB + Client 34GB = 62GB on 64GB machine. Linux OOM killer terminates client. Reduce Jarvis workers or run client only on Neo.
 13. **GameLoop.play_game() kills threading perf** (2026-03-23) -- Per-move TraceEntry allocations cause 28% more GC, amplified to 20-30x under 32 threads. Selfplay must use direct BatchedMCTS calls. GameLoop only for eval scripts.
 14. **Multi-threaded scaling is memory-bandwidth limited** (2026-03-31) -- Neo M3 Max: peaks at 8-16 workers (6x speedup), **degrades at 24** (4.4x). Jarvis i7-10700K: scales linearly to 6 workers (5x, 84% efficiency). Workers share L2/L3 cache for 256KB weight matrices. Optimal: Neo 16 workers, Jarvis 6 workers. Use `--threads N+2 --num-workers N` to reserve threads for upload+eval.
-15. **Multihead equity heads must be masked** (2026-03-23) -- Train P(gammon|win)/P(bg|win) only on won games, P(gammon|loss)/P(bg|loss) only on lost games. Without masking, network learns joint probabilities instead of conditionals, inconsistent with compute_equity().
+15. **Multihead equity heads are joint cumulative** (updated 2026-07-03) -- Train all five heads on every equity-labeled sample: P(win), P(win and gammon+), P(win and backgammon), P(lose and gammon+), P(lose and backgammon). No conditional masking is needed; zeros on the non-applicable side are valid joint probabilities and match `compute_equity()`.
 
 ### Evaluation
 12. **Random baseline is misleading** -- always evaluate vs wildbg or GnuBG
@@ -290,9 +291,10 @@ into the engine we deliver.
 
 ### Immediate (before v13 launch)
 
-1. **Promotion gate** -- Only publish weights when fixed bearoff eval + race eval don't
-   regress beyond confidence bounds; keep `race_best.data` for rollback. Design in
-   `notes/review_fixes_20260703.md` (finding 5, the one open review item).
+1. **Extend promotion gate beyond bearoff** -- Current gate protects the exact-table
+   bearoff anchor and rollback path. Add race/pre-bearoff metrics and confidence
+   bounds once ground truth is available, so regressed self-play weights do not become
+   the published teacher.
 
 2. **Pre-bearoff ground-truth eval** -- One-sided rollouts with 3 personalities
    (efficiency / gammon-go / gammon-save) + analytic combine, k=7 truncation. Makes
