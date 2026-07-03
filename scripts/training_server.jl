@@ -132,6 +132,34 @@ function parse_args()
         "--mcts-iters"
             arg_type = Int
             default = 400
+        "--mcts-budget-mode"
+            help = "Self-play MCTS budget mode: constant, progressive, or turn_progressive"
+            arg_type = String
+            default = "constant"
+        "--progressive-sim-min"
+            help = "Minimum self-play simulations for mcts_budget_mode=progressive"
+            arg_type = Int
+            default = 0
+        "--progressive-sim-max"
+            help = "Maximum self-play simulations for mcts_budget_mode=progressive"
+            arg_type = Int
+            default = 0
+        "--turn-sim-min"
+            help = "Minimum opening simulations for mcts_budget_mode=turn_progressive"
+            arg_type = Int
+            default = 0
+        "--turn-sim-target"
+            help = "Target simulations for mcts_budget_mode=turn_progressive"
+            arg_type = Int
+            default = 0
+        "--ramp-turns-initial"
+            help = "Initial-iteration turns to reach target for mcts_budget_mode=turn_progressive"
+            arg_type = Int
+            default = 0
+        "--ramp-turns-final"
+            help = "Final-iteration turns to reach target for mcts_budget_mode=turn_progressive"
+            arg_type = Int
+            default = 0
         "--inference-batch-size"
             arg_type = Int
             default = 50
@@ -262,6 +290,16 @@ function parse_args()
 end
 
 const ARGS = parse_args()
+ARGS["mcts_budget_mode"] in ("constant", "progressive", "turn_progressive") ||
+    error("Unsupported --mcts-budget-mode=" * string(ARGS["mcts_budget_mode"]))
+if ARGS["mcts_budget_mode"] == "progressive"
+    ARGS["progressive_sim_min"] > 0 && ARGS["progressive_sim_max"] > 0 ||
+        error("--mcts-budget-mode=progressive requires --progressive-sim-min and --progressive-sim-max")
+elseif ARGS["mcts_budget_mode"] == "turn_progressive"
+    ARGS["turn_sim_min"] > 0 && ARGS["turn_sim_target"] > 0 &&
+        ARGS["ramp_turns_initial"] > 0 && ARGS["ramp_turns_final"] > 0 ||
+        error("--mcts-budget-mode=turn_progressive requires --turn-sim-min, --turn-sim-target, --ramp-turns-initial, and --ramp-turns-final")
+end
 const DATA_DIR = ARGS["data_dir"]
 const CHECKPOINT_DIR = joinpath(DATA_DIR, "checkpoints")
 const TB_DIR = joinpath(DATA_DIR, "tb")
@@ -298,6 +336,7 @@ end
 println("PER: $(ARGS["use_per"])")
 println("Reanalyze: $(ARGS["use_reanalyze"]) (blend=$(ARGS["reanalyze_blend"]))")
 println("Bootstrap only: $(ARGS["bootstrap_only"])")
+println("MCTS budget mode: $(ARGS["mcts_budget_mode"])")
 println("LR: $(ARGS["learning_rate"]) (schedule=$(ARGS["lr_schedule"]), min=$(ARGS["lr_min"]))")
 println("=" ^ 60)
 flush(stdout)
@@ -766,7 +805,8 @@ function eval_race_game_server(single_oracle, batch_oracle, wildbg_backend,
         dirichlet_noise_ϵ=0.0,
         dirichlet_noise_α=1.0)
 
-    az = AlphaZero.GameLoop.MctsAgent(single_oracle, batch_oracle, eval_mcts_params, 50, gspec)
+    az = AlphaZero.GameLoop.MctsAgent(single_oracle, batch_oracle, eval_mcts_params, 50, gspec;
+        batch_oracle_with_actions=batch_oracle)
     wb = AlphaZero.GameLoop.ExternalAgent(wildbg_backend)
 
     # NN V is normalized equity/3 ∈ [-1,1]; wildbg returns raw points ∈ [-3,3].
@@ -1366,6 +1406,13 @@ end
 # Server config (served to clients via GET /api/config)
 const SERVER_CONFIG = Dict{String, Any}(
     "mcts_iters" => ARGS["mcts_iters"],
+    "mcts_budget_mode" => ARGS["mcts_budget_mode"],
+    "progressive_sim_min" => ARGS["progressive_sim_min"],
+    "progressive_sim_max" => ARGS["progressive_sim_max"],
+    "turn_sim_min" => ARGS["turn_sim_min"],
+    "turn_sim_target" => ARGS["turn_sim_target"],
+    "ramp_turns_initial" => ARGS["ramp_turns_initial"],
+    "ramp_turns_final" => ARGS["ramp_turns_final"],
     "inference_batch_size" => ARGS["inference_batch_size"],
     "cpuct" => ARGS["cpuct"],
     "dirichlet_alpha" => ARGS["dirichlet_alpha"],

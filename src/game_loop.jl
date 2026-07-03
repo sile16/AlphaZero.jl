@@ -43,15 +43,20 @@ Fields:
 struct MctsAgent{O, BO, G, BE} <: GameAgent
     oracle::O
     batch_oracle::BO
+    batch_oracle_with_actions::Any
     mcts_params::MctsParams
     batch_size::Int
     gspec::G
     bearoff_eval::BE  # Union{Nothing, Function}
+    sim_budget_fn::Any
 end
 
 function MctsAgent(oracle::O, batch_oracle::BO, mcts_params::MctsParams, batch_size::Int, gspec::G;
-                   bearoff_eval::BE=nothing) where {O, BO, G, BE}
-    return MctsAgent{O, BO, G, BE}(oracle, batch_oracle, mcts_params, batch_size, gspec, bearoff_eval)
+                   bearoff_eval::BE=nothing, batch_oracle_with_actions=nothing,
+                   sim_budget_fn=nothing) where {O, BO, G, BE}
+    return MctsAgent{O, BO, G, BE}(oracle, batch_oracle, batch_oracle_with_actions,
+                                   mcts_params, batch_size, gspec, bearoff_eval,
+                                   sim_budget_fn)
 end
 
 """
@@ -124,7 +129,9 @@ function create_player(agent::MctsAgent)
         return BatchedMCTS.BatchedMctsPlayer(
             agent.gspec, agent.oracle, agent.mcts_params;
             batch_size=agent.batch_size, batch_oracle=agent.batch_oracle,
-            bearoff_evaluator=agent.bearoff_eval)
+            batch_oracle_with_actions=agent.batch_oracle_with_actions,
+            bearoff_evaluator=agent.bearoff_eval,
+            sim_budget_fn=agent.sim_budget_fn)
     end
     # Exotic chance modes (stratified, progressive) need classic MctsPlayer
     MctsPlayer = getfield(parentmodule(@__MODULE__), :MctsPlayer)

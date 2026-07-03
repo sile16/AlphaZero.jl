@@ -296,7 +296,8 @@ mcts_params = MctsParams(
     dirichlet_noise_α=0.3)
 
 player = BatchedMCTS.BatchedMctsPlayer(gspec, single_oracle, mcts_params;
-    batch_size=BATCH, batch_oracle=batch_oracle)
+    batch_size=BATCH, batch_oracle=batch_oracle,
+    batch_oracle_with_actions=batch_oracle)
 
 # Play games and time them
 println("\n--- Single-thread game timing ---")
@@ -367,7 +368,8 @@ for nw in [1, min(4, NUM_WORKERS), min(8, NUM_WORKERS), min(16, NUM_WORKERS), NU
             w_rng = MersenneTwister(42 + w)
             _, w_batch_oracle = make_cpu_oracles(:fast, net, cfg; batch_size=BATCH, nslots=1)
             w_player = BatchedMCTS.BatchedMctsPlayer(gspec, single_oracle, mcts_params;
-                batch_size=BATCH, batch_oracle=w_batch_oracle)
+                batch_size=BATCH, batch_oracle=w_batch_oracle,
+                batch_oracle_with_actions=w_batch_oracle)
             w_env = GI.init(gspec)
             for _ in 1:games_per_worker
                 GI.set_state!(w_env, GI.init(gspec))

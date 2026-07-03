@@ -185,15 +185,31 @@ if EVAL_CAPABLE
 end
 
 # Temperature scheduling
-const TEMP_MOVE_CUTOFF = Int(get(config, "temp_move_cutoff", 20))
-const TEMP_FINAL = Float64(get(config, "temp_final", 0.1))
-const TEMP_ITER_DECAY = Bool(get(config, "temp_iter_decay", false))
-const TEMP_ITER_FINAL = Float64(get(config, "temp_iter_final", 0.3))
-const TOTAL_ITERS = Int(get(config, "total_iterations", 200))
+const TEMP_MOVE_CUTOFF = Int(config["temp_move_cutoff"])
+const TEMP_FINAL = Float64(config["temp_final"])
+const TEMP_ITER_DECAY = Bool(config["temp_iter_decay"])
+const TEMP_ITER_FINAL = Float64(config["temp_iter_final"])
+const TOTAL_ITERS = Int(config["total_iterations"])
+const MCTS_BUDGET_MODE = Symbol(config["mcts_budget_mode"])
+const PROGRESSIVE_SIM_MIN = Int(config["progressive_sim_min"])
+const PROGRESSIVE_SIM_MAX = Int(config["progressive_sim_max"])
+const TURN_SIM_MIN = Int(config["turn_sim_min"])
+const TURN_SIM_TARGET = Int(config["turn_sim_target"])
+const RAMP_TURNS_INITIAL = Int(config["ramp_turns_initial"])
+const RAMP_TURNS_FINAL = Int(config["ramp_turns_final"])
+MCTS_BUDGET_MODE in (:constant, :progressive, :turn_progressive) ||
+    error("Unsupported mcts_budget_mode: $MCTS_BUDGET_MODE")
+if MCTS_BUDGET_MODE == :progressive
+    PROGRESSIVE_SIM_MIN > 0 && PROGRESSIVE_SIM_MAX > 0 ||
+        error("progressive mode requires positive progressive_sim_min and progressive_sim_max")
+elseif MCTS_BUDGET_MODE == :turn_progressive
+    TURN_SIM_MIN > 0 && TURN_SIM_TARGET > 0 && RAMP_TURNS_INITIAL > 0 && RAMP_TURNS_FINAL > 0 ||
+        error("turn_progressive mode requires positive turn simulation/ramp settings")
+end
 
 # Bear-off config (always enabled — mandatory for backgammon training)
-const BEAROFF_HARD_TARGETS = Bool(get(config, "bearoff_hard_targets", false))
-const BEAROFF_TRUNCATION = Bool(get(config, "bearoff_truncation", false))
+const BEAROFF_HARD_TARGETS = Bool(config["bearoff_hard_targets"])
+const BEAROFF_TRUNCATION = Bool(config["bearoff_truncation"])
 
 # Game setup
 if GAME_NAME == "backgammon-deterministic"
@@ -471,8 +487,8 @@ const BEAROFF_EVALUATOR = make_bearoff_evaluator(BEAROFF_TABLE)
 using Serialization
 using StaticArrays
 
-const TRAINING_MODE = get(config, "training_mode", "dual")
-const START_POSITIONS_FILE = get(config, "start_positions_file", "")
+const TRAINING_MODE = config["training_mode"]
+const START_POSITIONS_FILE = config["start_positions_file"]
 
 """Find a data file locally or download from server. Returns local path."""
 function find_or_download(filename::String; required::Bool=true)
@@ -627,6 +643,29 @@ function get_temperature(move_num::Int)
     end
     return τ
 end
+
+const SELFPLAY_SIM_BUDGET_FN = if MCTS_BUDGET_MODE == :constant
+    nothing
+elseif MCTS_BUDGET_MODE == :progressive
+    let params = AlphaZero.ProgressiveSimParams(
+            sim_min=PROGRESSIVE_SIM_MIN,
+            sim_max=PROGRESSIVE_SIM_MAX)
+        _turn -> AlphaZero.compute_sim_budget(params, CURRENT_ITERATION[], TOTAL_ITERS)
+    end
+else
+    let params = AlphaZero.TurnProgressiveSimParams(
+            turn_sim_min=TURN_SIM_MIN,
+            turn_sim_target=TURN_SIM_TARGET,
+            ramp_turns_initial=RAMP_TURNS_INITIAL,
+            ramp_turns_final=RAMP_TURNS_FINAL)
+        turn -> AlphaZero.compute_turn_sim_budget(params, turn, CURRENT_ITERATION[], TOTAL_ITERS)
+    end
+end
+
+println("MCTS budget mode: $MCTS_BUDGET_MODE" *
+        (MCTS_BUDGET_MODE == :constant ? " ($MCTS_ITERS sims)" :
+         MCTS_BUDGET_MODE == :progressive ? " ($PROGRESSIVE_SIM_MIN->$PROGRESSIVE_SIM_MAX sims over iterations)" :
+         " ($TURN_SIM_MIN->$TURN_SIM_TARGET sims over turns/iterations)"))
 
 function _sample_chance(rng, outcomes)
     r = rand(rng)
@@ -844,7 +883,9 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         az_agent = GameLoop.MctsAgent(
             CPU_SINGLE_ORACLE, CPU_BATCH_ORACLE,
             mcts_params, INFERENCE_BATCH_SIZE, gspec;
-            bearoff_eval=BEAROFF_EVALUATOR)
+            bearoff_eval=BEAROFF_EVALUATOR,
+            batch_oracle_with_actions=CPU_BATCH_ORACLE,
+            sim_budget_fn=SELFPLAY_SIM_BUDGET_FN)
         player = GameLoop.create_player(az_agent)
     end
 
@@ -979,7 +1020,9 @@ function worker_play_games_gpu(worker_id::Int, games_claimed::Threads.Atomic{Int
     az_agent = GameLoop.MctsAgent(
         GPU_SINGLE_ORACLE, GPU_BATCH_ORACLE,
         mcts_params, INFERENCE_BATCH_SIZE, gspec;
-        bearoff_eval=nothing)
+        bearoff_eval=nothing,
+        batch_oracle_with_actions=GPU_BATCH_ORACLE,
+        sim_budget_fn=SELFPLAY_SIM_BUDGET_FN)
 
     # Create player ONCE and reuse across all games
     player = GameLoop.create_player(az_agent)
@@ -1200,7 +1243,9 @@ function continuous_worker(worker_id::Int, rng::MersenneTwister)
     az_agent = GameLoop.MctsAgent(
         CPU_SINGLE_ORACLE, CPU_BATCH_ORACLE,
         mcts_params, INFERENCE_BATCH_SIZE, gspec;
-        bearoff_eval=BEAROFF_EVALUATOR)
+        bearoff_eval=BEAROFF_EVALUATOR,
+        batch_oracle_with_actions=CPU_BATCH_ORACLE,
+        sim_budget_fn=SELFPLAY_SIM_BUDGET_FN)
     player = GameLoop.create_player(az_agent)
 
     # Play games forever — one at a time, push samples immediately
@@ -1246,7 +1291,7 @@ const EVAL_SESSION = EvalSession(0, 0, nothing, nothing, nothing, nothing, :larg
 
 # Load eval positions if eval-capable
 const EVAL_POSITIONS = if EVAL_CAPABLE
-    eval_file = get(config, "eval_positions_file", ARGS["eval_positions_file"])
+    eval_file = config["eval_positions_file"]
     path = find_or_download(eval_file; required=false)
     if !isempty(path)
         pos = Serialization.deserialize(path)
@@ -1306,7 +1351,8 @@ end
 function EvalAlphaZeroAgent(single_oracle, batch_oracle, mcts_params, batch_size, gspec)
     player = BatchedMCTS.BatchedMctsPlayer(
         gspec, single_oracle, mcts_params;
-        batch_size=batch_size, batch_oracle=batch_oracle)
+        batch_size=batch_size, batch_oracle=batch_oracle,
+        batch_oracle_with_actions=batch_oracle)
     EvalAlphaZeroAgent(single_oracle, batch_oracle, mcts_params, batch_size, gspec, player)
 end
 

@@ -25,6 +25,8 @@ using AlphaZero: GameLoop, MctsParams, ConstSchedule
         @test agent.mcts_params === params
         @test agent.batch_size == 32
         @test agent.bearoff_eval === nothing
+        @test agent.batch_oracle_with_actions === nothing
+        @test agent.sim_budget_fn === nothing
     end
 
     @testset "ExternalAgent construction" begin

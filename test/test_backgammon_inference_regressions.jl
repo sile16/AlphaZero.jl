@@ -128,6 +128,31 @@ end
         end
     end
 
+    @testset "action-aware batch oracle matches state-only oracle" begin
+        contact_net = FluxLib.FCResNetMultiHead(
+            gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1))
+        states = random_decision_states(gspec, 8; seed=41)
+        actions_by_state = [GI.available_actions(GI.init(gspec, s)) for s in states]
+
+        for backend in (:fast, :flux)
+            _, batch_oracle = AlphaZero.BackgammonInference.make_cpu_oracles(
+                backend, contact_net, cfg;
+                batch_size=8, nslots=max(Threads.nthreads(), 1))
+
+            state_only = batch_oracle(states)
+            action_aware = batch_oracle(states, actions_by_state)
+            @test length(action_aware) == length(state_only)
+            for i in eachindex(state_only)
+                p_state, v_state = state_only[i]
+                p_action, v_action = action_aware[i]
+                @test length(p_action) == length(actions_by_state[i])
+                @test length(p_action) == length(p_state)
+                @test maximum(abs.(p_action .- p_state)) ≤ 5f-4
+                @test isapprox(v_action, v_state; atol=5f-4)
+            end
+        end
+    end
+
     @testset "shared gpu oracle builder matches canonical routing" begin
         primary_net = FluxLib.FCResNetMultiHead(
             gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1))
@@ -353,7 +378,8 @@ end
                 batch_size=8, nslots=max(Threads.nthreads(), 1))
             player = BatchedMCTS.BatchedMctsPlayer(
                 gspec, single_oracle, params;
-                batch_size=8, batch_oracle=batch_oracle)
+                batch_size=8, batch_oracle=batch_oracle,
+                batch_oracle_with_actions=batch_oracle)
 
             env = GI.init(gspec)
             moves = 0

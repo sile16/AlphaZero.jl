@@ -68,15 +68,17 @@ end
 
 Wrapper around MCTS.Env that enables batched evaluation.
 """
-mutable struct BatchedEnv{S, O, BO, BE, G}
+mutable struct BatchedEnv{S, O, BO, BOWA, BE, G}
     env::MCTS.Env{S, O}     # Underlying MCTS environment
     batch_size::Int          # Number of simulations to batch
     pending::Vector{PendingSimulation{S}}  # Simulations waiting for evaluation
     batch_oracle::BO         # Optional: (Vector{S}) -> Vector{(P,V)} for batched GPU eval
+    batch_oracle_with_actions::BOWA  # Optional: (Vector{S}, Vector{Vector{Int}}) -> Vector{(P,V)}
     game_pool::Vector{G}     # Pre-allocated game clones (filled lazily on first use)
     sim_pool::Vector{PendingSimulation{S}}  # Pre-allocated sim objects (reuse vectors)
     # Pre-allocated buffers for batch_evaluate_pending! (avoid per-call allocation)
     _eval_states::Vector{S}
+    _eval_actions::Vector{Vector{Int}}
     _eval_indices::Vector{Int}
     # Bear-off evaluator: (game) -> Union{Float64, Nothing}
     bearoff_evaluator::BE
@@ -85,13 +87,17 @@ mutable struct BatchedEnv{S, O, BO, BE, G}
     inv_reward_scale::Float64
 end
 
-function BatchedEnv(env::MCTS.Env{S, O}, batch_size::Int; batch_oracle::BO=nothing, bearoff_evaluator::BE=nothing) where {S, O, BO, BE}
+function BatchedEnv(env::MCTS.Env{S, O}, batch_size::Int;
+                    batch_oracle::BO=nothing, batch_oracle_with_actions::BOWA=nothing,
+                    bearoff_evaluator::BE=nothing) where {S, O, BO, BOWA, BE}
     game_type = typeof(GI.init(env.gspec))
     eval_states = S[]; sizehint!(eval_states, batch_size)
+    eval_actions = Vector{Int}[]; sizehint!(eval_actions, batch_size)
     eval_indices = Int[]; sizehint!(eval_indices, batch_size)
-    BatchedEnv{S, O, BO, BE, game_type}(env, batch_size, PendingSimulation{S}[], batch_oracle,
+    BatchedEnv{S, O, BO, BOWA, BE, game_type}(env, batch_size, PendingSimulation{S}[],
+                              batch_oracle, batch_oracle_with_actions,
                               game_type[], PendingSimulation{S}[], eval_states,
-                              eval_indices, bearoff_evaluator,
+                              eval_actions, eval_indices, bearoff_evaluator,
                               1.0 / GI.reward_scale(env.gspec))
 end
 
@@ -289,12 +295,14 @@ Returns vector of (P, V) pairs.
 When a `batch_oracle` is set, all states are evaluated in a single call
 (e.g. one GPU forward pass via RPC). Otherwise falls back to sequential oracle calls.
 """
-function batch_evaluate(benv::BatchedEnv, states::Vector)
+function batch_evaluate(benv::BatchedEnv, states::Vector, actions_by_state=nothing)
     if isempty(states)
         return Tuple{Vector{Float32}, Float32}[]
     end
 
-    if benv.batch_oracle !== nothing
+    if actions_by_state !== nothing && benv.batch_oracle_with_actions !== nothing
+        return benv.batch_oracle_with_actions(states, actions_by_state)
+    elseif benv.batch_oracle !== nothing
         # Use batched oracle for GPU evaluation (all states in one call)
         return benv.batch_oracle(states)
     else
@@ -309,13 +317,16 @@ function batch_evaluate_pending!(benv::BatchedEnv{S}) where S
 
     # Reuse pre-allocated vectors (avoid per-call allocation)
     states_to_eval = benv._eval_states
+    actions_to_eval = benv._eval_actions
     eval_indices = benv._eval_indices
     empty!(states_to_eval)
+    empty!(actions_to_eval)
     empty!(eval_indices)
 
     @inbounds for (i, sim) in enumerate(benv.pending)
         if sim.is_new_node
             push!(states_to_eval, sim.leaf_state)
+            push!(actions_to_eval, sim.leaf_actions)
             push!(eval_indices, i)
         end
     end
@@ -325,7 +336,7 @@ function batch_evaluate_pending!(benv::BatchedEnv{S}) where S
     end
 
     # Batch evaluate
-    results = batch_evaluate(benv, states_to_eval)
+    results = batch_evaluate(benv, states_to_eval, actions_to_eval)
     length(results) == length(states_to_eval) ||
         error("Batched oracle result count mismatch: got $(length(results)) results for $(length(states_to_eval)) states")
 
@@ -496,8 +507,9 @@ end
 """
 Create a batched MCTS environment from a regular one.
 """
-function make_batched(env::MCTS.Env, batch_size::Int; batch_oracle=nothing)
-    return BatchedEnv(env, batch_size; batch_oracle=batch_oracle)
+function make_batched(env::MCTS.Env, batch_size::Int; batch_oracle=nothing, batch_oracle_with_actions=nothing)
+    return BatchedEnv(env, batch_size; batch_oracle=batch_oracle,
+                      batch_oracle_with_actions=batch_oracle_with_actions)
 end
 
 """
@@ -523,11 +535,13 @@ end
 A player that uses batched MCTS for improved GPU utilization.
 Similar to MctsPlayer but batches neural network evaluations.
 """
-struct BatchedMctsPlayer{B, T} <: Function
+mutable struct BatchedMctsPlayer{B, T, F} <: Function
     benv::B
     niters::Int
     batch_size::Int
     τ::T  # Temperature schedule (AbstractSchedule{Float64})
+    sim_budget_fn::F
+    turn_count::Int
 end
 
 """
@@ -543,7 +557,9 @@ Create a batched MCTS player.
 - `batch_oracle`: Optional batched oracle `(Vector{S}) -> Vector{(P,V)}` for GPU eval
 - `bearoff_evaluator`: Optional `(game) -> Union{Float64, Nothing}` for exact bear-off values at chance nodes
 """
-function BatchedMctsPlayer(game_spec, oracle, params; batch_size=32, batch_oracle=nothing, bearoff_evaluator=nothing)
+function BatchedMctsPlayer(game_spec, oracle, params; batch_size=32, batch_oracle=nothing,
+                           batch_oracle_with_actions=nothing, bearoff_evaluator=nothing,
+                           sim_budget_fn=nothing)
     mcts = MCTS.Env(game_spec, oracle,
         gamma=params.gamma,
         cpuct=params.cpuct,
@@ -553,12 +569,17 @@ function BatchedMctsPlayer(game_spec, oracle, params; batch_size=32, batch_oracl
         chance_mode=params.chance_mode,
         progressive_widening_alpha=params.progressive_widening_alpha,
         prior_virtual_visits=params.prior_virtual_visits)
-    benv = BatchedEnv(mcts, batch_size; batch_oracle=batch_oracle, bearoff_evaluator=bearoff_evaluator)
-    return BatchedMctsPlayer(benv, params.num_iters_per_turn, batch_size, params.temperature)
+    benv = BatchedEnv(mcts, batch_size; batch_oracle=batch_oracle,
+                      batch_oracle_with_actions=batch_oracle_with_actions,
+                      bearoff_evaluator=bearoff_evaluator)
+    return BatchedMctsPlayer(benv, params.num_iters_per_turn, batch_size, params.temperature,
+                             sim_budget_fn, 0)
 end
 
 function think(p::BatchedMctsPlayer, game)
-    batched_explore!(p.benv, game, p.niters)
+    niters = p.sim_budget_fn === nothing ? p.niters : p.sim_budget_fn(p.turn_count)
+    batched_explore!(p.benv, game, niters)
+    p.turn_count += 1
     return MCTS.policy(p.benv.env, game)
 end
 
@@ -568,6 +589,7 @@ end
 
 function reset_player!(p::BatchedMctsPlayer)
     reset!(p.benv)
+    p.turn_count = 0
 end
 
 end  # module

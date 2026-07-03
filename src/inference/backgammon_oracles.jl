@@ -38,6 +38,8 @@ struct OracleScratch
     secondary_input::Union{InputBuffers, Nothing}
     primary_idxs::Vector{Int}
     secondary_idxs::Vector{Int}
+    primary_actions::Vector{Vector{Int}}
+    secondary_actions::Vector{Vector{Int}}
     results::Vector{Tuple{Vector{Float32}, Float32}}
 end
 
@@ -47,6 +49,8 @@ function OracleScratch(state_dim::Int, num_actions::Int, max_batch::Int; dual::B
         dual ? InputBuffers(state_dim, num_actions, max_batch) : nothing,
         Vector{Int}(undef, max_batch),
         Vector{Int}(undef, max_batch),
+        [Int[] for _ in 1:max_batch],
+        [Int[] for _ in 1:max_batch],
         Vector{Tuple{Vector{Float32}, Float32}}(undef, max_batch))
 end
 
@@ -62,6 +66,7 @@ end
 
 struct GpuOracleRequest
     states::Vector
+    actions::Union{Nothing, Vector{Vector{Int}}}
     answer_channel::Channel{Vector{Tuple{Vector{Float32}, Float32}}}
 end
 
@@ -98,6 +103,11 @@ function _populate_column!(cfg::OracleConfig, X::Matrix{Float32}, A::Matrix{Floa
     if !BackgammonNet.game_terminated(state) && !BackgammonNet.is_chance_node(state)
         actions = GI.available_actions(GI.init(cfg.gspec, state))
     end
+    _populate_column!(cfg, X, A, col, state, actions)
+end
+
+function _populate_column!(cfg::OracleConfig, X::Matrix{Float32}, A::Matrix{Float32},
+                           col::Int, state, actions::Vector{Int})
     cfg.vectorize_state!(@view(X[:, col]), cfg.gspec, state)
     a_col = @view(A[:, col])
     fill!(a_col, 0.0f0)
@@ -131,6 +141,36 @@ function _pack_states!(scratch::OracleScratch, states, cfg::OracleConfig)
     return n_primary, n_secondary
 end
 
+function _pack_states_with_actions!(scratch::OracleScratch, states, actions_by_state::Vector{Vector{Int}},
+                                    cfg::OracleConfig)
+    length(states) == length(actions_by_state) ||
+        error("State/action batch mismatch: $(length(states)) states, $(length(actions_by_state)) action lists")
+
+    n_primary = 0
+    n_secondary = 0
+    dual = scratch.secondary_input !== nothing
+    primary_input = scratch.primary_input
+    secondary_input = scratch.secondary_input
+
+    @inbounds for (idx, state) in enumerate(states)
+        actions = actions_by_state[idx]
+        route = dual ? cfg.route_state(state) : 1
+        if route == 2 && dual
+            n_secondary += 1
+            scratch.secondary_idxs[n_secondary] = idx
+            scratch.secondary_actions[n_secondary] = actions
+            _populate_column!(cfg, secondary_input.X, secondary_input.A, n_secondary, state, actions)
+        else
+            n_primary += 1
+            scratch.primary_idxs[n_primary] = idx
+            scratch.primary_actions[n_primary] = actions
+            _populate_column!(cfg, primary_input.X, primary_input.A, n_primary, state, actions)
+        end
+    end
+
+    return n_primary, n_secondary
+end
+
 function _store_results!(scratch::OracleScratch, idxs::Vector{Int}, A::Matrix{Float32},
                          P::AbstractMatrix, V, n::Int, num_actions::Int)
     @inbounds for j in 1:n
@@ -154,11 +194,34 @@ function _store_results!(scratch::OracleScratch, idxs::Vector{Int}, A::Matrix{Fl
     end
 end
 
+function _store_results_with_actions!(scratch::OracleScratch, idxs::Vector{Int},
+                                      actions_by_col::Vector{Vector{Int}},
+                                      P::AbstractMatrix, V, n::Int)
+    @inbounds for j in 1:n
+        idx = idxs[j]
+        actions = actions_by_col[j]
+        pv = Vector{Float32}(undef, length(actions))
+        for (k, action) in enumerate(actions)
+            pv[k] = P[action, j]
+        end
+        v = V isa AbstractVector ? V[j] : V[1, j]
+        scratch.results[idx] = (pv, v)
+    end
+end
+
 function _forward_fast!(scratch::OracleScratch, fw::FastWeights, fb::FastBuffers,
                         input::InputBuffers, idxs::Vector{Int}, n::Int, cfg::OracleConfig)
     n == 0 && return
     P, V, _ = fast_forward_normalized!(fw, fb, input.X, input.A, n)
     _store_results!(scratch, idxs, input.A, P, V, n, cfg.num_actions)
+end
+
+function _forward_fast_with_actions!(scratch::OracleScratch, fw::FastWeights, fb::FastBuffers,
+                                     input::InputBuffers, idxs::Vector{Int},
+                                     actions_by_col::Vector{Vector{Int}}, n::Int)
+    n == 0 && return
+    P, V, _ = fast_forward_normalized!(fw, fb, input.X, input.A, n)
+    _store_results_with_actions!(scratch, idxs, actions_by_col, P, V, n)
 end
 
 function _new_fast_worker_buffers(cfg::OracleConfig, batch_size::Int,
@@ -214,6 +277,36 @@ function _forward_gpu!(scratch::OracleScratch, net_gpu,
         V_cpu = Array(result[2])
     end
     _store_results!(scratch, idxs, input.A, P_cpu, V_cpu, n, cfg.num_actions)
+end
+
+function _forward_gpu_with_actions!(scratch::OracleScratch, net_gpu,
+                                    input::InputBuffers, idxs::Vector{Int},
+                                    actions_by_col::Vector{Vector{Int}}, n::Int,
+                                    gpu_array_fn, sync_fn, gpu_lock)
+    n == 0 && return
+    local P_cpu, V_cpu
+    X_active = @view(input.X[:, 1:n])
+    A_active = @view(input.A[:, 1:n])
+    lock(gpu_lock) do
+        X_g = gpu_array_fn(X_active)
+        A_g = gpu_array_fn(A_active)
+        result = Network.forward_normalized(net_gpu, X_g, A_g)
+        sync_fn()
+        P_cpu = Array(result[1])
+        V_cpu = Array(result[2])
+    end
+    _store_results_with_actions!(scratch, idxs, actions_by_col, P_cpu, V_cpu, n)
+end
+
+function _forward_network_with_actions!(scratch::OracleScratch, net,
+                                        input::InputBuffers, idxs::Vector{Int},
+                                        actions_by_col::Vector{Vector{Int}}, n::Int)
+    n == 0 && return
+    X_active = @view(input.X[:, 1:n])
+    A_active = @view(input.A[:, 1:n])
+    X_net, A_net = Network.convert_input_tuple(net, (X_active, A_active))
+    P, V, _ = Network.convert_output_tuple(net, Network.forward_normalized(net, X_net, A_net))
+    _store_results_with_actions!(scratch, idxs, actions_by_col, P, V, n)
 end
 
 function _gpu_server_loop!(server_scratch::OracleScratch, request_channel::Channel{GpuOracleRequest},
@@ -294,12 +387,37 @@ function _gpu_server_loop!(server_scratch::OracleScratch, request_channel::Chann
             offsets[i + 1] = pos
         end
 
-        n_primary, n_secondary = _pack_states!(server_scratch, combined_states, cfg)
-        _forward_gpu!(server_scratch, primary_net_gpu, server_scratch.primary_input, server_scratch.primary_idxs, n_primary,
-                      cfg, gpu_array_fn, sync_fn, gpu_lock)
-        if dual
-            _forward_gpu!(server_scratch, secondary_net_gpu, server_scratch.secondary_input, server_scratch.secondary_idxs, n_secondary,
+        combined_actions = nothing
+        if all(req -> req.actions !== nothing, batch_requests)
+            combined_actions = Vector{Vector{Int}}(undef, used)
+            pos = 1
+            for req in batch_requests
+                copyto!(combined_actions, pos, req.actions, 1, length(req.actions))
+                pos += length(req.actions)
+            end
+        elseif any(req -> req.actions !== nothing, batch_requests)
+            error("Cannot mix action-aware and state-only GPU oracle requests in one server batch")
+        end
+
+        if combined_actions === nothing
+            n_primary, n_secondary = _pack_states!(server_scratch, combined_states, cfg)
+            _forward_gpu!(server_scratch, primary_net_gpu, server_scratch.primary_input, server_scratch.primary_idxs, n_primary,
                           cfg, gpu_array_fn, sync_fn, gpu_lock)
+        else
+            n_primary, n_secondary = _pack_states_with_actions!(server_scratch, combined_states, combined_actions, cfg)
+            _forward_gpu_with_actions!(server_scratch, primary_net_gpu, server_scratch.primary_input,
+                                       server_scratch.primary_idxs, server_scratch.primary_actions,
+                                       n_primary, gpu_array_fn, sync_fn, gpu_lock)
+        end
+        if dual
+            if combined_actions === nothing
+                _forward_gpu!(server_scratch, secondary_net_gpu, server_scratch.secondary_input, server_scratch.secondary_idxs, n_secondary,
+                              cfg, gpu_array_fn, sync_fn, gpu_lock)
+            else
+                _forward_gpu_with_actions!(server_scratch, secondary_net_gpu, server_scratch.secondary_input,
+                                           server_scratch.secondary_idxs, server_scratch.secondary_actions,
+                                           n_secondary, gpu_array_fn, sync_fn, gpu_lock)
+            end
         end
 
         for i in 1:nreq
@@ -322,9 +440,24 @@ function make_cpu_oracles(backend::Union{Symbol, AbstractString},
     dual = secondary_net !== nothing || secondary_fw !== nothing
 
     if resolved == :flux
-        function flux_batch_oracle(states::Vector)
+        flux_task_buffers = _task_buffer_resolver() do
+            OracleScratch(cfg.state_dim, cfg.num_actions, batch_size + 1; dual=dual)
+        end
+
+        function flux_batch_oracle(states::Vector, actions_by_state=nothing)
             n = length(states)
             n == 0 && return Tuple{Vector{Float32}, Float32}[]
+            if actions_by_state !== nothing
+                scratch = flux_task_buffers()
+                n_primary, n_secondary = _pack_states_with_actions!(scratch, states, actions_by_state, cfg)
+                _forward_network_with_actions!(scratch, primary_net, scratch.primary_input,
+                                               scratch.primary_idxs, scratch.primary_actions, n_primary)
+                if dual
+                    _forward_network_with_actions!(scratch, secondary_net, scratch.secondary_input,
+                                                   scratch.secondary_idxs, scratch.secondary_actions, n_secondary)
+                end
+                return @view(scratch.results[1:n])
+            end
             if !dual
                 return Network.evaluate_batch(primary_net, states)
             end
@@ -381,17 +514,27 @@ function make_cpu_oracles(backend::Union{Symbol, AbstractString},
     _pfw = primary_fw
     _sfw = secondary_fw
 
-    function fast_batch_oracle(states::Vector)
+    function fast_batch_oracle(states::Vector, actions_by_state=nothing)
         n = length(states)
         n == 0 && return Tuple{Vector{Float32}, Float32}[]
         pfw = _unwrap_fw(_pfw)
         sfw = _unwrap_fw(_sfw)
         worker = task_buffers()
         scratch = worker.scratch
-        n_primary, n_secondary = _pack_states!(scratch, states, cfg)
-        _forward_fast!(scratch, pfw, worker.primary_fast, scratch.primary_input, scratch.primary_idxs, n_primary, cfg)
-        if dual
-            _forward_fast!(scratch, sfw, worker.secondary_fast, scratch.secondary_input, scratch.secondary_idxs, n_secondary, cfg)
+        if actions_by_state === nothing
+            n_primary, n_secondary = _pack_states!(scratch, states, cfg)
+            _forward_fast!(scratch, pfw, worker.primary_fast, scratch.primary_input, scratch.primary_idxs, n_primary, cfg)
+            if dual
+                _forward_fast!(scratch, sfw, worker.secondary_fast, scratch.secondary_input, scratch.secondary_idxs, n_secondary, cfg)
+            end
+        else
+            n_primary, n_secondary = _pack_states_with_actions!(scratch, states, actions_by_state, cfg)
+            _forward_fast_with_actions!(scratch, pfw, worker.primary_fast, scratch.primary_input,
+                                        scratch.primary_idxs, scratch.primary_actions, n_primary)
+            if dual
+                _forward_fast_with_actions!(scratch, sfw, worker.secondary_fast, scratch.secondary_input,
+                                            scratch.secondary_idxs, scratch.secondary_actions, n_secondary)
+            end
         end
         return @view(scratch.results[1:n])
     end
@@ -413,17 +556,29 @@ function make_gpu_oracles(primary_net_gpu,
         _new_gpu_worker_buffers(cfg, batch_size; secondary=dual)
     end
 
-    function gpu_batch_oracle(states::Vector)
+    function gpu_batch_oracle(states::Vector, actions_by_state=nothing)
         n = length(states)
         n == 0 && return Tuple{Vector{Float32}, Float32}[]
         worker = task_buffers()
         scratch = worker.scratch
-        n_primary, n_secondary = _pack_states!(scratch, states, cfg)
-        _forward_gpu!(scratch, primary_net_gpu, scratch.primary_input, scratch.primary_idxs, n_primary,
-                      cfg, gpu_array_fn, sync_fn, gpu_lock)
-        if dual
-            _forward_gpu!(scratch, secondary_net_gpu, scratch.secondary_input, scratch.secondary_idxs, n_secondary,
+        if actions_by_state === nothing
+            n_primary, n_secondary = _pack_states!(scratch, states, cfg)
+            _forward_gpu!(scratch, primary_net_gpu, scratch.primary_input, scratch.primary_idxs, n_primary,
                           cfg, gpu_array_fn, sync_fn, gpu_lock)
+            if dual
+                _forward_gpu!(scratch, secondary_net_gpu, scratch.secondary_input, scratch.secondary_idxs, n_secondary,
+                              cfg, gpu_array_fn, sync_fn, gpu_lock)
+            end
+        else
+            n_primary, n_secondary = _pack_states_with_actions!(scratch, states, actions_by_state, cfg)
+            _forward_gpu_with_actions!(scratch, primary_net_gpu, scratch.primary_input,
+                                       scratch.primary_idxs, scratch.primary_actions,
+                                       n_primary, gpu_array_fn, sync_fn, gpu_lock)
+            if dual
+                _forward_gpu_with_actions!(scratch, secondary_net_gpu, scratch.secondary_input,
+                                           scratch.secondary_idxs, scratch.secondary_actions,
+                                           n_secondary, gpu_array_fn, sync_fn, gpu_lock)
+            end
         end
         return @view(scratch.results[1:n])
     end
@@ -452,10 +607,10 @@ function make_gpu_server_oracles(primary_net_gpu,
         gpu_array_fn, sync_fn, gpu_lock)
     server = GpuOracleServer(request_channel, server_task)
 
-    function gpu_batch_oracle(states::Vector)
+    function gpu_batch_oracle(states::Vector, actions_by_state=nothing)
         isempty(states) && return Tuple{Vector{Float32}, Float32}[]
         answer_channel = Channel{Vector{Tuple{Vector{Float32}, Float32}}}(1)
-        put!(request_channel, GpuOracleRequest(states, answer_channel))
+        put!(request_channel, GpuOracleRequest(states, actions_by_state, answer_channel))
         return take!(answer_channel)
     end
 

@@ -131,7 +131,8 @@ end
 function play_one_game(single_oracle, batch_oracle, mcts_params, batch_size, rng)
     player = BatchedMCTS.BatchedMctsPlayer(
         gspec, single_oracle, mcts_params;
-        batch_size=batch_size, batch_oracle=batch_oracle)
+        batch_size=batch_size, batch_oracle=batch_oracle,
+        batch_oracle_with_actions=batch_oracle)
 
     env = GI.init(gspec)
     turns = 0
