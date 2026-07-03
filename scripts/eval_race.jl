@@ -56,6 +56,12 @@ function parse_args_eval()
             help = "CPU inference backend: auto, fast, or flux"
             arg_type = String
             default = "auto"
+        "--bearoff-eval"
+            help = "OPTIONAL: give MCTS agents the exact k=7 bear-off evaluator " *
+                   "(exact endgame values at chance + decision nodes). DEFAULT OFF — " *
+                   "the standard eval stays byte-identical for comparability with " *
+                   "historical numbers. Requires the k=7 table files (errors if missing)."
+            action = :store_true
     end
     return ArgParse.parse_args(s)
 end
@@ -85,6 +91,64 @@ const NUM_ACTIONS = GI.num_actions(gspec)
 const _state_dim = GI.state_dim(gspec)[1]
 const ORACLE_CFG = AlphaZero.BackgammonInference.OracleConfig(
     _state_dim, NUM_ACTIONS, gspec; vectorize_state! = vectorize_state_into!)
+
+# ── Optional exact bear-off evaluator (--bearoff-eval) ──────────────────
+# DEFAULT OFF. Without the flag, BEAROFF_EVALUATOR stays `nothing`, the k=7
+# table/BearoffK7 are never loaded, and the eval is byte-identical to the
+# historical standard. With the flag, MCTS agents get an exact endgame
+# evaluator: pre-dice table lookup at chance nodes, exact best-move value at
+# decision nodes. Every race game funnels into bearoff, so this removes wasted
+# sims re-deriving endgame values and eliminates close-bearoff misplays.
+#
+# Pattern follows scripts/eval_table_vs_wildbg.jl (TABLE const) and
+# scripts/selfplay_client.jl (make_bearoff_evaluator). The doubles pitfall is
+# handled inside bearoff_eval_common.jl — we use bearoff_best_move_value, which
+# recurses through mid-turn doubles states. Returns WHITE-relative, NORMALIZED
+# /3 values to match the NN value scale [-1,1].
+BEAROFF_EVALUATOR = nothing
+if ARGS["bearoff_eval"]
+    BEAROFF_SRC = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k7.jl")
+    isfile(BEAROFF_SRC) ||
+        error("--bearoff-eval requested but bearoff_k7.jl not found at $BEAROFF_SRC")
+    include(BEAROFF_SRC)
+    using .BearoffK7
+    using .BearoffK7: BearoffTable
+    include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
+
+    _table_candidates = [
+        joinpath(dirname(BEAROFF_SRC), "..", "tools", "bearoff_twosided", "bearoff_k7_twosided"),
+        joinpath(homedir(), "bearoff_k7_twosided"),
+        "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
+    ]
+    _tdir = findfirst(d -> isdir(d) && isfile(joinpath(d, "bearoff_k7_c14.bin")), _table_candidates)
+    _tdir === nothing &&
+        error("--bearoff-eval requested but k=7 bear-off table not found in: " *
+              join(_table_candidates, ", "))
+    println("Loading k=7 bear-off table from $(_table_candidates[_tdir]) ...")
+    flush(stdout)
+    global TABLE = BearoffTable(_table_candidates[_tdir])
+
+    # Mirrors selfplay_client.jl's make_bearoff_evaluator (money weights).
+    global BEAROFF_EVALUATOR = function(game_env)
+        bg = game_env.game
+        BearoffK7.is_bearoff_position(bg.p0, bg.p1) || return nothing
+        if BackgammonNet.is_chance_node(bg)
+            # Pre-dice: exact table value, mover-relative → white-relative, /3.
+            r = BearoffK7.lookup(TABLE, bg)
+            mover_equity = Float64(BearoffK7.compute_equity(r)) / 3.0
+            return bg.current_player == 0 ? mover_equity : -mover_equity
+        end
+        # Decision node (post-dice): exact Q via move enumeration (doubles-safe).
+        actions = BackgammonNet.legal_actions(bg)
+        isempty(actions) && return nothing
+        best_value = bearoff_best_move_value(TABLE, bg)
+        best_value == -Inf && return nothing
+        best_value /= 3.0  # normalize points → NN value scale [-1,1]
+        return bg.current_player == 0 ? best_value : -best_value
+    end
+    println("Exact bear-off evaluator: ENABLED")
+    flush(stdout)
+end
 
 # ── Wildbg Library ──────────────────────────────────────────────────────
 
@@ -132,7 +196,8 @@ end
 Uses GameLoop.play_game() for the game loop."""
 function eval_race_game(single_oracle, batch_oracle, wildbg_backend, position_data::Tuple,
                         value_batch_oracle; seed::Int=1, az_is_white::Bool=true,
-                        gspec=nothing, mcts_params=nothing, batch_size::Int=50)
+                        gspec=nothing, mcts_params=nothing, batch_size::Int=50,
+                        bearoff_eval=nothing)
     rng = MersenneTwister(seed)
     p0, p1, cp = position_data
 
@@ -141,7 +206,12 @@ function eval_race_game(single_oracle, batch_oracle, wildbg_backend, position_da
                           obs_type=:minimal_flat)
     env = GameEnv(game, rng)
 
-    az = GameLoop.MctsAgent(single_oracle, batch_oracle, mcts_params, batch_size, gspec)
+    # Pass bearoff_eval only when enabled — default (nothing) is byte-identical
+    # to not passing the kwarg (MctsAgent's default is also nothing).
+    az = bearoff_eval === nothing ?
+        GameLoop.MctsAgent(single_oracle, batch_oracle, mcts_params, batch_size, gspec) :
+        GameLoop.MctsAgent(single_oracle, batch_oracle, mcts_params, batch_size, gspec;
+                           bearoff_eval=bearoff_eval)
     wb = GameLoop.ExternalAgent(wildbg_backend)
 
     # Value comparison functions.
@@ -203,6 +273,7 @@ function main()
     println("MCTS: $mcts_iters iterations")
     println("Workers: $num_workers CPU")
     println("CPU inference: $(AlphaZero.BackgammonInference.cpu_backend_summary(backend))")
+    println("Bear-off evaluator: $(BEAROFF_EVALUATOR === nothing ? "OFF (standard)" : "ON (exact k=7)")")
 
     # Load network
     network = FluxLib.FCResNetMultiHead(
@@ -268,7 +339,8 @@ function main()
             end
             result = eval_race_game(single_oracle, batch_oracle, wb, positions[pos_idx],
                                     value_batch_oracle; seed=seed, az_is_white=az_white,
-                                    gspec=gspec, mcts_params=mcts_params, batch_size=batch_size)
+                                    gspec=gspec, mcts_params=mcts_params, batch_size=batch_size,
+                                    bearoff_eval=BEAROFF_EVALUATOR)
             rewards[job] = result.reward
             vsamples[job] = result.value_samples
             d = Threads.atomic_add!(done, 1) + 1
