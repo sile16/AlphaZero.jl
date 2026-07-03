@@ -12,8 +12,8 @@ same_state(game1, game2) = GI.current_state(game1) == GI.current_state(game2)
 
 # Test that the same (symmetric) actions are still available in a symmetric state
 # function test_symmetry(gspec, state, (symstate, aperm))
-#   mask = GI.actions_mask(GI.init(gspec, state))
-#   symmask = GI.actions_mask(GI.init(gspec, symstate))
+#   mask = GI.actions_mask(gspec, state)
+#   symmask = GI.actions_mask(gspec, symstate)
 #   v = falses(length(symmask))
 #   v[mask] .= true
 #   v = v[aperm]
@@ -21,8 +21,8 @@ same_state(game1, game2) = GI.current_state(game1) == GI.current_state(game2)
 # end
 
 function test_symmetry(gspec, state, (symstate, aperm))
-  mask = GI.actions_mask(GI.init(gspec, state))
-  symmask = GI.actions_mask(GI.init(gspec, symstate))
+  mask = GI.actions_mask(gspec, state)
+  symmask = GI.actions_mask(gspec, symstate)
   return symmask == mask[aperm]
 end
 

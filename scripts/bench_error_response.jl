@@ -270,7 +270,7 @@ function make_oracle(sd::StateData, injector::Symbol, eps::Float64, tau::Float64
         end
     end
     return function(state)
-        acts = GI.available_actions(GI.init(GSPEC, state))
+        acts = GI.available_actions(GSPEC, state)
         n = max(1, length(acts))
         if policy_mode && state_key(state) == rk
             logits = Float32[get(act2logit, a, -1f9) for a in acts]
@@ -554,7 +554,7 @@ function rung7_impl(states, rung6res, ckpt)
             return nn_white(game)
         end
     end
-    uniform_oracle(state) = let n = max(1, length(GI.available_actions(GI.init(GSPEC, state))))
+    uniform_oracle(state) = let n = max(1, length(GI.available_actions(GSPEC, state)))
         (fill(Float32(1.0 / n), n), 0.0f0)
     end
     n = length(states)

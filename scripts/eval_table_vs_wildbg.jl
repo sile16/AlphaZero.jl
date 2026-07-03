@@ -191,7 +191,7 @@ bearoff position, so the bearoff evaluator supplies exact values and this
 oracle's V is never used; the uniform prior only spreads initial exploration.
 (Kept valid for safety in case a non-bearoff leaf is ever reached.)"""
 function uniform_oracle(state)
-    acts = GI.available_actions(GI.init(GSPEC, state))
+    acts = GI.available_actions(GSPEC, state)
     n = max(1, length(acts))
     return (fill(Float32(1.0 / n), n), 0.0f0)
 end

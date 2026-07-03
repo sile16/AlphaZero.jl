@@ -208,7 +208,7 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
         if info === nothing
             # Derive leaf actions from the cloned state, not the pooled live
             # env, so the stored node contract matches the oracle input exactly.
-            leaf_actions = GI.available_actions(GI.init(GI.spec(game), state))
+            leaf_actions = GI.available_actions(GI.spec(game), state)
 
             # Single-option states (e.g., forced PASS): create trivial tree entry
             # and continue traversal. No oracle evaluation needed since P=[1.0]
@@ -345,7 +345,7 @@ function batch_evaluate_pending!(benv::BatchedEnv{S}) where S
         sim = benv.pending[result_idx]
         P, V = results[i]
         if length(P) != length(sim.leaf_actions)
-            recomputed_actions = GI.available_actions(GI.init(env.gspec, sim.leaf_state))
+            recomputed_actions = GI.available_actions(env.gspec, sim.leaf_state)
             error("Oracle policy/action mismatch: length(P)=$(length(P)) length(actions)=$(length(sim.leaf_actions)) length(recomputed)=$(length(recomputed_actions)) same_actions=$(sim.leaf_actions == recomputed_actions) state=$(sim.leaf_state)")
         end
         info = MCTS.init_state_info(P, V, env.prior_temperature, sim.leaf_actions)
@@ -428,7 +428,8 @@ function batched_explore!(benv::BatchedEnv, game, nsims)
     # Without this, if batch_size >= nsims, ALL simulations hit an empty tree,
     # no actions are selected, visit counts stay at 0, and policy() returns NaN.
     state = GI.current_state(game)
-    if !GI.game_terminated(game) && !GI.is_chance_node(game) && !haskey(env.tree, state)
+    root_info = get(env.tree, state, nothing)
+    if !GI.game_terminated(game) && !GI.is_chance_node(game) && root_info === nothing
         empty!(benv.pending)
         env.total_simulations += 1
         # Use pool sim for root init too
@@ -441,12 +442,13 @@ function batched_explore!(benv::BatchedEnv, game, nsims)
         for s in benv.pending
             backpropagate!(benv, s)
         end
+        root_info = get(env.tree, state, nothing)
         nsims -= 1
     end
 
     # Generate Dirichlet noise using cached actions from tree (avoids GI.available_actions)
-    η = if env.noise_α != 0 && haskey(env.tree, state)
-        n_actions = length(env.tree[state].actions)
+    η = if env.noise_α != 0 && root_info !== nothing
+        n_actions = length(root_info.actions)
         rand(Dirichlet(n_actions, Float64(env.noise_α)))
     elseif env.noise_α != 0
         n_actions = length(GI.available_actions(game))

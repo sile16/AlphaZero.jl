@@ -153,6 +153,17 @@ The following identities must hold:
 function actions_mask end
 
 """
+    actions_mask(::AbstractGameSpec, state)
+
+Return the available-action mask for a state without requiring callers to
+materialize a long-lived game environment. Games can specialize this to avoid
+temporary env construction.
+"""
+function actions_mask(gspec::AbstractGameSpec, state)
+  return actions_mask(init(gspec, state))
+end
+
+"""
     play!(game::AbstractGameEnv, action)
 
 Update the game environment by making the current player perform `action`.
@@ -477,6 +488,17 @@ Return the vector of all available actions.
 function available_actions(game::AbstractGameEnv)
   mask = actions_mask(game)
   return actions(spec(game))[mask]
+end
+
+"""
+    available_actions(::AbstractGameSpec, state)
+
+Return available actions for a state. The default matches
+`available_actions(init(gspec, state))`; games can specialize this to avoid
+temporary env construction and state cloning.
+"""
+function available_actions(gspec::AbstractGameSpec, state)
+  return available_actions(init(gspec, state))
 end
 
 """

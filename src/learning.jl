@@ -28,7 +28,7 @@ function convert_sample(
     w = Float32[e.n]
   end
   x = GI.vectorize_state(gspec, e.s)
-  a = GI.actions_mask(GI.init(gspec, e.s))
+  a = GI.actions_mask(gspec, e.s)
   p = zeros(size(a))
   # For chance nodes, policy should be empty (no targets)
   if !e.is_chance && !isempty(e.π)

@@ -167,7 +167,7 @@ else
     """Uniform-prior, V=0 oracle. Under the exact bear-off evaluator its V is never
     used (every node is a bear-off leaf); the uniform prior only seeds exploration."""
     function _uniform_oracle(state)
-        n = max(1, length(GI.available_actions(GI.init(GSPEC_ID, state))))
+        n = max(1, length(GI.available_actions(GSPEC_ID, state)))
         return (fill(Float32(1 / n), n), 0.0f0)
     end
 

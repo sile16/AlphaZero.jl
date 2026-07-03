@@ -101,7 +101,7 @@ end
 function _populate_column!(cfg::OracleConfig, X::Matrix{Float32}, A::Matrix{Float32}, col::Int, state)
     actions = Int[]
     if !BackgammonNet.game_terminated(state) && !BackgammonNet.is_chance_node(state)
-        actions = GI.available_actions(GI.init(cfg.gspec, state))
+        actions = GI.available_actions(cfg.gspec, state)
     end
     _populate_column!(cfg, X, A, col, state, actions)
 end

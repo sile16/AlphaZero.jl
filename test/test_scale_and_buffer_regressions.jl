@@ -50,8 +50,7 @@ const BGD_SB = Main.BackgammonDeterministic
 
     # Uniform oracle with V = 0: root Q comes purely from the terminal reward.
     uniform_oracle(state) = begin
-        g = GI.init(gspec, state)
-        n = length(GI.available_actions(g))
+        n = length(GI.available_actions(gspec, state))
         (ones(Float64, n) ./ n, 0.0)
     end
 

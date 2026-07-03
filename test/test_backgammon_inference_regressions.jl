@@ -74,6 +74,82 @@ end
         @test state._actions_buffer !== env.game._actions_buffer
     end
 
+    @testset "state-level action APIs match env path" begin
+        states = random_decision_states(gspec, 24; seed=43)
+
+        chance_env = GI.init(gspec)
+        push!(states, GI.current_state(chance_env))
+
+        terminal_env = GI.init(gspec)
+        rng = MersenneTwister(44)
+        guard = 0
+        while !GI.game_terminated(terminal_env) && guard < 2000
+            if GI.is_chance_node(terminal_env)
+                outcomes = GI.chance_outcomes(terminal_env)
+                GI.apply_chance!(terminal_env, outcomes[rand(rng, eachindex(outcomes))][1])
+            else
+                actions = GI.available_actions(terminal_env)
+                isempty(actions) && break
+                GI.play!(terminal_env, actions[rand(rng, eachindex(actions))])
+            end
+            guard += 1
+        end
+        @test GI.game_terminated(terminal_env)
+        push!(states, GI.current_state(terminal_env))
+
+        for state in states
+            state_before = BackgammonNet.clone(state)
+            hash_before = hash(state)
+            vec_before = copy(GI.vectorize_state(gspec, state))
+            actions_cached_before = state._actions_cached
+            actions_buffer_before = copy(state._actions_buffer)
+            actions_buffer_id = state._actions_buffer
+
+            direct_actions = GI.available_actions(gspec, state)
+            env_actions = GI.available_actions(GI.init(gspec, state))
+            direct_mask = GI.actions_mask(gspec, state)
+            env_mask = GI.actions_mask(GI.init(gspec, state))
+
+            @test direct_actions == env_actions
+            @test direct_mask == env_mask
+            @test direct_actions == findall(direct_mask)
+            @test hash(state) == hash_before
+            @test state == state_before
+            @test GI.vectorize_state(gspec, state) == vec_before
+            @test state._actions_cached == actions_cached_before
+            @test state._actions_buffer === actions_buffer_id
+            @test state._actions_buffer == actions_buffer_before
+        end
+    end
+
+    @testset "state-level action APIs are shared-state thread safe" begin
+        state = random_decision_states(gspec, 1; seed=45)[1]
+        expected_actions = GI.available_actions(GI.init(gspec, state))
+        expected_mask = GI.actions_mask(GI.init(gspec, state))
+        actions_cached_before = state._actions_cached
+        actions_buffer_before = copy(state._actions_buffer)
+        actions_buffer_id = state._actions_buffer
+
+        failures = Threads.Atomic{Int}(0)
+        ntasks = max(2, Threads.nthreads())
+        tasks = [Threads.@spawn begin
+            for _ in 1:100
+                actions = GI.available_actions(gspec, state)
+                mask = GI.actions_mask(gspec, state)
+                if actions != expected_actions || mask != expected_mask
+                    Threads.atomic_add!(failures, 1)
+                end
+                yield()
+            end
+        end for _ in 1:ntasks]
+        foreach(fetch, tasks)
+
+        @test failures[] == 0
+        @test state._actions_cached == actions_cached_before
+        @test state._actions_buffer === actions_buffer_id
+        @test state._actions_buffer == actions_buffer_before
+    end
+
     @testset "flux oracle uses active batch slice only" begin
         struct BatchSensitiveNet <: Network.AbstractNetwork
             gspec::Any
@@ -132,7 +208,7 @@ end
         contact_net = FluxLib.FCResNetMultiHead(
             gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1))
         states = random_decision_states(gspec, 8; seed=41)
-        actions_by_state = [GI.available_actions(GI.init(gspec, s)) for s in states]
+        actions_by_state = [GI.available_actions(gspec, s) for s in states]
 
         for backend in (:fast, :flux)
             _, batch_oracle = AlphaZero.BackgammonInference.make_cpu_oracles(
@@ -161,7 +237,7 @@ end
         routed_cfg = AlphaZero.BackgammonInference.OracleConfig(
             state_dim, num_actions, gspec;
             vectorize_state! = BGD.vectorize_state_into!,
-            route_state = s -> iseven(length(GI.available_actions(GI.init(gspec, s)))) ? 2 : 1)
+            route_state = s -> iseven(length(GI.available_actions(gspec, s))) ? 2 : 1)
 
         states = random_decision_states(gspec, 6; seed=29)
         _, batch_oracle = AlphaZero.BackgammonInference.make_gpu_oracles(
@@ -191,14 +267,14 @@ end
             batch_size=4, nslots=max(Threads.nthreads(), 1))
 
         states = random_decision_states(gspec, 24; seed=11)
-        counts = [length(GI.available_actions(GI.init(gspec, s))) for s in states]
+        counts = [length(GI.available_actions(gspec, s)) for s in states]
         order = sortperm(counts)
         probe_states = [states[order[1]], states[order[end]], states[order[2]], states[order[end-1]]]
 
         for _ in 1:20
             for s in probe_states
                 result = batch_oracle([s])[1]
-                @test length(result[1]) == length(GI.available_actions(GI.init(gspec, s)))
+                @test length(result[1]) == length(GI.available_actions(gspec, s))
                 @test isapprox(sum(result[1]), 1.0f0; atol=5f-4)
             end
         end
@@ -212,7 +288,7 @@ end
             batch_size=4, nslots=max(Threads.nthreads(), 1))
 
         states = random_decision_states(gspec, 16; seed=19)
-        counts = [length(GI.available_actions(GI.init(gspec, s))) for s in states]
+        counts = [length(GI.available_actions(gspec, s)) for s in states]
         order = sortperm(counts)
         low_state = states[order[1]]
         high_state = states[order[end]]
@@ -246,7 +322,7 @@ end
                     for iter in 1:10
                         state = states[mod1(task_id + iter, length(states))]
                         result = batch_oracle([state])[1]
-                        actions = GI.available_actions(GI.init(gspec, state))
+                        actions = GI.available_actions(gspec, state)
                         @test length(result[1]) == length(actions)
                         @test isapprox(sum(result[1]), 1.0f0; atol=5f-4)
                         yield()
@@ -282,7 +358,7 @@ end
                         results = batch_oracle([s1, s2])
                         @test length(results) == 2
                         for (state, result) in zip((s1, s2), results)
-                            actions = GI.available_actions(GI.init(gspec, state))
+                            actions = GI.available_actions(gspec, state)
                             @test length(result[1]) == length(actions)
                             @test isapprox(sum(result[1]), 1.0f0; atol=5f-4)
                         end
@@ -316,7 +392,7 @@ end
                             results = batch_oracle(batch)
                             @test length(results) == length(batch)
                             for i in eachindex(batch)
-                                actions = GI.available_actions(GI.init(gspec, batch[i]))
+                                actions = GI.available_actions(gspec, batch[i])
                                 policy, value = results[i]
                                 @test length(policy) == length(actions)
                                 @test isapprox(sum(policy), 1.0f0; atol=5f-4)
@@ -328,7 +404,9 @@ end
                     end
                 end
             end
-            @test !isready(failures)
+            worker_error = isready(failures) ? take!(failures) : nothing
+            worker_error === nothing || @error "shared oracle worker failed" backend exception=worker_error
+            @test worker_error === nothing
         end
     end
 
@@ -348,7 +426,7 @@ end
                     for iter in 1:10
                         state = states[mod1(task_id + iter, length(states))]
                         result = batch_oracle([state])[1]
-                        actions = GI.available_actions(GI.init(gspec, state))
+                        actions = GI.available_actions(gspec, state)
                         @test length(result[1]) == length(actions)
                         @test isapprox(sum(result[1]), 1.0f0; atol=5f-4)
                         yield()

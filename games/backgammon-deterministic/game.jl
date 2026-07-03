@@ -263,6 +263,24 @@ function GI.actions_mask(g::GameEnv)
   return mask
 end
 
+function GI.actions_mask(::GameSpec, state::BackgammonNet.BackgammonGame)
+  mask = falses(NUM_ACTIONS)
+
+  if BackgammonNet.game_terminated(state) || BackgammonNet.is_chance_node(state)
+    return mask
+  end
+
+  work = BackgammonNet.clone(state)
+  legal = BackgammonNet.legal_actions(work)
+  for action in legal
+    if 1 <= action <= NUM_ACTIONS
+      mask[action] = true
+    end
+  end
+
+  return mask
+end
+
 # Override default available_actions to avoid expensive collect(1:676) + indexing.
 # Returns sorted legal action indices directly from BackgammonNet.
 function GI.available_actions(g::GameEnv)
@@ -271,6 +289,16 @@ function GI.available_actions(g::GameEnv)
   end
   legal = BackgammonNet.legal_actions(g.game)
   # Must be sorted to match oracle P indexing (findall order)
+  return sort!(collect(Int, action for action in legal if 1 <= action <= NUM_ACTIONS))
+end
+
+function GI.available_actions(::GameSpec, state::BackgammonNet.BackgammonGame)
+  if BackgammonNet.game_terminated(state) || BackgammonNet.is_chance_node(state)
+    return Int[]
+  end
+  work = BackgammonNet.clone(state)
+  legal = BackgammonNet.legal_actions(work)
+  # Must be sorted to match the env-based `actions_mask`/findall order.
   return sort!(collect(Int, action for action in legal if 1 <= action <= NUM_ACTIONS))
 end
 

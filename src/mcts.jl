@@ -12,7 +12,7 @@ An oracle can be any function or callable object.
 evaluates a single state from the current player's perspective and returns 
 a pair `(P, V)` where:
 
-  - `P` is a probability vector on `GI.available_actions(GI.init(gspec, state))`
+  - `P` is a probability vector on `GI.available_actions(gspec, state)`
   - `V` is a scalar estimating the value or win probability for white.
 """
 module MCTS
@@ -76,8 +76,7 @@ struct RandomOracle{GameSpec}
 end
 
 function (r::RandomOracle)(state)
-  g = GI.init(r.gspec, state)
-  n = length(GI.available_actions(g))
+  n = length(GI.available_actions(r.gspec, state))
   P = ones(n) ./ n
   V = 0.
   return P, V
@@ -303,15 +302,15 @@ end
 # Handle simulation at a decision node (original MCTS logic).
 function run_simulation_decision!(env::Env, game; η, root, depth)
   state = GI.current_state(game)
-  if haskey(env.tree, state)
+  info = get(env.tree, state, nothing)
+  if info !== nothing
     # Existing node: use cached actions (no allocation)
-    info = env.tree[state]
     actions = info.actions
   else
     # New node: derive actions from the cloned state so the node/action
     # contract stays aligned with the oracle input, even if the live env
     # has been reused or its internal action cache was refreshed differently.
-    actions = GI.available_actions(GI.init(env.gspec, state))
+    actions = GI.available_actions(env.gspec, state)
     # Single-option states (e.g., forced PASS): create trivial tree entry
     # and continue traversal. No oracle evaluation needed since P=[1.0]
     # and the value will come from the child via backpropagation.

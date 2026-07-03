@@ -276,8 +276,8 @@ function merge_by_state(samples)
 end
 
 function apply_symmetry(gspec, sample, (symstate, aperm))
-  mask = GI.actions_mask(GI.init(gspec, sample.s))
-  symmask = GI.actions_mask(GI.init(gspec, symstate))
+  mask = GI.actions_mask(gspec, sample.s)
+  symmask = GI.actions_mask(gspec, symstate)
   π = zeros(eltype(sample.π), length(mask))
   π[mask] = sample.π
   π = π[aperm]

@@ -49,12 +49,9 @@ for g in 1:200
         # Random but valid policy (uniform over legal actions for decision nodes)
         full_policy = zeros(Float32, num_actions)
         if !is_chance_flags[i]
-            game_tmp = GI.init(gspec, state)
-            if !GI.game_terminated(game_tmp) && !GI.is_chance_node(game_tmp)
-                legal = GI.available_actions(game_tmp)
-                for a in legal
-                    full_policy[a] = 1.0f0 / length(legal)
-                end
+            legal = GI.available_actions(gspec, state)
+            for a in legal
+                full_policy[a] = 1.0f0 / length(legal)
             end
         end
 
