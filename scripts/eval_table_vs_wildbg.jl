@@ -174,7 +174,9 @@ struct TableAgent <: GameLoop.GameAgent
     weights::NTuple{4, Float64}
 end
 
-GameLoop.create_player(::TableAgent) = nothing
+# TableAgent has no player object; accept and ignore `rng` (play_game passes it
+# to every agent's create_player after commit 19abe68's explicit-stream change).
+GameLoop.create_player(::TableAgent; rng=nothing) = nothing
 
 function GameLoop.select_action(agent::TableAgent, ::Nothing, env)
     bg = env.game
