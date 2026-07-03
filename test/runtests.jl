@@ -49,5 +49,9 @@ end
   include("test_play_game_integration.jl")
 end
 
+@testset "Progressive Sim Budget" begin
+  include("test_progressive_sim_budget.jl")
+end
+
 # Note: Dummy Runs test removed — depends on legacy Benchmark module
 # (rewards_and_redundancy undefined). Run tictactoe manually if needed.
