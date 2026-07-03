@@ -75,6 +75,9 @@ const OBS_SIZE = _compute_obs_size(OBSERVATION_TYPE)
 const Player = Bool
 const WHITE = true   # Player 0
 const BLACK = false  # Player 1
+const LEGAL_ACTIONS_SCRATCHES = [BackgammonNet.LegalActionsScratch() for _ in 1:Threads.maxthreadid()]
+
+legal_actions_scratch() = LEGAL_ACTIONS_SCRATCHES[Threads.threadid()]
 
 #####
 ##### Game Specification
@@ -270,8 +273,7 @@ function GI.actions_mask(::GameSpec, state::BackgammonNet.BackgammonGame)
     return mask
   end
 
-  work = BackgammonNet.clone(state)
-  legal = BackgammonNet.legal_actions(work)
+  legal = BackgammonNet.legal_actions!(legal_actions_scratch(), state)
   for action in legal
     if 1 <= action <= NUM_ACTIONS
       mask[action] = true
@@ -296,8 +298,7 @@ function GI.available_actions(::GameSpec, state::BackgammonNet.BackgammonGame)
   if BackgammonNet.game_terminated(state) || BackgammonNet.is_chance_node(state)
     return Int[]
   end
-  work = BackgammonNet.clone(state)
-  legal = BackgammonNet.legal_actions(work)
+  legal = BackgammonNet.legal_actions!(legal_actions_scratch(), state)
   # Must be sorted to match the env-based `actions_mask`/findall order.
   return sort!(collect(Int, action for action in legal if 1 <= action <= NUM_ACTIONS))
 end
