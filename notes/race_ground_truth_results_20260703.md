@@ -109,6 +109,23 @@ race evaluator feeding contact training, per the curriculum plan), better
 exploration/search, or otherwise breaking the self-play-at-teacher ceiling. NOT
 a bigger network.
 
+### Contact trend (256w×5b, iter 10→200) — a hard method-bound ceiling
+
+| iter | value corr | value MSE | move-regret | regret\|disagree | agree |
+|------|-----------|-----------|-------------|------------------|-------|
+| 10  | 0.720 | 0.429 | +0.087 | +0.105 | 15.5% |
+| 50  | 0.760 | 0.300 | +0.062 | +0.075 | 17.7% |
+| 100 | 0.722 | 0.391 | +0.057 | +0.070 | 19.2% |
+| 150 | 0.740 | 0.359 | +0.048 | +0.062 | 21.3% |
+| 200 | 0.747 | 0.377 | +0.054 | +0.068 | 18.8% |
+
+Contact value corr is **flat at ~0.74 across iter 10→200** (never approaches the
+race band's 0.99). Policy move-regret improves modestly early (+0.087→~+0.05)
+then **plateaus at ~+0.05 pts** — a persistent per-move equity loss vs wildbg.
+So **neither capacity (256 vs 128) NOR 20× more training (10→200 iters) closes
+the contact gap** — the self-play-at-teacher ceiling, measured and bounded from
+every angle.
+
 ## Implications for v13
 - Value-head training is healthy (converges, stable, no drift) — do not spend v13
   effort "fixing" the pre-bearoff value head.
