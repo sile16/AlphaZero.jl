@@ -441,6 +441,13 @@ function handle_eval_submit(req::HTTP.Request, state::ServerState)
                 @warn "Eval submit rejected" chunk_id client_name owner
                 return
             end
+            expected = length(chunk.position_range)
+            if length(rewards) != expected
+                error_status = 400
+                error_message = "Eval chunk $chunk_id: expected $expected rewards, got $(length(rewards))"
+                @warn error_message chunk_id client_name
+                return
+            end
             az_is_white = chunk.az_is_white
             result = EvalManager.EvalChunkResult(chunk_id, az_is_white,
                                                   rewards, value_nn, value_opp, value_is_contact)

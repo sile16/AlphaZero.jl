@@ -145,7 +145,11 @@ function eval_decision_node(oracle, wb_agent, p0::UInt128, p1::UInt128, cp::Int8
     BackgammonNet.game_terminated(g0) && return nothing
     BackgammonNet.is_chance_node(g0) && return nothing
     mover = Int(g0.current_player)
-    acts = BackgammonNet.legal_actions(g0)
+    # Use GI.available_actions (explicitly sorted to match the oracle's policy
+    # index order) rather than raw legal_actions — guarantees pol[i] ↔ acts[i]
+    # alignment for the policy metrics instead of relying on legal_actions
+    # happening to be sorted (verified identical, but this makes it robust).
+    acts = GI.available_actions(gspec, g0)
     isempty(acts) && return nothing
 
     # NN policy + value at the in-distribution decision node (single_oracle:

@@ -842,7 +842,11 @@ end
 Run `nsims` MCTS simulations from the current state.
 """
 function explore!(env::Env, game, nsims)
-  η = dirichlet_noise(env.rng, game, env.noise_α)
+  # Only build Dirichlet noise when it will actually be used: noise_ϵ==0 means
+  # best_uct_action ignores η, and Dirichlet(n, α) is undefined for α<=0. In
+  # both cases pass an empty η (best_uct_action guards isempty(η)).
+  η = (env.noise_ϵ != 0 && env.noise_α > 0) ?
+      dirichlet_noise(env.rng, game, env.noise_α) : Float64[]
   for i in 1:nsims
     env.total_simulations += 1
     run_simulation!(env, GI.clone(game), η=η)

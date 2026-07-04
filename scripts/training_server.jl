@@ -1916,11 +1916,13 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
             # (e.g. DimensionMismatch on a malformed submission). This runs inside
             # the training task — an unguarded throw here KILLS training. Guard it
             # and ALWAYS clear the job so one bad eval can't wedge or crash the run.
+            # Capture TB step BEFORE the try so the finally always restores it,
+            # even if a log call throws mid-eval-logging.
+            saved_step = TB_LOGGER.global_step
             try
                 result = EvalManager.finalize_eval(job)
                 @info "Eval completed iter $(job.iter)" equity=round(result.equity, digits=3) win_pct=round(result.win_pct * 100, digits=1) games=result.num_games
                 # Log to TB at the eval iteration (not the current training iteration)
-                saved_step = TB_LOGGER.global_step
                 TB_LOGGER.global_step = job.iter
                 with_logger(TB_LOGGER) do
                     @info "eval/equity" value=result.equity log_step_increment=0
@@ -1931,10 +1933,10 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
                     @info "eval/value_corr" value=result.value_corr log_step_increment=0
                     @info "eval/games" value=result.num_games log_step_increment=0
                 end
-                TB_LOGGER.global_step = saved_step
             catch e
                 @error "finalize_eval failed; discarding eval job for iter $(job.iter)" exception=(e, catch_backtrace())
             finally
+                TB_LOGGER.global_step = saved_step
                 EVAL_JOB[] = nothing
             end
         end
