@@ -130,10 +130,14 @@ end
     return Float64(g.reward)   # white-relative
 end
 
-"""Score one (position, dice) decision node: NN value vs wildbg-rollout equity.
-Returns (nn_val, rollout_eq) both mover-relative in RAW points, or nothing if the
-rolled state has no legal move (shouldn't happen for a live race)."""
-function eval_decision_node(value_oracle, wb_agent, p0::UInt128, p1::UInt128, cp::Int8,
+"""Score one (position, dice) decision node. Computes BOTH:
+- VALUE: NN value (mover-relative RAW points) vs wildbg-rollout equity.
+- POLICY: does the NN policy argmax match wildbg's move, and how much policy mass
+  the NN puts on wildbg's move (a cheap policy-quality proxy — the value finding
+  showed value isn't the pre-bearoff bottleneck, so policy is the next suspect).
+Returns a NamedTuple, or nothing if the rolled state has no legal move.
+Doubles caveat: at a doubles node this compares the FIRST action of the turn."""
+function eval_decision_node(oracle, wb_agent, p0::UInt128, p1::UInt128, cp::Int8,
                             rollouts::Int, rng)
     g0 = BackgammonGame(p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
                         obs_type=:minimal_flat)
@@ -141,19 +145,51 @@ function eval_decision_node(value_oracle, wb_agent, p0::UInt128, p1::UInt128, cp
     BackgammonNet.game_terminated(g0) && return nothing
     BackgammonNet.is_chance_node(g0) && return nothing
     mover = Int(g0.current_player)
+    acts = BackgammonNet.legal_actions(g0)
+    isempty(acts) && return nothing
 
-    # NN value at the in-distribution decision node (mover-relative, /reward_scale → [-1,1]).
-    nn_val = Float64(value_oracle([g0])[1][2]) * REWARD_SCALE
+    # NN policy + value at the in-distribution decision node (single_oracle:
+    # policy over legal actions, value mover-relative /reward_scale).
+    pol, val = oracle(g0)
+    nn_val = Float64(val) * REWARD_SCALE
 
-    # Ground truth: wildbg-vs-wildbg rollout FROM this decision node.
+    # Policy vs wildbg's move (reference).
+    wb_move = BackgammonNet.agent_move(wb_agent, g0)
+    wb_idx = findfirst(==(wb_move), acts)
+    nn_move = acts[argmax(pol)]
+    agree = (nn_move == wb_move)
+    wb_mass = wb_idx === nothing ? NaN : Float64(pol[wb_idx])
+    top1 = Float64(maximum(pol))
+
+    # VALUE ground truth: wildbg-vs-wildbg rollout FROM g0 (wildbg plays its move
+    # first) — so this ALSO equals the equity after wildbg's chosen move.
     total = 0.0
     for _ in 1:rollouts
         g = BackgammonNet.clone(g0)
         total += rollout_to_end!(wb_agent, g, rng)
     end
-    white_eq = total / rollouts
-    mover_eq = mover == 0 ? white_eq : -white_eq
-    return (nn_val, mover_eq)
+    we = total / rollouts
+    mover_eq = mover == 0 ? we : -we
+
+    # POLICY move-regret: equity the NN's policy-argmax move loses vs wildbg's.
+    # gt already = equity after wildbg's move, so regret = mover_eq − eq(nn_move).
+    # Non-doubles only (1 action = full turn → clean); 0 when the moves agree.
+    is_doubles = g0.dice[1] == g0.dice[2]
+    regret = 0.0
+    regret_valid = !is_doubles
+    if regret_valid && !agree
+        tn = 0.0
+        for _ in 1:rollouts
+            g = BackgammonNet.clone(g0)
+            BackgammonNet.apply_action!(g, nn_move)
+            tn += rollout_to_end!(wb_agent, g, rng)
+        end
+        en = tn / rollouts
+        eq_nn = mover == 0 ? en : -en
+        regret = mover_eq - eq_nn
+    end
+    return (nn_val=nn_val, rollout_eq=mover_eq, agree=agree, wb_mass=wb_mass, top1=top1,
+            regret=regret, regret_valid=regret_valid)
 end
 
 function main()
@@ -185,7 +221,7 @@ function main()
         gspec, FluxLib.FCResNetMultiHeadHP(width=ARGS["width"], num_blocks=ARGS["blocks"]))
     FluxLib.load_weights(ARGS["checkpoint"], network)
     network = Flux.cpu(network)
-    _, value_oracle = AlphaZero.BackgammonInference.make_cpu_oracles(
+    single_oracle, _ = AlphaZero.BackgammonInference.make_cpu_oracles(
         :flux, network, ORACLE_CFG; batch_size=1)
 
     # Wildbg per worker.
@@ -207,6 +243,10 @@ function main()
     n_jobs = n_pos * dice_per
     nn_vals = Vector{Float64}(undef, n_jobs)
     gt_vals = Vector{Float64}(undef, n_jobs)
+    agree_v = fill(false, n_jobs)
+    wbmass_v = fill(NaN, n_jobs)
+    top1_v = fill(NaN, n_jobs)
+    regret_v = fill(NaN, n_jobs)   # NaN = doubles node (excluded from regret)
     valid = fill(false, n_jobs)
     claimed = Threads.Atomic{Int}(0)
     done = Threads.Atomic{Int}(0)
@@ -221,9 +261,12 @@ function main()
             p0, p1, cp = positions[pos_idx]
             # Deterministic per-job RNG (reproducible; distinct per dice sample).
             rng = Xoshiro(ARGS["seed"] * 1_000_003 + job)
-            r = eval_decision_node(value_oracle, wb, UInt128(p0), UInt128(p1), Int8(cp), rollouts, rng)
+            r = eval_decision_node(single_oracle, wb, UInt128(p0), UInt128(p1), Int8(cp), rollouts, rng)
             if r !== nothing
-                nn_vals[job] = r[1]; gt_vals[job] = r[2]; valid[job] = true
+                nn_vals[job] = r.nn_val; gt_vals[job] = r.rollout_eq
+                agree_v[job] = r.agree; wbmass_v[job] = r.wb_mass; top1_v[job] = r.top1
+                regret_v[job] = r.regret_valid ? r.regret : NaN
+                valid[job] = true
             end
             d = Threads.atomic_add!(done, 1) + 1
             if d % 200 == 0
@@ -240,12 +283,30 @@ function main()
     bias = mean(nn) - mean(gt)
     corr = n >= 3 ? cor(nn, gt) : NaN
 
+    # Policy metrics (mover-move agreement with wildbg + policy mass on wildbg's move).
+    agree = agree_v[valid]
+    wbmass = wbmass_v[valid]; wbmass = wbmass[.!isnan.(wbmass)]
+    top1 = top1_v[valid]
+    agree_rate = mean(agree)
+    mean_wbmass = isempty(wbmass) ? NaN : mean(wbmass)
+    mean_top1 = mean(top1)
+
     println("=" ^ 70)
-    println("Pre-bearoff race value-head vs wildbg-rollout ground truth")
+    println("Pre-bearoff race: NN vs wildbg-rollout ground truth")
     @printf("  nodes scored:   %d  (%.1fs, %.0f rollouts total)\n", n, time() - t0, n * rollouts)
-    @printf("  NN value  mean=%.3f std=%.3f\n", mean(nn), std(nn))
-    @printf("  rollout   mean=%.3f std=%.3f\n", mean(gt), std(gt))
+    println("  -- VALUE HEAD --")
+    @printf("  NN value  mean=%.3f std=%.3f | rollout mean=%.3f std=%.3f\n", mean(nn), std(nn), mean(gt), std(gt))
     @printf("  MSE=%.4f  MAE=%.4f  bias=%.4f  corr=%.4f\n", mse, mae, bias, corr)
+    reg = regret_v[valid]; reg = reg[.!isnan.(reg)]   # non-doubles nodes only
+    mean_regret = isempty(reg) ? NaN : mean(reg)
+    # regret conditioned on disagreement (the equity cost when the NN differs).
+    reg_dis = reg[reg .!= 0.0]
+    mean_regret_dis = isempty(reg_dis) ? NaN : mean(reg_dis)
+    println("  -- POLICY HEAD (argmax vs wildbg move; doubles = first action) --")
+    @printf("  agree=%.1f%%  policy-mass-on-wildbg-move=%.3f  top1-prob=%.3f\n",
+            agree_rate * 100, mean_wbmass, mean_top1)
+    @printf("  move-regret (non-doubles, pts): mean=%.4f  mean|disagree=%.4f  (n=%d)\n",
+            mean_regret, mean_regret_dis, length(reg))
     println("=" ^ 70)
 
     if !isempty(ARGS["out"])
