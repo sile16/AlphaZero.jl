@@ -86,10 +86,28 @@ GENUINE equity-losing mistakes (+0.094 pts/disagreement, disagreeing 85% of the
 time) and the value head is far noisier (corr 0.74 vs 0.99). Both heads are
 substantially below wildbg in contact.
 
-Caveat: this is the 128w×3b contact model; the best contact model is 256w×5b
-(`distributed_20260213_031243`). NEXT STEP: rerun the contact diagnostic on the
-256w×5b model to see whether scale closes the contact gap (if it doesn't, the gap
-is training-signal/method, not capacity).
+### Scale does NOT close the contact gap → it's METHOD, not capacity
+
+Reran the contact diagnostic on the best 256w×5b contact model
+(`distributed_20260213_031243`, iter-50):
+
+| contact metric | 128w×3b | 256w×5b (4× params) |
+|----------------|---------|---------------------|
+| value corr | 0.740 | 0.714 |
+| value MSE | 0.305 | 0.333 |
+| move-regret (pts) | +0.079 | +0.076 |
+| policy agreement | 15.6% | 17.6% |
+
+Essentially identical. **4× the parameters buys no contact improvement** — the
+contact weakness is a TRAINING-METHOD / SIGNAL limitation, not model capacity.
+This localizes the known "self-play caps at teacher (wildbg) level" plateau to
+the CONTACT band and rules out scaling as the fix.
+
+**v13 lever (data-backed): the training METHOD for contact play** — a
+stronger-than-wildbg signal (e.g. the exact one-sided race endgame as a frozen
+race evaluator feeding contact training, per the curriculum plan), better
+exploration/search, or otherwise breaking the self-play-at-teacher ceiling. NOT
+a bigger network.
 
 ## Implications for v13
 - Value-head training is healthy (converges, stable, no drift) — do not spend v13
