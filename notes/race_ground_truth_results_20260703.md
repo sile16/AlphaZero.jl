@@ -38,6 +38,29 @@ plateaued.
    needs the exact one-sided ground truth (the memory's designed approach) — this
    run validates precisely why that refinement matters.
 
+## Policy-head result (v12 iter-50, 1000 pre-bearoff positions, n=815 non-doubles)
+
+| metric | value |
+|--------|-------|
+| policy argmax == wildbg move | 54.3% |
+| NN policy mass on wildbg's move | 0.351 |
+| top-1 prob (policy sharpness) | 0.395 |
+| move-regret mean (pts) | **−0.0144** |
+| move-regret \| disagree (pts) | **−0.0381** (SE ≈ 0.006) |
+
+**The 54% agreement is a red herring.** Move-regret is ≈0 and marginally
+NEGATIVE — the NN's disagreements with wildbg are near-ties where the NN is
+*marginally better* by rollout truth, not mistakes. The diffuse policy (top-1
+0.40) reflects genuine move-ambiguity in races (many pip-equivalent plays), not
+weakness. wildbg picks its move by static eval; the NN's move aligns slightly
+better with rollout truth. So the pre-bearoff **policy/move quality is also at
+(or just above) wildbg parity** — not the plateau bottleneck.
+
+Net across both heads: **the pre-bearoff RACE band is not where v12 is weak.**
+Value AND move quality match/slightly-beat wildbg there. The plateau at wildbg
+parity must live in CONTACT positions or overall integration — that is where the
+next diagnostic (same value+policy eval on a contact model/positions) should go.
+
 ## Implications for v13
 - Value-head training is healthy (converges, stable, no drift) — do not spend v13
   effort "fixing" the pre-bearoff value head.
