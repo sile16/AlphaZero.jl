@@ -58,6 +58,14 @@ function parse_cli()
             arg_type = Float64
             default = 2.0
             help = "MCTS exploration constant (--policy=mcts only)"
+        "--table"
+            arg_type = String
+            default = "k7"
+            help = "Bearoff table: k7 (deep two-sided, EXACT) | onesided (n=18 race) | combined (exact k7 where it applies, else onesided). Positions are rolled forward until they enter the chosen table's domain."
+        "--onesided-dir"
+            arg_type = String
+            default = ""
+            help = "Directory of the n=18 one-sided table (for --table=onesided|combined; auto-detected if empty)"
     end
     return ArgParse.parse_args(s)
 end
@@ -86,7 +94,18 @@ using .BearoffK7
 using .BearoffK7: BearoffTable
 include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
 
-const TABLE = let
+const TABLE_KIND = Symbol(ARGS_D["table"])
+TABLE_KIND in (:k7, :onesided, :combined) || error("--table must be k7|onesided|combined")
+
+# One-sided module + combined dispatch — only loaded when needed. These add the
+# one-sided/combined methods to the generic bearoff_lookup/bearoff_covers.
+if TABLE_KIND != :k7
+    include(joinpath(dirname(BEAROFF_SRC), "bearoff_onesided.jl"))
+    using .BearoffOneSided
+    include(joinpath(@__DIR__, "bearoff_combined.jl"))
+end
+
+function _find_k7_dir()
     candidates = [
         joinpath(dirname(BEAROFF_SRC), "..", "tools", "bearoff_twosided", "bearoff_k7_twosided"),
         joinpath(homedir(), "bearoff_k7_twosided"),
@@ -94,8 +113,28 @@ const TABLE = let
     ]
     dir = findfirst(d -> isdir(d) && isfile(joinpath(d, "bearoff_k7_c14.bin")), candidates)
     dir === nothing && error("k=7 bear-off table not found in: $(join(candidates, ", "))")
-    println("Loading k=7 table from $(candidates[dir]) ...")
-    BearoffTable(candidates[dir])
+    return candidates[dir]
+end
+
+function _find_onesided_dir()
+    isempty(ARGS_D["onesided_dir"]) || return ARGS_D["onesided_dir"]
+    for d in [
+        joinpath(dirname(BEAROFF_SRC), "..", "tools", "bearoff_onesided", "bearoff_n18"),
+        joinpath(homedir(), "bearoff_n18"),
+    ]
+        isdir(d) && isfile(joinpath(d, "onesided_all.bin")) && return d
+    end
+    error("n=18 one-sided table not found; pass --onesided-dir")
+end
+
+const TABLE = if TABLE_KIND == :k7
+    d = _find_k7_dir(); println("Loading k=7 table from $d ..."); BearoffTable(d)
+elseif TABLE_KIND == :onesided
+    d = _find_onesided_dir(); println("Loading n=18 one-sided table from $d ..."); BearoffOneSided.OneSidedTable(d)
+else  # combined
+    k7d = _find_k7_dir(); osd = _find_onesided_dir()
+    println("Loading COMBINED bearoff: exact k7=$k7d + onesided=$osd ...")
+    load_combined_bearoff(k7_dir=k7d, onesided_dir=osd)
 end
 
 # ── Objective + policy configuration ────────────────────────────────────
@@ -180,8 +219,8 @@ GameLoop.create_player(::TableAgent; rng=nothing) = nothing
 
 function GameLoop.select_action(agent::TableAgent, ::Nothing, env)
     bg = env.game
-    BearoffK7.is_bearoff_position(bg.p0, bg.p1) ||
-        error("TableAgent reached a non-bearoff position — starts must be mutual bearoff")
+    bearoff_covers(TABLE, bg.p0, bg.p1) ||
+        error("TableAgent reached a position outside the $(TABLE_KIND) table domain")
     best_action, _ = table_best_action(bg, agent.weights)
     return (best_action, Float32[], Int[])
 end
@@ -206,9 +245,9 @@ the money-scaled reward path via reward_scale), or `nothing` if not bearoff."""
 function make_objective_bearoff_evaluator(table, weights)
     return function(game_env)
         bg = game_env.game
-        BearoffK7.is_bearoff_position(bg.p0, bg.p1) || return nothing
+        bearoff_covers(table, bg.p0, bg.p1) || return nothing
         if BackgammonNet.is_chance_node(bg)
-            r = BearoffK7.lookup(table, bg)
+            r = bearoff_lookup(table, bg)
             mover_eq = _bearoff_objective_value(r, weights) / 3.0
             return bg.current_player == 0 ? mover_eq : -mover_eq
         end
@@ -264,7 +303,7 @@ function rollout_to_bearoff(tup, rng)
     for _ in 1:200
         g.terminated && return nothing
         if BackgammonNet.is_chance_node(g)
-            BearoffK7.is_bearoff_position(g.p0, g.p1) &&
+            bearoff_covers(TABLE, g.p0, g.p1) &&
                 return (g.p0, g.p1, g.current_player)
             BackgammonNet.sample_chance!(g, rng)
         else
@@ -450,7 +489,7 @@ function main()
     ci = 1.96 * se
 
     println("=" ^ 64)
-    println("Exact k=7 table [$(POLICY)] vs wildbg — objective=$(OBJECTIVE) " *
+    println("$(TABLE_KIND) bearoff [$(POLICY)] vs wildbg — objective=$(OBJECTIVE) " *
             "($(length(jobs)) games, $npos paired positions)")
     println("  Mean objective value:    $(round(eq, digits=4))")
     println("  Win%:                    $(round(win, digits=1))%")
