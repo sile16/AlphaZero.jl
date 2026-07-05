@@ -1714,6 +1714,18 @@ function process_eval_chunk!(chunk_data::Dict)
     # Merge per-thread results
     val_nn = reduce(vcat, thread_val_nn)
     val_opp = reduce(vcat, thread_val_opp)
+    # Robustness: keep only FINITE, PAIRED value samples before submit. A single
+    # non-finite value (e.g. wildbg returning NaN/Inf on a contact position) or any
+    # length skew otherwise breaks the server-side submit boundary check / MsgPack
+    # round-trip / cor() aggregate — which is what was 400'ing the contact eval.
+    let m = min(length(val_nn), length(val_opp))
+        keep = [i for i in 1:m if isfinite(val_nn[i]) && isfinite(val_opp[i])]
+        if length(keep) != length(val_nn) || length(keep) != length(val_opp)
+            println("[EVAL] dropped $(max(length(val_nn),length(val_opp)) - length(keep)) non-finite/unpaired value samples before submit")
+        end
+        val_nn = val_nn[keep]
+        val_opp = val_opp[keep]
+    end
     val_is_contact = fill(false, length(val_nn))
 
     t_chunk = time() - t0
