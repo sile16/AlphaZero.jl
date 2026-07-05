@@ -298,7 +298,9 @@ include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
 # a client without it would silently produce DIFFERENT training targets (game-outcome
 # fallback) than table-equipped clients. We fail-fast rather than allow that
 # divergence — there is NO remote-table fallback.
-const USE_BEAROFF = Bool(get(config, "use_bearoff", true))
+# No default — a server that doesn't send use_bearoff is a protocol mismatch and must
+# fail immediately rather than silently assuming a bearoff mode.
+const USE_BEAROFF = Bool(config["use_bearoff"])
 
 const BEAROFF_TABLE = let
     if !USE_BEAROFF
@@ -1490,6 +1492,11 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
     agents = Vector{Any}(undef, n_threads)
     wb_agents = Vector{Any}(undef, n_threads)
     value_batch_oracles = Vector{Any}(undef, n_threads)
+    # Track EVERY constructed wb, pushed BEFORE open!, so a failure inside open!
+    # (which can acquire the native handle before a later dlsym/wildbg_new throws) or
+    # inside BackendAgent() still closes it — closing an unopened/partially-opened
+    # backend is a safe no-op. wb_agents-only cleanup would miss the in-flight wb.
+    opened_wbs = Any[]
     try
         for tid in 1:n_threads
             oracles = make_eval_oracles(INFERENCE_BATCH_SIZE)
@@ -1498,14 +1505,13 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
             vo = make_eval_oracles(1)
             value_batch_oracles[tid] = vo[2]
             wb = BackgammonNet.WildbgBackend(; nets=nets_variant, lib_path=WILDBG_LIB_EVAL)
+            push!(opened_wbs, wb)
             BackgammonNet.open!(wb)
             wb_agents[tid] = BackgammonNet.BackendAgent(wb)
         end
     catch
-        for i in 1:n_threads
-            isassigned(wb_agents, i) || continue
-            wb_agents[i] === nothing && continue
-            try; close(wb_agents[i].backend); catch; end
+        for wb in opened_wbs
+            try; close(wb); catch; end
         end
         rethrow()
     end
