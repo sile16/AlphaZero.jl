@@ -40,6 +40,16 @@ const BEAROFF_MONEY_WEIGHTS = (1.0, 2.0, -1.0, -2.0)
 """Generic bear-off lookup — dispatches on the table type. k=7 method."""
 bearoff_lookup(table::BearoffK7.BearoffTable, game) = BearoffK7.lookup(table, game)
 
+"""
+    bearoff_covers(table, p0, p1) -> Bool
+
+Is this position inside `table`'s domain? (the "is_in_table" check). Callers gate
+on this before `bearoff_lookup`. Generic over table type; k=7 method here, the
+one-sided + combined methods are added in `bearoff_combined.jl`.
+"""
+bearoff_covers(::BearoffK7.BearoffTable, p0::UInt128, p1::UInt128) =
+    BearoffK7.is_bearoff_position(p0, p1)
+
 """Money equity of a lookup result. Duck-typed on `.pW/.pWG/.pLG`; bit-identical
 to both back-ends' `compute_equity` = (2·pW−1) + (pWG−pLG)."""
 @inline bearoff_equity(r) = (2.0f0 * r.pW - 1.0f0) + (r.pWG - r.pLG)
