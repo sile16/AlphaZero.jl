@@ -27,6 +27,23 @@
 """Money weights: reproduce `compute_equity` and raw `reward` exactly."""
 const BEAROFF_MONEY_WEIGHTS = (1.0, 2.0, -1.0, -2.0)
 
+# ── Unified bear-off table interface ────────────────────────────────────
+# Everything below is table-AGNOSTIC: it only needs `bearoff_lookup(table, game)`
+# to return a result with `.pW/.pWG/.pLG` fields. Both back-ends implement this:
+#   - k=7 two-sided   → BearoffK7.lookup       (BearoffResult)
+#   - n=18 one-sided  → BearoffOneSided.lookup (OneSidedResult)
+# so the turn-aware / move-enumeration / objective machinery is shared with zero
+# duplication. The k=7 method is defined here (BearoffK7 is always loaded first);
+# a consumer that also loads BearoffOneSided adds the one-sided method:
+#     bearoff_lookup(t::BearoffOneSided.OneSidedTable, game) = BearoffOneSided.lookup(t, game)
+
+"""Generic bear-off lookup — dispatches on the table type. k=7 method."""
+bearoff_lookup(table::BearoffK7.BearoffTable, game) = BearoffK7.lookup(table, game)
+
+"""Money equity of a lookup result. Duck-typed on `.pW/.pWG/.pLG`; bit-identical
+to both back-ends' `compute_equity` = (2·pW−1) + (pWG−pLG)."""
+@inline bearoff_equity(r) = (2.0f0 * r.pW - 1.0f0) + (r.pWG - r.pLG)
+
 """
     bearoff_value_to_nn_scale(v_points, reward_scale) -> Float64
 
@@ -47,7 +64,7 @@ caller (evaluator) concern, applied here explicitly and once.
 """Objective value of a `BearoffResult` (mover-perspective) in points.
 For money weights this equals `compute_equity(r)` (bit-exact fast path)."""
 @inline function _bearoff_objective_value(r, weights)::Float64
-    weights == BEAROFF_MONEY_WEIGHTS && return Float64(BearoffK7.compute_equity(r))
+    weights == BEAROFF_MONEY_WEIGHTS && return Float64(bearoff_equity(r))
     pW = Float64(r.pW); pWG = Float64(r.pWG); pLG = Float64(r.pLG)
     p_plain_win = pW - pWG            # win, not a gammon
     p_plain_loss = (1.0 - pW) - pLG   # loss, not a gammon
@@ -92,7 +109,7 @@ function bearoff_turn_value(table, game, mover::Integer; weights=BEAROFF_MONEY_W
         mover_r = mover == 0 ? white_r : -white_r
         return _bearoff_terminal_value(mover_r, weights)
     elseif BackgammonNet.is_chance_node(game)
-        r = BearoffK7.lookup(table, game)
+        r = bearoff_lookup(table, game)
         v = _bearoff_objective_value(r, weights)
         # lookup() is from game.current_player's perspective
         return Int(game.current_player) == Int(mover) ? v : -v
@@ -135,8 +152,8 @@ function bearoff_turn_value_equity(table, game, mover::Integer)
         end
         return (mval, eq)
     elseif BackgammonNet.is_chance_node(game)
-        r = BearoffK7.lookup(table, game)
-        v = Float64(BearoffK7.compute_equity(r))
+        r = bearoff_lookup(table, game)
+        v = Float64(bearoff_equity(r))
         eq = Float32[r.pW, r.pWG, 0.0f0, r.pLG, 0.0f0]
         if Int(game.current_player) == Int(mover)
             return (v, eq)
