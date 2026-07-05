@@ -292,6 +292,13 @@ end
 include(joinpath(BEAROFF_SRC_DIR, "bearoff_k7.jl"))
 using .BearoffK7
 include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
+# One-sided (n=18 race) + combined position-dispatch. Modules always present in the
+# repo; the combined TABLE is loaded below only if its data dir exists. This lets the
+# self-play/eval MCTS use the EXACT race frontier (combined = exact k7 where it applies,
+# else n=18 one-sided race), not just deep k7 bearoff.
+include(joinpath(BEAROFF_SRC_DIR, "bearoff_onesided.jl"))
+using .BearoffOneSided
+include(joinpath(@__DIR__, "bearoff_combined.jl"))
 
 # F1/F3: bearoff is a CLUSTER-WIDE decision made by the server (config["use_bearoff"],
 # derived from its --no-bearoff). When ON, EVERY client must have the LOCAL k=7 table:
@@ -328,11 +335,33 @@ const BEAROFF_TABLE = let
             "table-equipped clients.\n  Fix: copy bearoff_k7_twosided/ to ~/bearoff_k7_twosided/, " *
             "or run the server with --no-bearoff to disable bearoff for the whole cluster.")
         println("Loading k=7 bear-off table from $table_dir ...")
-        t = BearoffTable(table_dir)
-        println("  c14: $(round(length(t.c14_data)/1e9, digits=1)) GB")
-        println("  c15: $(round(length(t.c15_data)/1e9, digits=1)) GB")
-        flush(stdout)
-        t
+        k7 = BearoffTable(table_dir)
+        println("  c14: $(round(length(k7.c14_data)/1e9, digits=1)) GB")
+        println("  c15: $(round(length(k7.c15_data)/1e9, digits=1)) GB")
+        # Optional n=18 one-sided race table — extends EXACT coverage to disengaged
+        # races ≤18 pips/side. Present → COMBINED (exact race frontier for the contact
+        # curriculum); absent → k7-only (deep bearoff exact; >7pt races → NN).
+        os_candidates = [
+            joinpath(BEAROFF_SRC_DIR, "..", "tools", "bearoff_onesided", "bearoff_n18"),
+            joinpath(homedir(), "bearoff_n18"),
+            "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_n18",
+        ]
+        os_dir = nothing
+        for d in os_candidates
+            if isdir(d) && isfile(joinpath(d, "onesided_all.bin"))
+                os_dir = d; break
+            end
+        end
+        if os_dir !== nothing
+            os = BearoffOneSided.OneSidedTable(os_dir)
+            println("Loaded n=18 one-sided race table from $os_dir → COMBINED bearoff (exact race frontier)")
+            flush(stdout)
+            CombinedBearoff(k7, os)
+        else
+            println("No n=18 one-sided table found — k7-only bearoff (>7pt races handled by NN)")
+            flush(stdout)
+            k7
+        end
     end
 end
 
@@ -361,14 +390,12 @@ Maps to the NN's 5-head joint convention:
 """
 function bearoff_table_equity(game::BackgammonNet.BackgammonGame)
     BEAROFF_TABLE === nothing && return nothing
-    # Domain self-guard: BearoffK7.lookup returns an OUT-OF-DOMAIN (garbage) value if
-    # the position is not in the k=7 home-board range. Callers already gate, but this
-    # helper self-guards so it is safe to reuse (its previous trust-the-caller contract
-    # was a footgun for consolidation).
-    BearoffK7.is_bearoff_position(game.p0, game.p1) || return nothing
-    r = BearoffK7.lookup(BEAROFF_TABLE, game)
+    # Domain self-guard (generic: k7 deep-bearoff OR combined n=18 race ≤18pt).
+    # bearoff_lookup returns an OUT-OF-DOMAIN value if the position is uncovered.
+    bearoff_covers(BEAROFF_TABLE, game.p0, game.p1) || return nothing
+    r = bearoff_lookup(BEAROFF_TABLE, game)
     eq = Float32[r.pW, r.pWG, 0.0f0, r.pLG, 0.0f0]
-    value = BearoffK7.compute_equity(r)
+    value = bearoff_equity(r)
     return (value=value, equity=eq)
 end
 
@@ -388,14 +415,14 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
     if table === nothing
         return nothing
     end
-    if !BearoffK7.is_bearoff_position(game.p0, game.p1)
+    if !bearoff_covers(table, game.p0, game.p1)
         return nothing
     end
     if BackgammonNet.is_chance_node(game)
         # Pre-dice: table value is exact. lookup() returns mover-relative;
         # convert to white-relative for consistency with the function's contract.
-        r = BearoffK7.lookup(table, game)
-        mover_val = BearoffK7.compute_equity(r)
+        r = bearoff_lookup(table, game)
+        mover_val = bearoff_equity(r)
         mover_eq = Float32[r.pW, r.pWG, 0.0f0, r.pLG, 0.0f0]
         if game.current_player == 0
             return (value=mover_val, equity=mover_eq)
@@ -467,15 +494,17 @@ function make_bearoff_evaluator(table)
         table === nothing && return nothing
 
         bg = game_env.game
-        if !BearoffK7.is_bearoff_position(bg.p0, bg.p1)
+        # Generic domain gate: k7 deep-bearoff OR (combined) n=18 race ≤18 pips.
+        # Uncovered positions (contact, >18pt races) return nothing → NN handles them.
+        if !bearoff_covers(table, bg.p0, bg.p1)
             return nothing
         end
 
         if BackgammonNet.is_chance_node(bg)
-            # Pre-dice: table value is exact (mover-relative → white-relative),
+            # Pre-dice: exact table value (mover-relative → white-relative),
             # normalized to the NN value scale [-1,1] via reward_scale.
-            r = BearoffK7.lookup(table, bg)
-            mover_equity = bearoff_value_to_nn_scale(BearoffK7.compute_equity(r), rs)
+            r = bearoff_lookup(table, bg)
+            mover_equity = bearoff_value_to_nn_scale(bearoff_equity(r), rs)
             return bg.current_player == 0 ? mover_equity : -mover_equity
         end
 
@@ -764,7 +793,7 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
 
         is_bearoff_pos = false
         if bearoff_equity === nothing && state isa BackgammonNet.BackgammonGame &&
-                BearoffK7.is_bearoff_position(state.p0, state.p1)
+                BEAROFF_TABLE !== nothing && bearoff_covers(BEAROFF_TABLE, state.p0, state.p1)
             # Use post-dice move enumeration for exact Q(board, dice) values
             # and the matching five-head joint target for this specific
             # state. Override both together so `value` and `equity` stay aligned.
@@ -915,7 +944,7 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         while !GI.game_terminated(env)
             if GI.is_chance_node(env)
                 bg = env.game
-                if BearoffK7.is_bearoff_position(bg.p0, bg.p1)
+                if BEAROFF_TABLE !== nothing && bearoff_covers(BEAROFF_TABLE, bg.p0, bg.p1)
                     if first_bearoff_bo === nothing
                         first_bearoff_bo = bearoff_table_equity(bg)
                         first_bearoff_wp = (bg.current_player == 0)
@@ -1044,7 +1073,7 @@ function worker_play_games_gpu(worker_id::Int, games_claimed::Threads.Atomic{Int
         first_bearoff_bo = Ref{Any}(nothing)
         first_bearoff_wp = Ref{Bool}(true)
         function bearoff_lookup_with_capture(game)
-            if !BearoffK7.is_bearoff_position(game.p0, game.p1)
+            if BEAROFF_TABLE === nothing || !bearoff_covers(BEAROFF_TABLE, game.p0, game.p1)
                 return nothing
             end
             bo = bearoff_table_equity(game)
