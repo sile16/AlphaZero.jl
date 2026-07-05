@@ -574,11 +574,20 @@ function find_or_download(filename::String; required::Bool=true)
 end
 
 const START_POSITIONS = let
-    path = find_or_download(START_POSITIONS_FILE; required=true)
-    tuples = Serialization.deserialize(path)
-    println("Loaded $(length(tuples)) starting positions from $(basename(path))")
-    flush(stdout)
-    tuples
+    # Empty config = default opening (server contract: "Empty = use default opening").
+    # init_game() falls back to GI.init(gspec) — the SHORT_GAME contact opening — when
+    # START_POSITIONS is nothing. This is the correct start for contact self-play.
+    if isempty(START_POSITIONS_FILE)
+        println("No start-positions file configured — using the default SHORT_GAME opening.")
+        flush(stdout)
+        nothing
+    else
+        path = find_or_download(START_POSITIONS_FILE; required=true)
+        tuples = Serialization.deserialize(path)
+        println("Loaded $(length(tuples)) starting positions from $(basename(path))")
+        flush(stdout)
+        tuples
+    end
 end
 
 """Initialize a game environment from configured starting positions or default opening."""
