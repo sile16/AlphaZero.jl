@@ -1612,7 +1612,7 @@ function submit_eval_results(chunk_id::Int, rewards, val_nn, val_opp, val_is_con
                 end
                 return true
             else
-                println("[EVAL] Submit failed (attempt $attempt): HTTP $(resp.status)")
+                println("[EVAL] Submit failed (attempt $attempt): HTTP $(resp.status) — $(String(resp.body))")
             end
         catch e
             println("[EVAL] Submit error (attempt $attempt): $e")
