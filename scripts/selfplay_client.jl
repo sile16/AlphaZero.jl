@@ -126,6 +126,14 @@ import Flux
 import BackgammonNet
 import JSON3
 const CPU_INFERENCE_BACKEND = AlphaZero.BackgammonInference.resolve_cpu_backend(ARGS["inference_backend"])
+# Fail-fast: the :flux CPU oracle reads the MUTABLE network object that the
+# weight-sync thread mutates in place (FluxLib.load_weights!), a live data race /
+# torn-read hazard under threading. The :fast path (FastWeights + atomic Ref-swap)
+# is both correct and faster on every platform, so we refuse to run :flux here
+# rather than let a subtle race corrupt self-play silently.
+CPU_INFERENCE_BACKEND == :flux && error(
+    "--inference-backend=flux is unsafe for the self-play client (mutable-weight " *
+    "data race with the sync thread). Use :fast (default) or :auto.")
 
 println("Server: $SERVER_URL")
 println("Workers: $NUM_WORKERS CPU" * (GPU_WORKERS > 0 ? " + $GPU_WORKERS GPU" : ""))
@@ -323,6 +331,17 @@ const BEAROFF_TABLE = let
                   "  Fix: copy bearoff_k7_twosided/ to ~/bearoff_k7_twosided/ or start bearoff server")
         end
     end
+end
+
+# Fail-fast: bearoff TRUNCATION and hard targets read the LOCAL table's exact value
+# (first_bearoff_bo.value). A remote-only config leaves BEAROFF_TABLE=nothing, which
+# would make truncation dereference `nothing.value` and crash the worker. We never
+# silently run truncation without exact local values — require the table or turn
+# truncation off.
+if BEAROFF_TRUNCATION && BEAROFF_TABLE === nothing
+    error("Bearoff truncation is enabled but no LOCAL bearoff table is loaded " *
+          "(BEAROFF_TABLE is nothing — remote bearoff cannot supply truncation/hard-target " *
+          "values). Install a local k=7 table or disable bearoff truncation.")
 end
 
 # Remote bearoff lookup helper (used when BEAROFF_TABLE is nothing)
@@ -1421,26 +1440,38 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
     println("[EVAL] Setting up eval session for iter $eval_iter (weights v$weights_version)")
     flush(stdout)
 
-    # Create fresh networks and download eval weights pinned to the exact version
+    # A3: close the PREVIOUS session's wildbg backends before reallocating — each
+    # WildbgBackend owns a native handle; not closing leaks one per thread on every
+    # eval iteration (setup re-runs when iter/version changes).
+    if !isempty(EVAL_SESSION.wb_agents)
+        for a in EVAL_SESSION.wb_agents
+            a === nothing && continue
+            try
+                close(a.backend)
+            catch e
+                println("[EVAL] warning: failed to close old wildbg backend: $e")
+            end
+        end
+    end
+
+    # A1: download eval weights PINNED + VERSION-VERIFIED. Fail-fast — we must NOT
+    # fall through to the self-play weight copy, or a chunk stamped weights_version=N
+    # would submit metrics computed from DIFFERENT weights (silent mis-attribution).
+    # download_weights(expected_version=...) throws on a version mismatch; a nothing
+    # result (download failed / version not yet published) is fatal here too. The
+    # enclosing chunk try/catch then skips the chunk (re-leased later) rather than
+    # crediting the wrong iteration.
     eval_contact_net = Network.copy(contact_network; on_gpu=false, test_mode=true)
     eval_race_net = Network.copy(race_network; on_gpu=false, test_mode=true)
-    try
-        result_c = download_weights(client, :contact; pinned_version=weights_version)
-        if result_c !== nothing
-            FluxLib.load_weights!(eval_contact_net, result_c[2])
-            println("[EVAL] Downloaded contact weights v$weights_version")
-        end
-        result_r = download_weights(client, :race; pinned_version=weights_version)
-        if result_r !== nothing
-            FluxLib.load_weights!(eval_race_net, result_r[2])
-            println("[EVAL] Downloaded race weights v$weights_version")
-        end
-        if result_c === nothing && result_r === nothing
-            println("[EVAL] WARNING: No weights v$weights_version available — using self-play weights copy")
-        end
-    catch e
-        println("[EVAL] Weight download error (v$weights_version): $e")
+    result_c = download_weights(client, :contact; pinned_version=weights_version, expected_version=weights_version)
+    result_r = download_weights(client, :race; pinned_version=weights_version, expected_version=weights_version)
+    if result_c === nothing || result_r === nothing
+        error("[EVAL] pinned weights v$weights_version unavailable (contact loaded=$(result_c !== nothing), " *
+              "race loaded=$(result_r !== nothing)); refusing to eval with mismatched/self-play weights (fail-fast)")
     end
+    FluxLib.load_weights!(eval_contact_net, result_c[2])
+    FluxLib.load_weights!(eval_race_net, result_r[2])
+    println("[EVAL] Loaded pinned+verified contact+race weights v$weights_version")
 
     # Create FastWeights for eval (immutable after creation — thread-safe to read)
     eval_contact_fw = CPU_INFERENCE_BACKEND == :fast ?
@@ -1601,30 +1632,35 @@ function process_eval_chunk!(chunk_data::Dict)
         end
     end
 
-    # Parallel eval — each thread uses its own resources (nothing shared).
-    # `:static` pins one task per thread for the whole loop, so threadid() is
-    # STABLE within the body (no task migration). This makes the threadid()-keyed
-    # resource access safe even if an oracle ever yields (e.g. a GPU-server
-    # oracle) — the resource stays exclusively owned by this thread's loop task.
-    # The default :dynamic scheduler gives no such guarantee.
+    # Parallel eval via an explicit WORKER POOL. Spawn min(n_threads, n_games)
+    # tasks; each OWNS a fixed resource slot `wid` for its whole lifetime and pulls
+    # jobs from a shared atomic counter. This removes all reliance on
+    # Threads.threadid() (brittle under task migration / Julia's interactive pool):
+    # a task's slot is fixed at spawn, so agents[wid]/wb_agents[wid]/oracle[wid] and
+    # the thread_val_* accumulators are exclusively owned no matter which OS thread
+    # runs the task, and each rewards[job] is written exactly once.
+    n_workers = min(n_threads, max(n_games, 1))
+    next_job = Threads.Atomic{Int}(0)
     try
-        Threads.@threads :static for job in 1:n_games
-            wid = Threads.threadid()
-            if wid > n_threads
-                error("Eval resource slot missing for thread id $wid (n_threads=$n_threads)")
-            end
-            pos_idx = pos_start + job - 1
-            if pos_idx > length(EVAL_POSITIONS)
-                rewards[job] = 0.0
-            else
-                result = eval_game_from_position(
-                    agents[wid], wb_agents[wid],
-                    EVAL_POSITIONS[pos_idx], value_batch_oracles[wid];
-                    seed=chunk_id * 10000 + job, az_is_white=az_is_white)
-                rewards[job] = result.reward
-                for s in result.value_samples
-                    push!(thread_val_nn[wid], s.nn_val)
-                    push!(thread_val_opp[wid], s.wb_val)
+        @sync for wid in 1:n_workers
+            Threads.@spawn begin
+                agent = agents[wid]; wb = wb_agents[wid]; vo = value_batch_oracles[wid]
+                while true
+                    job = Threads.atomic_add!(next_job, 1) + 1
+                    job > n_games && break
+                    pos_idx = pos_start + job - 1
+                    if pos_idx > length(EVAL_POSITIONS)
+                        rewards[job] = 0.0
+                    else
+                        result = eval_game_from_position(
+                            agent, wb, EVAL_POSITIONS[pos_idx], vo;
+                            seed=chunk_id * 10000 + job, az_is_white=az_is_white)
+                        rewards[job] = result.reward
+                        for s in result.value_samples
+                            push!(thread_val_nn[wid], s.nn_val)
+                            push!(thread_val_opp[wid], s.wb_val)
+                        end
+                    end
                 end
             end
         end
