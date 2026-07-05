@@ -361,6 +361,11 @@ Maps to the NN's 5-head joint convention:
 """
 function bearoff_table_equity(game::BackgammonNet.BackgammonGame)
     BEAROFF_TABLE === nothing && return nothing
+    # Domain self-guard: BearoffK7.lookup returns an OUT-OF-DOMAIN (garbage) value if
+    # the position is not in the k=7 home-board range. Callers already gate, but this
+    # helper self-guards so it is safe to reuse (its previous trust-the-caller contract
+    # was a footgun for consolidation).
+    BearoffK7.is_bearoff_position(game.p0, game.p1) || return nothing
     r = BearoffK7.lookup(BEAROFF_TABLE, game)
     eq = Float32[r.pW, r.pWG, 0.0f0, r.pLG, 0.0f0]
     value = BearoffK7.compute_equity(r)
@@ -682,18 +687,6 @@ println("MCTS budget mode: $MCTS_BUDGET_MODE" *
         (MCTS_BUDGET_MODE == :constant ? " ($MCTS_ITERS sims)" :
          MCTS_BUDGET_MODE == :progressive ? " ($PROGRESSIVE_SIM_MIN->$PROGRESSIVE_SIM_MAX sims over iterations)" :
          " ($TURN_SIM_MIN->$TURN_SIM_TARGET sims over turns/iterations)"))
-
-function _sample_chance(rng, outcomes)
-    r = rand(rng)
-    acc = 0.0
-    @inbounds for i in eachindex(outcomes)
-        acc += outcomes[i][2]
-        if r <= acc
-            return i
-        end
-    end
-    return length(outcomes)
-end
 
 """
 Convert a recorded rollout into per-position training samples.
