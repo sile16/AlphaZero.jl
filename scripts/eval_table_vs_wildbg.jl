@@ -31,6 +31,10 @@ function parse_cli()
             arg_type = String
             default = ""
             help = "Path to wildbg shared library (auto-detected if empty)"
+        "--wildbg-nets"
+            arg_type = String
+            default = "small"
+            help = "wildbg net size: small | large (must match the shared library build; race eval standard is large)"
         "--positions-file"
             arg_type = String
             default = ""
@@ -442,8 +446,10 @@ function main()
         isempty(lib) && error("wildbg library not found; pass --wildbg-lib")
     end
     println("wildbg: $lib")
+    wnets = Symbol(ARGS_D["wildbg_nets"])
+    println("wildbg nets: $wnets")
     backends = [begin
-        wb = BackgammonNet.WildbgBackend(lib_path=lib)
+        wb = BackgammonNet.WildbgBackend(lib_path=lib, nets=wnets)
         BackgammonNet.open!(wb)
         wb
     end for _ in 1:nw]
