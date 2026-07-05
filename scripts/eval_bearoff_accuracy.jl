@@ -313,25 +313,36 @@ end
 
 function nn_greedy_action(state, value_oracle)
     actions = BackgammonNet.legal_actions(state)
+    mover = Int(state.current_player)
+    # A4: terminal children (immediate win/loss) scored from exact game.reward, not
+    # the NN — scoring decisive moves with the value net corrupts the metric.
+    values = Vector{Float64}(undef, length(actions))
     succs = BackgammonNet.BackgammonGame[]
-    movers = Int[]
-    for action in actions
+    succ_idx = Int[]
+    for (i, action) in enumerate(actions)
         g = BackgammonNet.clone(state)
         BackgammonNet.apply_action!(g, action)
-        push!(succs, g)
-        push!(movers, Int(state.current_player))
+        if g.terminated
+            white_r = Float64(g.reward)
+            mover_r = mover == 0 ? white_r : -white_r
+            values[i] = normalized_points(mover_r)
+        else
+            push!(succs, g); push!(succ_idx, i)
+        end
     end
-    evals = value_oracle(succs)
+    if !isempty(succs)
+        evals = value_oracle(succs)
+        for (k, i) in enumerate(succ_idx)
+            v = Float64(evals[k][2])
+            Int(succs[k].current_player) != mover && (v = -v)
+            values[i] = v
+        end
+    end
     best_action = actions[1]
     best_value = -Inf
     for (i, action) in enumerate(actions)
-        g2 = succs[i]
-        v = Float64(evals[i][2])
-        if Int(g2.current_player) != movers[i]
-            v = -v
-        end
-        if v > best_value
-            best_value = v
+        if values[i] > best_value
+            best_value = values[i]
             best_action = action
         end
     end

@@ -160,6 +160,18 @@ haskey(OBJ_WEIGHTS_MAP, OBJECTIVE) || error("Unknown --objective=$(OBJECTIVE); u
 POLICY in (:table, :mcts) || error("Unknown --policy=$(POLICY); use table|mcts")
 const OBJ_WEIGHTS = OBJ_WEIGHTS_MAP[OBJECTIVE]
 const MONEY_WEIGHTS = OBJ_WEIGHTS_MAP[:money]
+
+# A5: BatchedMCTS terminal edge rewards are MONEY-scaled (src/batched_mcts.jl), but
+# make_objective_bearoff_evaluator returns OBJECTIVE-weighted leaf values. Under a
+# non-money objective the two are mixed and MCTS can mis-rank terminal actions. The
+# pure --policy=table path is unaffected (it scores terminals via reward under the
+# objective). Fail fast rather than emit a subtly-wrong MCTS number.
+if POLICY == :mcts && OBJECTIVE != :money
+    error("--policy=mcts is only valid with --objective=money: BatchedMCTS terminal " *
+          "rewards are money-scaled and would mismatch the objective-weighted evaluator " *
+          "under objective=$(OBJECTIVE). Use --policy=table for non-money objectives.")
+end
+
 const GSPEC = GameSpec()
 
 """Score a raw table-relative game reward (±1/±2) in objective units."""

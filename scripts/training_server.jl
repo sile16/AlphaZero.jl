@@ -380,6 +380,11 @@ else
     error("Unknown game: $GAME_NAME")
 end
 const gspec = GameSpec()
+# C-scale: single source of the raw→[-1,1] normalization (= GI.reward_scale = 3.0 for
+# backgammon). Buffer/targets are RAW [-reward_scale, reward_scale]; network output +
+# MCTS live in [-1,1]. Deriving every /3 from reward_scale(gspec) stops the constant
+# from drifting if the game's reward scale ever changes.
+const REWARD_SCALE = Float32(GI.reward_scale(gspec))
 const NUM_ACTIONS = GI.num_actions(gspec)
 const _state_dim = let env = GI.init(gspec); length(vec(GI.vectorize_state(gspec, GI.current_state(env)))); end
 
@@ -557,7 +562,7 @@ function _eval_forward_network(net, states)
     return results
 end
 
-@inline normalized_points_server(v::Real) = Float64(v) / 3.0
+@inline normalized_points_server(v::Real) = Float64(v) / Float64(REWARD_SCALE)
 
 function start_game_from_tuple_server(position_data::Tuple{UInt128, UInt128, Int8}, seed::Int)
     p0, p1, cp = position_data
@@ -643,25 +648,40 @@ end
 
 function nn_greedy_bearoff_action(state, value_oracle)
     actions = BackgammonNet.legal_actions(state)
+    mover = Int(state.current_player)
+    # A4: score TERMINAL children (a move that bears off the last checker = an
+    # immediate, known win/loss) from the exact game.reward — NOT the NN. Passing
+    # decisive moves through the value network corrupts the greedy pick and the
+    # nn_top1/nn_regret metric on exactly the moves that matter most. Only
+    # non-terminal children go to the NN.
+    values = Vector{Float64}(undef, length(actions))
     succs = BackgammonNet.BackgammonGame[]
-    movers = Int[]
-    for action in actions
+    succ_idx = Int[]
+    for (i, action) in enumerate(actions)
         g = BackgammonNet.clone(state)
         BackgammonNet.apply_action!(g, action)
-        push!(succs, g)
-        push!(movers, Int(state.current_player))
+        if g.terminated
+            white_r = Float64(g.reward)               # reward is white-relative
+            mover_r = mover == 0 ? white_r : -white_r # carries gammon multiplier
+            values[i] = normalized_points_server(mover_r)
+        else
+            push!(succs, g); push!(succ_idx, i)
+        end
     end
-    evals = value_oracle(succs)
+    if !isempty(succs)
+        evals = value_oracle(succs)
+        for (k, i) in enumerate(succ_idx)
+            v = Float64(evals[k][2])
+            # value_oracle is from the successor's current_player perspective.
+            Int(succs[k].current_player) != mover && (v = -v)
+            values[i] = v
+        end
+    end
     best_action = actions[1]
     best_value = -Inf
     for (i, action) in enumerate(actions)
-        g2 = succs[i]
-        v = Float64(evals[i][2])
-        if Int(g2.current_player) != movers[i]
-            v = -v
-        end
-        if v > best_value
-            best_value = v
+        if values[i] > best_value
+            best_value = values[i]
             best_action = action
         end
     end
@@ -1181,8 +1201,8 @@ function compute_td_errors(nn, batch_data)
         equity = FluxLib.compute_equity(
             Flux.sigmoid.(L̂_win), Flux.sigmoid.(L̂_gw), Flux.sigmoid.(L̂_bgw),
             Flux.sigmoid.(L̂_gl), Flux.sigmoid.(L̂_bgl))
-        V̂_combined = equity ./ 3f0
-        V_normalized = V ./ 3f0  # Buffer V is in [-3,3], normalize to match network output
+        V̂_combined = equity ./ REWARD_SCALE
+        V_normalized = V ./ REWARD_SCALE  # Buffer V is RAW [-reward_scale, reward_scale] → [-1,1]
         td = abs.(Flux.cpu(V̂_combined) .- Flux.cpu(V_normalized))
     else
         _, V̂, _ = Network.forward_normalized(nn, X, A)
@@ -1743,7 +1763,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
             # Table equity from stored targets (joint formula, normalized)
             table_equity = Float32[
                 ((2*bo_eq_targets[1,i] - 1) + (bo_eq_targets[2,i] - bo_eq_targets[4,i]) +
-                 (bo_eq_targets[3,i] - bo_eq_targets[5,i])) / 3.0f0
+                 (bo_eq_targets[3,i] - bo_eq_targets[5,i])) / REWARD_SCALE
                 for i in 1:n_sample]
 
             # Compute MSE and correlation
