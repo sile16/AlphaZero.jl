@@ -241,6 +241,11 @@ function parse_args()
             arg_type = String
             default = ""
 
+        # Bearoff table (fail-fast: required unless --no-bearoff)
+        "--no-bearoff"
+            help = "Explicitly run WITHOUT the exact bearoff table — disables bearoff fixed-eval, promotion gate, and exact bearoff targets. WITHOUT this flag the server REQUIRES a local k=7 table and FAILS FAST if none is found, rather than silently running as if bearoff were active (which would corrupt result interpretation)."
+            action = :store_true
+
         # Fixed bearoff eval
         "--bearoff-eval-interval"
             help = "Run fixed-set bearoff eval every N iterations (0 = disabled)"
@@ -462,7 +467,19 @@ function find_bearoff_dir_server()
     error("Bearoff k7 directory not found. Checked: $(join(candidates, ", "))")
 end
 
-const BEAROFF_DIR = find_bearoff_dir_server()
+# Fail-fast: the bearoff table is REQUIRED unless --no-bearoff is explicitly set.
+# find_bearoff_dir_server() errors if no local table is found — we never silently
+# fall back, so results are never misread as bearoff-anchored when they are not.
+const BEAROFF_DIR = if ARGS["no_bearoff"]
+    @warn "════════════════════════════════════════════════════════════════════\n" *
+          "  --no-bearoff SET: running WITHOUT the exact bearoff table.\n" *
+          "  Bearoff fixed-eval, promotion gate, and exact bearoff targets are\n" *
+          "  DISABLED. Do NOT interpret results as bearoff-anchored.\n" *
+          "════════════════════════════════════════════════════════════════════"
+    ""
+else
+    find_bearoff_dir_server()  # errors (fail-fast) if no local k=7 table is present
+end
 const BEAROFF_FIXED_EVAL_ENABLED =
     ARGS["training_mode"] == "race" &&
     BEAROFF_EVAL_INTERVAL > 0 &&
