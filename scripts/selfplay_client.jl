@@ -293,43 +293,44 @@ include(joinpath(BEAROFF_SRC_DIR, "bearoff_k7.jl"))
 using .BearoffK7
 include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
 
-const BEAROFF_SERVER_URL = "http://192.168.20.155:8787"
+# F1/F3: bearoff is a CLUSTER-WIDE decision made by the server (config["use_bearoff"],
+# derived from its --no-bearoff). When ON, EVERY client must have the LOCAL k=7 table:
+# a client without it would silently produce DIFFERENT training targets (game-outcome
+# fallback) than table-equipped clients. We fail-fast rather than allow that
+# divergence — there is NO remote-table fallback.
+const USE_BEAROFF = Bool(get(config, "use_bearoff", true))
 
 const BEAROFF_TABLE = let
-    # Prefer local copy (mmap over NFS can cause bus errors on large files)
-    candidates = [
-        joinpath(BEAROFF_SRC_DIR, "..", "tools", "bearoff_twosided", "bearoff_k7_twosided"),
-        joinpath(homedir(), "bearoff_k7_twosided"),
-        "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
-    ]
-    table_dir = nothing
-    for dir in candidates
-        if isdir(dir) && isfile(joinpath(dir, "bearoff_k7_c14.bin"))
-            table_dir = dir
-            break
+    if !USE_BEAROFF
+        println("Bearoff DISABLED by server (use_bearoff=false) — no bearoff eval or exact targets.")
+        flush(stdout)
+        nothing
+    else
+        # Prefer local copy (mmap over NFS can cause bus errors on large files)
+        candidates = [
+            joinpath(BEAROFF_SRC_DIR, "..", "tools", "bearoff_twosided", "bearoff_k7_twosided"),
+            joinpath(homedir(), "bearoff_k7_twosided"),
+            "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
+        ]
+        table_dir = nothing
+        for dir in candidates
+            if isdir(dir) && isfile(joinpath(dir, "bearoff_k7_c14.bin"))
+                table_dir = dir
+                break
+            end
         end
-    end
-    if table_dir !== nothing
+        table_dir === nothing && error(
+            "Bearoff is ENABLED cluster-wide (server use_bearoff=true) but NO local k=7 table " *
+            "was found.\n  Searched: $(join(candidates, ", "))\n" *
+            "  Fail-fast: a client without the table would produce different training targets than " *
+            "table-equipped clients.\n  Fix: copy bearoff_k7_twosided/ to ~/bearoff_k7_twosided/, " *
+            "or run the server with --no-bearoff to disable bearoff for the whole cluster.")
         println("Loading k=7 bear-off table from $table_dir ...")
         t = BearoffTable(table_dir)
         println("  c14: $(round(length(t.c14_data)/1e9, digits=1)) GB")
         println("  c15: $(round(length(t.c15_data)/1e9, digits=1)) GB")
         flush(stdout)
         t
-    else
-        # No local table — require remote bearoff server
-        try
-            resp = HTTP.get("$BEAROFF_SERVER_URL/bearoff/health"; connect_timeout=3, readtimeout=5, status_exception=false)
-            resp.status == 200 || error("Remote bearoff server returned $(resp.status)")
-            println("Using remote bearoff server at $BEAROFF_SERVER_URL (no local table)")
-            flush(stdout)
-            nothing  # Table is nothing; MCTS skips bearoff eval, training targets use game outcome
-        catch e
-            error("Bear-off unavailable. No local k=7 table and remote server unreachable.\n" *
-                  "  Searched: $(join(candidates, ", "))\n" *
-                  "  Remote: $BEAROFF_SERVER_URL ($e)\n" *
-                  "  Fix: copy bearoff_k7_twosided/ to ~/bearoff_k7_twosided/ or start bearoff server")
-        end
     end
 end
 
@@ -342,20 +343,6 @@ if BEAROFF_TRUNCATION && BEAROFF_TABLE === nothing
     error("Bearoff truncation is enabled but no LOCAL bearoff table is loaded " *
           "(BEAROFF_TABLE is nothing — remote bearoff cannot supply truncation/hard-target " *
           "values). Install a local k=7 table or disable bearoff truncation.")
-end
-
-# Remote bearoff lookup helper (used when BEAROFF_TABLE is nothing)
-function _remote_bearoff_lookup(p0::UInt128, p1::UInt128, player::Int)
-    body = JSON3.write(Dict("positions" => [
-        Dict("p0" => string(p0, base=16), "p1" => string(p1, base=16), "player" => player)
-    ]))
-    resp = HTTP.post("$BEAROFF_SERVER_URL/bearoff/lookup",
-        ["Content-Type" => "application/json"], body;
-        connect_timeout=5, readtimeout=10)
-    data = JSON3.read(String(resp.body))
-    r = data["results"][1]
-    return (pW=Float32(r["pW"]), pWG=Float32(r["pWG"]), pLG=Float32(r["pLG"]),
-            equity=Float32(r["equity"]), is_bearoff=Bool(r["is_bearoff"]))
 end
 
 """
@@ -1440,19 +1427,11 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
     println("[EVAL] Setting up eval session for iter $eval_iter (weights v$weights_version)")
     flush(stdout)
 
-    # A3: close the PREVIOUS session's wildbg backends before reallocating — each
-    # WildbgBackend owns a native handle; not closing leaks one per thread on every
-    # eval iteration (setup re-runs when iter/version changes).
-    if !isempty(EVAL_SESSION.wb_agents)
-        for a in EVAL_SESSION.wb_agents
-            a === nothing && continue
-            try
-                close(a.backend)
-            catch e
-                println("[EVAL] warning: failed to close old wildbg backend: $e")
-            end
-        end
-    end
+    # A3/F2: capture the PREVIOUS session's wildbg backends but do NOT close them yet.
+    # Each owns a native handle that must be freed — but only AFTER the new session is
+    # fully built and swapped in. Closing first would leave EVAL_SESSION pointing at
+    # closed handles if setup then fails (e.g. weights unavailable / backend open error).
+    old_wb_agents = EVAL_SESSION.wb_agents
 
     # A1: download eval weights PINNED + VERSION-VERIFIED. Fail-fast — we must NOT
     # fall through to the self-play weight copy, or a chunk stamped weights_version=N
@@ -1503,20 +1482,32 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
         secondary_net=eval_race_net, batch_size=batch_size,
         primary_fw=eval_contact_fw, secondary_fw=eval_race_fw, nslots=1)
 
-    # Create ALL per-thread resources ONCE (reused across all chunks in this eval)
+    # Create ALL per-thread resources ONCE (reused across all chunks in this eval).
+    # F2: if a backend fails to open partway, close the NEW backends already opened
+    # before rethrowing — a partial setup must not leak handles, and the old session
+    # (still referenced by EVAL_SESSION) stays intact because we have not swapped yet.
     n_threads = Threads.maxthreadid()
     agents = Vector{Any}(undef, n_threads)
     wb_agents = Vector{Any}(undef, n_threads)
     value_batch_oracles = Vector{Any}(undef, n_threads)
-    for tid in 1:n_threads
-        oracles = make_eval_oracles(INFERENCE_BATCH_SIZE)
-        agents[tid] = EvalAlphaZeroAgent(oracles[1], oracles[2],
-            eval_mcts_params, INFERENCE_BATCH_SIZE, gspec)
-        vo = make_eval_oracles(1)
-        value_batch_oracles[tid] = vo[2]
-        wb = BackgammonNet.WildbgBackend(; nets=nets_variant, lib_path=WILDBG_LIB_EVAL)
-        BackgammonNet.open!(wb)
-        wb_agents[tid] = BackgammonNet.BackendAgent(wb)
+    try
+        for tid in 1:n_threads
+            oracles = make_eval_oracles(INFERENCE_BATCH_SIZE)
+            agents[tid] = EvalAlphaZeroAgent(oracles[1], oracles[2],
+                eval_mcts_params, INFERENCE_BATCH_SIZE, gspec)
+            vo = make_eval_oracles(1)
+            value_batch_oracles[tid] = vo[2]
+            wb = BackgammonNet.WildbgBackend(; nets=nets_variant, lib_path=WILDBG_LIB_EVAL)
+            BackgammonNet.open!(wb)
+            wb_agents[tid] = BackgammonNet.BackendAgent(wb)
+        end
+    catch
+        for i in 1:n_threads
+            isassigned(wb_agents, i) || continue
+            wb_agents[i] === nothing && continue
+            try; close(wb_agents[i].backend); catch; end
+        end
+        rethrow()
     end
 
     # Store everything in session — reused across chunks
@@ -1531,6 +1522,20 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
     EVAL_SESSION.wb_agents = wb_agents
     EVAL_SESSION.value_batch_oracles = value_batch_oracles
     EVAL_SESSION.n_threads = n_threads
+
+    # F2: the new session is fully swapped in — NOW it is safe to close the previous
+    # session's backends (freeing their native handles). A failure above rethrew
+    # before reaching here, leaving the old session intact and its handles open.
+    if old_wb_agents !== nothing && !isempty(old_wb_agents)
+        for a in old_wb_agents
+            a === nothing && continue
+            try
+                close(a.backend)
+            catch e
+                println("[EVAL] warning: failed to close old wildbg backend: $e")
+            end
+        end
+    end
 
     println("[EVAL] Session ready (iter=$eval_iter, $n_threads eval slots)")
     flush(stdout)

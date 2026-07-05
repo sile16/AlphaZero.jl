@@ -407,6 +407,12 @@ function child_nn_value(state, action, value_oracle)
     g = BackgammonNet.clone(state)
     mover = Int(state.current_player)
     BackgammonNet.apply_action!(g, action)
+    # A4/F4: a terminal child is a known win/loss — score it from exact game.reward,
+    # not the NN (same fix as nn_greedy_action; this is the diagnostic-dump path).
+    if g.terminated
+        white_r = Float64(g.reward)
+        return normalized_points(mover == 0 ? white_r : -white_r)
+    end
     v = Float64(value_oracle([g])[1][2])
     if Int(g.current_player) != mover
         v = -v

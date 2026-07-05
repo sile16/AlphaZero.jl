@@ -1466,9 +1466,13 @@ const SERVER_CONFIG = Dict{String, Any}(
     "temp_iter_decay" => ARGS["temp_iter_decay"],
     "temp_iter_final" => ARGS["temp_iter_final"],
     "total_iterations" => ARGS["total_iterations"],
-    "use_bearoff" => true,  # always enabled
-    "bearoff_hard_targets" => ARGS["bearoff_hard_targets"],
-    "bearoff_truncation" => ARGS["bearoff_truncation"],
+    # F3: propagate the server's bearoff state so --no-bearoff is CLUSTER-WIDE.
+    # When bearoff is on, clients must have the local table (they fail-fast otherwise);
+    # when off, clients run without it. Never let table presence silently diverge
+    # training targets across clients.
+    "use_bearoff" => !isempty(BEAROFF_DIR),
+    "bearoff_hard_targets" => !isempty(BEAROFF_DIR) && ARGS["bearoff_hard_targets"],
+    "bearoff_truncation" => !isempty(BEAROFF_DIR) && ARGS["bearoff_truncation"],
     "bootstrap_only" => ARGS["bootstrap_only"],
     "training_mode" => ARGS["training_mode"],
     "start_positions_file" => basename(ARGS["start_positions_file"]),
