@@ -10,8 +10,8 @@ decision node before scoring). Deduped.
 
 Usage:
     julia --project scripts/generate_contact_positions.jl \\
-        --num-positions=2000 --out=/homeshare/projects/AlphaZero.jl/eval_data/contact_eval_2000.jls \\
-        --wildbg-lib=/home/sile/github/wildbg/target/release/libwildbg.so
+        --num-positions=2000 --out=eval_data/contact_eval_2000.jls \\
+        --wildbg-lib=/path/to/libwildbg.so
 """
 
 using ArgParse
@@ -25,7 +25,7 @@ function parse_args_gen()
         "--seed";          arg_type = Int; default = 7
         "--wildbg-lib";    arg_type = String; default = ""
         "--out";           arg_type = String;
-            default = "/homeshare/projects/AlphaZero.jl/eval_data/contact_eval_2000.jls"
+            default = joinpath(dirname(@__DIR__), "eval_data", "contact_eval_2000.jls")
     end
     return ArgParse.parse_args(s)
 end

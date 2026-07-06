@@ -1,5 +1,9 @@
 # Stochastic MCTS Experiments
 
+> Superseded 2026-07-06: legacy `games/backgammon/` references in this
+> historical note point to removed code. Active Backgammon integration is
+> `games/backgammon-deterministic/` plus BackgammonNet v0.6.2+ package APIs.
+
 > **GnuBG RESULTS INVALIDATED (2026-02-14)**: Any GnuBG evaluation numbers in this file (e.g., "63.6% vs GnuBG 0-PLY", "65% vs GnuBG") are invalid due to a critical board encoding bug in `_to_gnubg_board` (fixed in commit e164a85). The MCTS design discussion, implementation details, bug fixes, and "vs Random" results are still valid. See `notes/corrected_eval_results_20260214.md` for corrected GnuBG results.
 
 ## Experiment 1: Sampling Mode vs Standard MCTS (2024-01-14)

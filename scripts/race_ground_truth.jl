@@ -22,7 +22,7 @@ notes/race_ground_truth_plan_20260703.md is the documented follow-on):
 Usage:
     julia --threads 28 --project scripts/race_ground_truth.jl <checkpoint> \\
         --width=128 --blocks=3 --num-workers=24 --rollouts=200 --num-positions=500 \\
-        --wildbg-lib=/home/sile/github/wildbg/target/release/libwildbg.so
+        --wildbg-lib=/path/to/libwildbg.so
 """
 
 using ArgParse
@@ -63,7 +63,7 @@ function parse_args_gt()
             default = ""
         "--positions-file"
             arg_type = String
-            default = "/homeshare/projects/AlphaZero.jl/eval_data/race_eval_2000.jls"
+            default = joinpath(dirname(@__DIR__), "eval_data", "race_eval_2000.jls")
         "--pre-bearoff-only"
             help = "Keep only positions NOT yet in the k=7 bearoff range (the pre-bearoff band)"
             action = :store_true

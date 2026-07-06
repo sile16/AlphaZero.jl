@@ -176,6 +176,57 @@ end
     @test targets.p_bg_loss ≈ 1.0
   end
 
+  @testset "EquityTargets match BackgammonNet terminal heads" begin
+    set_nibble(board::UInt128, idx::Int, val::Int) =
+      (board & ~(UInt128(0xF) << (idx << 2))) | (UInt128(val) << (idx << 2))
+
+    function terminal_game(; white_won::Bool, gammon::Bool, backgammon::Bool, cube_value::Int=1)
+      g = BackgammonNet.initial_state(; obs_type=:minimal_flat)
+      g.p0 = UInt128(0)
+      g.p1 = UInt128(0)
+      if white_won
+        g.p0 = set_nibble(g.p0, 25, 15)
+        loser_off = gammon ? 0 : 1
+        loser_point = backgammon ? 24 : 18
+        loser_bar = backgammon ? 1 : 0
+        g.p1 = set_nibble(g.p1, 0, loser_off)
+        g.p1 = set_nibble(g.p1, loser_point, 15 - loser_off - loser_bar)
+        loser_bar > 0 && (g.p1 = set_nibble(g.p1, 27, loser_bar))
+        g.reward = Float32(cube_value)
+      else
+        g.p1 = set_nibble(g.p1, 0, 15)
+        loser_off = gammon ? 0 : 1
+        loser_point = backgammon ? 1 : 7
+        loser_bar = backgammon ? 1 : 0
+        g.p0 = set_nibble(g.p0, 25, loser_off)
+        g.p0 = set_nibble(g.p0, loser_point, 15 - loser_off - loser_bar)
+        loser_bar > 0 && (g.p0 = set_nibble(g.p0, 26, loser_bar))
+        g.reward = -Float32(cube_value)
+      end
+      g.cube_value = Int16(cube_value)
+      g.terminated = true
+      return g
+    end
+
+    cases = (
+      (white_won=true, gammon=false, backgammon=false),
+      (white_won=true, gammon=true, backgammon=false),
+      (white_won=false, gammon=true, backgammon=true),
+    )
+
+    for c in cases
+      outcome = GI.GameOutcome(c.white_won, c.gammon, c.backgammon)
+      g = terminal_game(; c..., cube_value=4)
+      for white_perspective in (true, false)
+        player = white_perspective ? 0 : 1
+        az = AlphaZero.equity_vector(equity_targets_from_outcome(outcome, white_perspective))
+        h = BackgammonNet.terminal_heads_target(g, player)
+        bg = Float32[h.p_win, h.p_gammon_win, h.p_bg_win, h.p_gammon_loss, h.p_bg_loss]
+        @test az == bg
+      end
+    end
+  end
+
   @testset "Equity vector helpers" begin
     @test AlphaZero.VALUE_HEAD_CONTRACT == BackgammonNet.VALUE_HEAD_CONTRACT
     @test AlphaZero.VALUE_HEAD_ORDER == BackgammonNet.VALUE_HEAD_ORDER

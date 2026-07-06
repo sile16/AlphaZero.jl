@@ -40,12 +40,13 @@ function parse_cli()
         "--min-legal";       arg_type=Int;    default=3;    help="Keep states with >= this many legal moves"
         "--states-cache";    arg_type=String; default="/tmp/error_response_states.jls"
         "--positions-file";  arg_type=String; default=""
-        "--checkpoint";      arg_type=String; default="/home/sile/alphazero-server-race-v12/checkpoints/race_iter_50.data"
+        "--checkpoint";      arg_type=String; default=get(ENV, "ALPHAZERO_CHECKPOINT",
+            joinpath(dirname(@__DIR__), "sessions", "alphazero-server", "checkpoints", "race_iter_50.data"))
         "--width";           arg_type=Int;    default=256
         "--blocks";          arg_type=Int;    default=5
         "--nn-mcts-iters";   arg_type=Int;    default=600
         "--skip-nn";         action=:store_true
-        "--out";             arg_type=String; default="/home/sile/github/AlphaZero.jl/scratchpad/error_response_results.jls"
+        "--out";             arg_type=String; default=joinpath(dirname(@__DIR__), "scratchpad", "error_response_results.jls")
     end
     return ArgParse.parse_args(s)
 end
@@ -67,17 +68,12 @@ ENV["BACKGAMMON_OBS_TYPE"] = "minimal_flat"
 include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
 const GSPEC = GameSpec()
 
-const BACKGAMMONNET_REPO = dirname(dirname(pathof(BackgammonNet)))
 const TABLE = let
-    candidates = [
-        joinpath(BACKGAMMONNET_REPO, "tools", "bearoff_twosided", "bearoff_k7_twosided"),
-        joinpath(homedir(), "bearoff_k7_twosided"),
-        "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
-    ]
-    dir = findfirst(d -> isdir(d) && isfile(joinpath(d, "bearoff_k7_c14.bin")), candidates)
-    dir === nothing && error("k=7 table not found in: $(join(candidates, ", "))")
-    println("Loading k=7 table from $(candidates[dir]) ...")
-    BearoffK7.BearoffTable(candidates[dir])
+    dir = BackgammonNet.default_bearoff_k7_dir()
+    isdir(dir) && isfile(joinpath(dir, "bearoff_k7_c14.bin")) ||
+        error("k=7 table not found at $dir")
+    println("Loading k=7 table from $dir ...")
+    BearoffK7.BearoffTable(dir)
 end
 
 # ── Deterministic frozen-noise pool (hash -> standard normal) ────────────
@@ -152,8 +148,8 @@ function find_positions_file()
     isempty(ARGS_D["positions_file"]) || return ARGS_D["positions_file"]
     for f in [
         joinpath(@__DIR__, "..", "eval_data", "race_starts_tuples_bootstrap_no_eval_no_bo.jls"),
-        "/homeshare/projects/AlphaZero.jl/eval_data/race_starts_tuples_no_eval.jls",
-        "/homeshare/projects/AlphaZero.jl/eval_data/race_starts_tuples.jls",
+        joinpath(@__DIR__, "..", "eval_data", "race_starts_tuples_no_eval.jls"),
+        joinpath(@__DIR__, "..", "eval_data", "race_starts_tuples.jls"),
     ]
         isfile(f) && return f
     end

@@ -15,7 +15,7 @@ see the exact same positions.
 
 Example:
   julia --threads 10 --project scripts/eval_bearoff_accuracy.jl \
-      /home/sile/alphazero-server-race-v12/checkpoints/race_iter_50.data \
+      ./sessions/alphazero-server/checkpoints/race_iter_50.data \
       --width=256 --blocks=5 --mcts-iters=600 --num-positions=2000
 """
 
@@ -54,7 +54,9 @@ function parse_args()
             help = "Cache file for sampled bearoff decision states"
         "--bootstrap-file"
             arg_type = String
-            default = "/home/sile/github/BackgammonNet.jl/data/bootstrap/bootstrap_5000g_bgblitz1ply.jls"
+            default = get(ENV, "BACKGAMMONNET_BOOTSTRAP_FILE",
+                          joinpath(dirname(dirname(@__DIR__)), "BackgammonNet.jl",
+                                   "data", "bootstrap", "bootstrap_5000g_bgblitz1ply.jls"))
             help = "Raw bootstrap with BackgammonGame states (fallback source)"
         "--start-positions-file"
             arg_type = String
@@ -125,8 +127,6 @@ const STATE_DIM = GI.state_dim(gspec)[1]
 const ORACLE_CFG = AlphaZero.BackgammonInference.OracleConfig(
     STATE_DIM, NUM_ACTIONS, gspec; vectorize_state! = vectorize_state_into!)
 
-const BACKGAMMONNET_REPO = dirname(dirname(pathof(BackgammonNet)))
-
 @inline normalized_points(v::Real) = Float64(v) / 3.0
 
 function parse_checkpoint_list()
@@ -147,17 +147,9 @@ function find_bearoff_dir()
     if !isempty(ARGS["bearoff_dir"])
         return ARGS["bearoff_dir"]
     end
-    candidates = [
-        joinpath(BACKGAMMONNET_REPO, "tools", "bearoff_twosided", "bearoff_k7_twosided"),
-        joinpath(homedir(), "bearoff_k7_twosided"),
-        "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
-    ]
-    for dir in candidates
-        if isdir(dir) && isfile(joinpath(dir, "bearoff_k7_c14.bin"))
-            return dir
-        end
-    end
-    error("bearoff_k7_twosided not found")
+    dir = BackgammonNet.default_bearoff_k7_dir()
+    isdir(dir) && isfile(joinpath(dir, "bearoff_k7_c14.bin")) && return dir
+    error("bearoff_k7_twosided not found at $dir")
 end
 
 function make_state_key(g::BackgammonNet.BackgammonGame)

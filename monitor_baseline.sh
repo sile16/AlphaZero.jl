@@ -1,6 +1,6 @@
 #!/bin/bash
 # Monitor baseline training, log progress every 10 minutes
-LOG="/homeshare/projects/AlphaZero.jl/training_200iter_baseline.log"
+LOG="${ALPHAZERO_BASELINE_LOG:-./training_200iter_baseline.log}"
 while kill -0 1295102 2>/dev/null; do
     echo "=== $(date) ==="
     grep -E "^┌ Info: Iteration" "$LOG" | tail -1

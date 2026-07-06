@@ -93,28 +93,18 @@ include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl")
 
 const TABLE_KIND = Symbol(ARGS_D["table"])
 TABLE_KIND in (:k7, :onesided, :combined) || error("--table must be k7|onesided|combined")
-const BACKGAMMONNET_REPO = dirname(dirname(pathof(BackgammonNet)))
 
 function _find_k7_dir()
-    candidates = [
-        joinpath(BACKGAMMONNET_REPO, "tools", "bearoff_twosided", "bearoff_k7_twosided"),
-        joinpath(homedir(), "bearoff_k7_twosided"),
-        "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
-    ]
-    dir = findfirst(d -> isdir(d) && isfile(joinpath(d, "bearoff_k7_c14.bin")), candidates)
-    dir === nothing && error("k=7 bear-off table not found in: $(join(candidates, ", "))")
-    return candidates[dir]
+    dir = BackgammonNet.default_bearoff_k7_dir()
+    isdir(dir) && isfile(joinpath(dir, "bearoff_k7_c14.bin")) && return dir
+    error("k=7 bear-off table not found at $dir")
 end
 
 function _find_onesided_dir()
     isempty(ARGS_D["onesided_dir"]) || return ARGS_D["onesided_dir"]
-    for d in [
-        joinpath(BACKGAMMONNET_REPO, "tools", "bearoff_onesided", "bearoff_n18"),
-        joinpath(homedir(), "bearoff_n18"),
-    ]
-        isdir(d) && isfile(joinpath(d, "onesided_all.bin")) && return d
-    end
-    error("n=18 one-sided table not found; pass --onesided-dir")
+    d = BackgammonNet.default_bearoff_onesided_dir()
+    isdir(d) && isfile(joinpath(d, "onesided_all.bin")) && return d
+    error("n=18 one-sided table not found at $d; pass --onesided-dir")
 end
 
 const TABLE = if TABLE_KIND == :k7
@@ -289,8 +279,8 @@ function find_positions_file()
     isempty(ARGS_D["positions_file"]) || return ARGS_D["positions_file"]
     for f in [
         joinpath(@__DIR__, "..", "eval_data", "race_starts_tuples_bootstrap_no_eval_no_bo.jls"),
-        "/homeshare/projects/AlphaZero.jl/eval_data/race_starts_tuples_no_eval.jls",
-        "/homeshare/projects/AlphaZero.jl/eval_data/race_starts_tuples.jls",
+        joinpath(@__DIR__, "..", "eval_data", "race_starts_tuples_no_eval.jls"),
+        joinpath(@__DIR__, "..", "eval_data", "race_starts_tuples.jls"),
     ]
         isfile(f) && return f
     end

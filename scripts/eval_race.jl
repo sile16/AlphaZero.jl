@@ -48,7 +48,7 @@ function parse_args_eval()
             default = ""
         "--positions-file"
             arg_type = String
-            default = "/homeshare/projects/AlphaZero.jl/eval_data/race_eval_2000.jls"
+            default = joinpath(dirname(@__DIR__), "eval_data", "race_eval_2000.jls")
         "--inference-batch-size"
             arg_type = Int
             default = 50
@@ -107,19 +107,12 @@ const ORACLE_CFG = AlphaZero.BackgammonInference.OracleConfig(
 # the NN value scale [-1,1].
 BEAROFF_EVALUATOR = nothing
 if ARGS["bearoff_eval"]
-    _bgn_repo = dirname(dirname(pathof(BackgammonNet)))
-    _table_candidates = [
-        joinpath(_bgn_repo, "tools", "bearoff_twosided", "bearoff_k7_twosided"),
-        joinpath(homedir(), "bearoff_k7_twosided"),
-        "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
-    ]
-    _tdir = findfirst(d -> isdir(d) && isfile(joinpath(d, "bearoff_k7_c14.bin")), _table_candidates)
-    _tdir === nothing &&
-        error("--bearoff-eval requested but k=7 bear-off table not found in: " *
-              join(_table_candidates, ", "))
-    println("Loading k=7 bear-off table from $(_table_candidates[_tdir]) ...")
+    _table_dir = BackgammonNet.default_bearoff_k7_dir()
+    isdir(_table_dir) && isfile(joinpath(_table_dir, "bearoff_k7_c14.bin")) ||
+        error("--bearoff-eval requested but k=7 bear-off table not found at $_table_dir")
+    println("Loading k=7 bear-off table from $_table_dir ...")
     flush(stdout)
-    global TABLE = BearoffK7.BearoffTable(_table_candidates[_tdir])
+    global TABLE = BearoffK7.BearoffTable(_table_dir)
 
     # Mirrors selfplay_client.jl's make_bearoff_evaluator (money weights).
     # Single normalization point tied to GI.reward_scale (raw points → [-1,1]).

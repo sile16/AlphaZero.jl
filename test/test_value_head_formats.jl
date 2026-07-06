@@ -22,8 +22,7 @@ using StaticArrays
 using BackgammonNet
 using BackgammonNet: BearoffK6
 
-const BACKGAMMONNET_REPO = dirname(dirname(pathof(BackgammonNet)))
-const TABLE_DIR = joinpath(BACKGAMMONNET_REPO, "tools", "bearoff_twosided", "bearoff_k6_twosided")
+const TABLE_DIR = BackgammonNet.default_bearoff_k6_dir()
 const TABLE = BearoffK6.BearoffTable(TABLE_DIR)
 
 # ── Board helpers (from test_bearoff_bellman.jl) ────────────────────────

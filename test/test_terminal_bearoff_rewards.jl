@@ -8,6 +8,8 @@
 # Also: MCTS mixes NN values (equity/3 ∈ [-1,1]) and game rewards in the same
 # Q totals, so `GI.reward_scale` must be 3.0 for backgammon and 1.0 by default.
 
+using Test
+using AlphaZero
 using BackgammonNet
 using StaticArrays
 using Random
@@ -39,22 +41,31 @@ using Random
   end
 end
 
-@testset "Terminal 5-head target consistent with reward scalar" begin
-  # Mirrors the fixed terminal branch in selfplay_client.jl:
-  # reward → joint cumulative vector, checked against the joint equity formula.
-  for (white_r, expected_eq) in [
-      (1.0f0, Float32[1, 0, 0, 0, 0]),
-      (2.0f0, Float32[1, 1, 0, 0, 0]),
-      (3.0f0, Float32[1, 1, 1, 0, 0])]
-    mover_val = white_r  # mover == white
-    is_g = mover_val >= 2.0f0
-    is_bg = mover_val >= 3.0f0
-    eq = Float32[1.0, is_g ? 1.0 : 0.0, is_bg ? 1.0 : 0.0, 0.0, 0.0]
+@testset "Terminal 5-head target derives from board outcome" begin
+  p0_off = UInt128(15) << (25 * 4)
+  p1_single = ((UInt128(14) << (1 * 4)) | UInt128(1))
+  p1_gammon = (UInt128(5) << (1 * 4)) | (UInt128(5) << (2 * 4)) | (UInt128(5) << (3 * 4))
+  p1_bg = (UInt128(14) << (7 * 4)) | (UInt128(1) << (27 * 4))
+
+  for (p1, reward, expected_eq, expected_points) in [
+      (p1_single, 1.0f0, Float32[1, 0, 0, 0, 0], 1.0f0),
+      (p1_gammon, 2.0f0, Float32[1, 1, 0, 0, 0], 2.0f0),
+      (p1_bg, 3.0f0, Float32[1, 1, 1, 0, 0], 3.0f0)]
+    g = BackgammonGame(p0_off, p1, SVector{2, Int8}(0, 0), Int8(0), Int8(0), true, reward;
+                       obs_type=:minimal_flat)
+    heads = BackgammonNet.terminal_heads_target(g, 0)
+    eq = Float32[heads.p_win, heads.p_gammon_win, heads.p_bg_win, heads.p_gammon_loss, heads.p_bg_loss]
     @test eq == expected_eq
-    # Joint equity formula must reproduce the scalar
-    eq_scalar = (2eq[1] - 1) + (eq[2] - eq[4]) + (eq[3] - eq[5])
-    @test eq_scalar == mover_val
+    @test BackgammonNet.compute_equity_joint(heads) == expected_points
   end
+
+  cubed_single = BackgammonGame(p0_off, p1_single, SVector{2, Int8}(0, 0), Int8(0), Int8(0), true, 4.0f0;
+                                obs_type=:minimal_flat)
+  cubed_single.cube_enabled = true
+  cubed_single.cube_value = Int16(4)
+  cubed_heads = BackgammonNet.terminal_heads_target(cubed_single, 0)
+  @test Float32[cubed_heads.p_win, cubed_heads.p_gammon_win, cubed_heads.p_bg_win,
+                cubed_heads.p_gammon_loss, cubed_heads.p_bg_loss] == Float32[1, 0, 0, 0, 0]
 end
 
 @testset "GI.reward_scale" begin

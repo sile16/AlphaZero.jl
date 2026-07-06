@@ -21,8 +21,7 @@ using Statistics
 using Random
 using BackgammonNet: BearoffK6
 
-const BACKGAMMONNET_REPO = dirname(dirname(pathof(BackgammonNet)))
-const TABLE_DIR = joinpath(BACKGAMMONNET_REPO, "tools", "bearoff_twosided", "bearoff_k6_twosided")
+const TABLE_DIR = BackgammonNet.default_bearoff_k6_dir()
 if !isdir(TABLE_DIR)
     error("Bearoff table not found at: $TABLE_DIR")
 end

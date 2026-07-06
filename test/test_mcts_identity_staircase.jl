@@ -57,16 +57,9 @@ using BackgammonNet: BackgammonGame, BearoffK7, bearoff_best_move_value, bearoff
 
 # ── Optional dependency discovery (table-optional guard) ────────────────────
 
-const _BGN_REPO = dirname(dirname(pathof(BackgammonNet)))
-
 function _find_k7_table_dir()
-    for d in [
-        joinpath(_BGN_REPO, "tools", "bearoff_twosided", "bearoff_k7_twosided"),
-        joinpath(homedir(), "bearoff_k7_twosided"),
-        "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
-    ]
-        isdir(d) && isfile(joinpath(d, "bearoff_k7_c14.bin")) && return d
-    end
+    d = BackgammonNet.default_bearoff_k7_dir()
+    isdir(d) && isfile(joinpath(d, "bearoff_k7_c14.bin")) && return d
     return nothing
 end
 

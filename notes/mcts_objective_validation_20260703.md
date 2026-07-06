@@ -1,5 +1,8 @@
 # MCTS-driven + Match-Objective Bearoff Validation — 2026-07-03
 
+> Superseded 2026-07-06: AlphaZero bearoff helpers now live in BackgammonNet
+> v0.6.2+; legacy `scripts/bearoff_eval_common.jl` references are historical.
+
 Extends `scripts/eval_table_vs_wildbg.jl` (exact k=7 bearoff table vs wildbg from
 mutual-bearoff starts, duplicate-dice paired CI) with:
 

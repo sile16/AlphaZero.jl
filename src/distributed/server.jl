@@ -6,7 +6,7 @@ trains models on GPU, serves weights to clients.
 
 Usage:
     julia --threads 4 --project scripts/training_server.jl \\
-        --port 9090 --data-dir /home/sile/alphazero-server
+        --port 9090 --data-dir ./sessions/alphazero-server
 """
 
 using HTTP
@@ -549,7 +549,7 @@ function create_router(state::ServerState, buffer::PERBuffer)
         # Search known data directories
         search_paths = [
             joinpath(@__DIR__, "..", "..", "eval_data"),  # project eval_data/
-            "/homeshare/projects/AlphaZero.jl/eval_data",
+            get(state.config, "eval_data_dir", ""),
             get(state.config, "data_dir", ""),
         ]
         for dir in search_paths

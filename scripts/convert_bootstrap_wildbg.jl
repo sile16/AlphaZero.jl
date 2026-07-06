@@ -3,8 +3,8 @@
 Convert wildbg bootstrap files (columnar NamedTuples with BackgammonGame states)
 into per-sample training format for training_server.jl.
 
-Input: ~/github/BackgammonNet.jl/data/bootstrap/bootstrap_wildbg_100k_part{0-9}.jls
-Output: /homeshare/projects/AlphaZero.jl/eval_data/bootstrap_wildbg_1M.jls
+Input: BackgammonNet.jl/data/bootstrap/bootstrap_wildbg_100k_part{0-9}.jls
+Output: eval_data/bootstrap_wildbg_1M.jls
 
 Each output sample is a NamedTuple with:
   state::Vector{Float32}   (344-dim minimal_flat)
@@ -35,8 +35,10 @@ include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl")
 const gspec = GameSpec()
 println("Packages loaded in $(round(time()-t0, digits=1))s"); flush(stdout)
 
-const INPUT_DIR = joinpath(homedir(), "github", "BackgammonNet.jl", "data", "bootstrap")
-const OUTPUT_PATH = "/homeshare/projects/AlphaZero.jl/eval_data/bootstrap_wildbg_1M.jls"
+const INPUT_DIR = get(ENV, "BACKGAMMONNET_BOOTSTRAP_DIR",
+    joinpath(dirname(dirname(@__DIR__)), "BackgammonNet.jl", "data", "bootstrap"))
+const OUTPUT_PATH = get(ENV, "ALPHAZERO_BOOTSTRAP_OUTPUT",
+    joinpath(dirname(@__DIR__), "eval_data", "bootstrap_wildbg_1M.jls"))
 const NUM_PARTS = 10
 const NUM_ACTIONS_CONST = BackgammonNet.CHECKER_ACTIONS
 const TARGET_TOTAL = 1_000_000

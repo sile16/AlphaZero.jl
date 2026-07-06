@@ -2,7 +2,8 @@
 ##### Session management
 #####
 
-const DEFAULT_SESSIONS_DIR = "/homeshare/projects/AlphaZero.jl/sessions"
+const DEFAULT_SESSIONS_DIR = get(ENV, "ALPHAZERO_SESSIONS_DIR",
+    joinpath(dirname(@__DIR__), "..", "sessions"))
 
 """
     SessionReport

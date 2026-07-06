@@ -102,7 +102,7 @@ function parse_args()
         "--eval-positions-file"
             help = "Path to fixed eval positions file (portable tuples)"
             arg_type = String
-            default = "/homeshare/projects/AlphaZero.jl/eval_data/race_eval_2000.jls"
+            default = joinpath(dirname(@__DIR__), "eval_data", "race_eval_2000.jls")
     end
 
     return ArgParse.parse_args(s)
@@ -286,8 +286,6 @@ end
 ##### Bear-off table (mandatory — loaded locally, too large to serve over HTTP)
 #####
 
-const BACKGAMMONNET_REPO_CLIENT = dirname(dirname(pathof(BackgammonNet)))
-
 # F1/F3: bearoff is a CLUSTER-WIDE decision made by the server (config["use_bearoff"],
 # derived from its --no-bearoff). When ON, EVERY client must have the LOCAL k=7 table:
 # a client without it would silently produce DIFFERENT training targets (game-outcome
@@ -303,25 +301,16 @@ const BEAROFF_TABLE = let
         flush(stdout)
         nothing
     else
-        # Prefer local copy (mmap over NFS can cause bus errors on large files)
-        candidates = [
-            joinpath(BACKGAMMONNET_REPO_CLIENT, "tools", "bearoff_twosided", "bearoff_k7_twosided"),
-            joinpath(homedir(), "bearoff_k7_twosided"),
-            "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
-        ]
-        table_dir = nothing
-        for dir in candidates
-            if isdir(dir) && isfile(joinpath(dir, "bearoff_k7_c14.bin"))
-                table_dir = dir
-                break
-            end
-        end
-        table_dir === nothing && error(
+        table_dir = BackgammonNet.default_bearoff_k7_dir()
+        has_k7 = isdir(table_dir) && isfile(joinpath(table_dir, "bearoff_k7_c14.bin"))
+        !has_k7 && error(
             "Bearoff is ENABLED cluster-wide (server use_bearoff=true) but NO local k=7 table " *
-            "was found.\n  Searched: $(join(candidates, ", "))\n" *
+            "was found at $table_dir.\n" *
             "  Fail-fast: a client without the table would produce different training targets than " *
-            "table-equipped clients.\n  Fix: copy bearoff_k7_twosided/ to ~/bearoff_k7_twosided/, " *
-            "or run the server with --no-bearoff to disable bearoff for the whole cluster.")
+            "table-equipped clients.\n  Fix: place bearoff_k7_twosided/ under " *
+            "$(BackgammonNet.default_bearoff_root()) on every machine, set " *
+            "BACKGAMMONNET_BEAROFF_K7_DIR, or run the server with --no-bearoff " *
+            "to disable bearoff for the whole cluster.")
         println("Loading k=7 bear-off table from $table_dir ...")
         k7 = BearoffK7.BearoffTable(table_dir)
         println("  c14: $(round(length(k7.c14_data)/1e9, digits=1)) GB")
@@ -329,18 +318,8 @@ const BEAROFF_TABLE = let
         # Optional n=18 one-sided race table — extends EXACT coverage to disengaged
         # races ≤18 pips/side. Present → COMBINED (exact race frontier for the contact
         # curriculum); absent → k7-only (deep bearoff exact; >7pt races → NN).
-        os_candidates = [
-            joinpath(BACKGAMMONNET_REPO_CLIENT, "tools", "bearoff_onesided", "bearoff_n18"),
-            joinpath(homedir(), "bearoff_n18"),
-            "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_n18",
-        ]
-        os_dir = nothing
-        for d in os_candidates
-            if isdir(d) && isfile(joinpath(d, "onesided_all.bin"))
-                os_dir = d; break
-            end
-        end
-        if os_dir !== nothing
+        os_dir = BackgammonNet.default_bearoff_onesided_dir()
+        if isdir(os_dir) && isfile(joinpath(os_dir, "onesided_all.bin"))
             os = BearoffOneSided.OneSidedTable(os_dir)
             println("Loaded n=18 one-sided race table from $os_dir → COMBINED bearoff (exact race frontier)")
             flush(stdout)

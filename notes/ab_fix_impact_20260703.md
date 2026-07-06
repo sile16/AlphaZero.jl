@@ -1,5 +1,8 @@
 # A/B Experiment: Play-Strength Impact of 2026-07-03 Bug Fixes (Eval-Time)
 
+> Superseded 2026-07-06: AlphaZero bearoff helpers now live in BackgammonNet
+> v0.6.2+; legacy `scripts/bearoff_eval_common.jl` references are historical.
+
 **Date:** 2026-07-03
 **Question:** How much do today's fixes (commit `8eb1a74` + `98e351c`) change *eval-time play strength*, holding the trained network constant?
 

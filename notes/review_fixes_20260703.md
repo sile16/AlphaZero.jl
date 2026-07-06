@@ -1,5 +1,9 @@
 # External Review Fixes — 2026-07-03
 
+> Superseded 2026-07-06: AlphaZero bearoff helpers now live in BackgammonNet
+> v0.6.2+; legacy `games/backgammon/` and `scripts/bearoff_eval_common.jl`
+> references are historical.
+
 Five High findings from an external engineer review. All verified against the code
 before acting; four fixed this session, one open.
 

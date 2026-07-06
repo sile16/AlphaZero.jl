@@ -12,7 +12,7 @@ Architecture:
 Usage:
     julia --threads 4 --project scripts/training_server.jl \\
         --port 9090 \\
-        --data-dir /home/sile/alphazero-server \\
+        --data-dir ./sessions/alphazero-server \\
         --api-key my-secret-key \\
         --contact-width 256 --contact-blocks 5 \\
         --total-iterations 200 \\
@@ -42,7 +42,8 @@ function parse_args()
         "--data-dir"
             help = "Directory for checkpoints, buffer, logs (outside git)"
             arg_type = String
-            default = "/home/sile/alphazero-server"
+            default = get(ENV, "ALPHAZERO_DATA_DIR",
+                          joinpath(dirname(@__DIR__), "sessions", "alphazero-server"))
         "--api-key"
             help = "API key for client authentication"
             arg_type = String
@@ -454,20 +455,11 @@ else
     Tuple[]
 end
 
-const BACKGAMMONNET_REPO_SERVER = dirname(dirname(pathof(BackgammonNet)))
-
 function find_bearoff_dir_server()
-    candidates = [
-        joinpath(BACKGAMMONNET_REPO_SERVER, "tools", "bearoff_twosided", "bearoff_k7_twosided"),
-        joinpath(homedir(), "bearoff_k7_twosided"),
-        "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
-    ]
-    for dir in candidates
-        if isdir(dir) && isfile(joinpath(dir, "bearoff_k7_c14.bin"))
-            return dir
-        end
-    end
-    error("Bearoff k7 directory not found. Checked: $(join(candidates, ", "))")
+    dir = BackgammonNet.default_bearoff_k7_dir()
+    isdir(dir) && isfile(joinpath(dir, "bearoff_k7_c14.bin")) && return dir
+    error("Bearoff k7 directory not found at $dir. Set BACKGAMMONNET_BEAROFF_K7_DIR " *
+          "or place the table under $(BackgammonNet.default_bearoff_root()).")
 end
 
 # Fail-fast: the bearoff table is REQUIRED unless --no-bearoff is explicitly set.
@@ -1065,15 +1057,10 @@ end
 function _check_bootstrap_equity_heads!(eq, label::AbstractString)
     length(eq) == 5 || error("$label expected 5 value heads, got $(length(eq))")
     vals = Float64.(eq)
-    tol = Float64(AlphaZero.VALUE_HEAD_STRICT_TOL)
-    for x in vals
-        isfinite(x) || error("$label has non-finite value head: $eq")
-        0.0 <= x <= 1.0 || error("$label has probability outside [0,1]: $eq")
-    end
-    vals[3] <= vals[2] + tol || error("$label violates p_bg_win <= p_gammon_win: $eq")
-    vals[2] <= vals[1] + tol || error("$label violates p_gammon_win <= p_win: $eq")
-    vals[5] <= vals[4] + tol || error("$label violates p_bg_loss <= p_gammon_loss: $eq")
-    vals[4] <= (1.0 - vals[1]) + tol || error("$label violates p_gammon_loss <= 1 - p_win: $eq")
+    BackgammonNet.check_probability_contract(
+        (vals[1], vals[2], vals[3], vals[4], vals[5]);
+        label=label,
+        tol=Float64(AlphaZero.VALUE_HEAD_STRICT_TOL))
     return nothing
 end
 

@@ -58,7 +58,9 @@ using BackgammonNet: bearoff_value_to_nn_scale
         # Terminal equity is mover-relative in both directions. The negative
         # case is rare in normal post-move scoring, but callers of the shared
         # helper should not get a win vector when the requested mover lost.
-        lost = BackgammonGame(p0, p1, SVector{2, Int8}(0, 0), Int8(0), Int8(0), true, -2.0f0;
+        p0_loss = (UInt128(5) << (19 * 4)) | (UInt128(5) << (20 * 4)) | (UInt128(5) << (21 * 4))
+        p1_win = UInt128(15) << 0
+        lost = BackgammonGame(p0_loss, p1_win, SVector{2, Int8}(0, 0), Int8(0), Int8(0), true, -2.0f0;
                               obs_type=:minimal_flat)
         v_loss, eq_loss = bearoff_turn_value_equity(nothing, lost, 0)
         @test v_loss == -2.0
@@ -88,8 +90,9 @@ using BackgammonNet: bearoff_value_to_nn_scale
 
         # End-to-end: a terminal gammon (+2 raw) the evaluator would feed MCTS
         # becomes +2/3 on the NN scale — the same number the NN head emits.
-        # The terminal branch reads only reward+terminated, so the board is moot.
-        gammon_win = BackgammonGame(UInt128(0), UInt128(0), SVector{2, Int8}(0, 0),
+        p0_win = UInt128(15) << (25 * 4)
+        p1_no_off = (UInt128(5) << (1 * 4)) | (UInt128(5) << (2 * 4)) | (UInt128(5) << (3 * 4))
+        gammon_win = BackgammonGame(p0_win, p1_no_off, SVector{2, Int8}(0, 0),
                                     Int8(0), Int8(0), true, 2.0f0; obs_type=:minimal_flat)
         v_win, eq_win = bearoff_turn_value_equity(nothing, gammon_win, 0)
         @test v_win == 2.0

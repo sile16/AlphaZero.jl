@@ -6,7 +6,7 @@ Plays full games from opening, records the FIRST board state where
 is_race_position() becomes true. These are realistic "race entry" positions
 with most checkers still on the board (~20+ moves remaining).
 
-Output: Serialized file at /homeshare/projects/AlphaZero.jl/eval_data/race_eval_2000.jls
+Output: Serialized file at eval_data/race_eval_2000.jls
 """
 
 using Random
@@ -126,7 +126,7 @@ function main()
     # Save as serialized bitboard pairs
     save_data = [(g.p0, g.p1, g.current_player) for g in positions]
 
-    output_dir = "/homeshare/projects/AlphaZero.jl/eval_data"
+    output_dir = get(ENV, "ALPHAZERO_EVAL_DATA_DIR", joinpath(@__DIR__, "..", "eval_data"))
     mkpath(output_dir)
     output_path = joinpath(output_dir, "race_eval_2000.jls")
     serialize(output_path, save_data)

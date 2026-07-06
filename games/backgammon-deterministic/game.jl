@@ -54,7 +54,9 @@ const OBS_TYPE_MAP = Dict(
 const OBS_TYPE_STR = get(ENV, "BACKGAMMON_OBS_TYPE", "minimal_flat")
 const OBSERVATION_TYPE = get(OBS_TYPE_MAP, OBS_TYPE_STR, :minimal_flat)
 
-# Action space: checker moves only; cube actions live outside this AlphaZero wrapper.
+# Action space: checker moves only. BackgammonNet supports cube/match/MET play,
+# but the current AlphaZero curriculum intentionally keeps cube decisions outside
+# this wrapper until the network/action head is extended beyond checker moves.
 const NUM_ACTIONS = BackgammonNet.CHECKER_ACTIONS
 
 # Get observation size from BackgammonNet

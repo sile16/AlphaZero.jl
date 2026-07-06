@@ -17,14 +17,14 @@ race net). Output NamedTuple: (states, policies, values, equity).
 Example:
   julia --threads 8 --project scripts/generate_contact_bootstrap.jl \\
      --target-samples=300000 --sample-prob=0.3 \\
-     --out=/homeshare/projects/AlphaZero.jl/eval_data/contact_bootstrap_wildbg.jls
+     --out=eval_data/contact_bootstrap_wildbg.jls
 =#
 using ArgParse, Serialization, Random, StaticArrays
 
 function parse_args_gen()
     s = ArgParseSettings(autofix_names=true)
     @add_arg_table! s begin
-        "--out";            arg_type = String;  default = "/homeshare/projects/AlphaZero.jl/eval_data/contact_bootstrap_wildbg.jls"
+        "--out";            arg_type = String;  default = joinpath(dirname(@__DIR__), "eval_data", "contact_bootstrap_wildbg.jls")
         "--target-samples"; arg_type = Int;     default = 300_000
         "--max-games";      arg_type = Int;     default = 2_000_000
         "--sample-prob";    arg_type = Float64; default = 0.30
