@@ -199,6 +199,41 @@ one interface per engine; evals valid/strong/fast/frequent.
 ##   also plateaus ~29%, the ceiling is capacity/policy-search-bound → curriculum/search.
 ## Artifacts: contact_bootstrap_wildbg_300k.jls (811MB, kept); 20 shards deleted post-merge.
 
+## EXP5 COMPLETED+KILLED (2026-07-06 ~14:20→14:35): SELF-PLAY CURRICULUM, the actual
+## beat-wildbg mechanism test. Warm-start = EXP4 contact iter40 (~26% win), COLD buffer
+## (via new --resume weights-only patch d3eab3a: isfile-guard on buffer load). Levers:
+## bearoff TRACE TRUNCATION ON (combined k7+n18 exact frontier, confirmed loaded on BOTH
+## clients), PER ON, Reanalyze OFF, 400 MCTS, dual 128×3. Both machines self-play (Jarvis
+## 4w server-colocated + Neo 16w eval-capable via reverse SSH tunnel). Data-dir
+## /home/sile/alphazero-contact-exp5-selfplay. Rationale (Fable consult): EXP2's plateau was
+## NOT valid evidence — it lacked truncation, had PER off, AND ran before the 2026-07-03
+## value-scale/terminal-gammon fixes (corrupted frontier arithmetic). So the mechanism was
+## never actually tested. This tested it.
+## RESULT — REGRESSED, did NOT climb:
+##   iter 0  -0.7875 25.8% (warm start)   iter 15 -1.135  16.8%
+##   iter 5  -0.9475 21.8%                iter 20 -1.0975 18.5%
+##   iter 10 -0.995  20.0%
+## Self-play dragged the 26% imitation warm-start DOWN to a ~17-18% fixed point while
+## contact_loss fell (4.36→3.93) — fitting self-play targets WORSE than wildbg-imitation.
+## Met Fable's kill criterion decisively (iters 10/15/20 all far below 31%, declining not
+## plateauing). Killed at iter 22.
+## DIAGNOSIS — two competing explanations, must distinguish:
+##   (A) RACE-NET CONFOUND (flagged pre-launch): EXP4's RACE net is UNTRAINED (contact-only
+##       bootstrap, partition race=0 → random race net). Truncation gives exact targets at
+##       COVERED race positions, but the UNCOVERED race band (early race, >18-frame, between
+##       contact-end and table coverage) is played+valued by the random race net → corrupt
+##       value backup propagates to contact → contact value head learns wrong values →
+##       worse contact play. FIXABLE: seed a TRAINED frozen race net.
+##   (B) FUNDAMENTAL: the net+400-sim+truncation policy-improvement operator has a fixed
+##       point BELOW wildbg for contact (search isn't better than wildbg → self-play pulls
+##       DOWN). = "contact method-bound / self-play caps at teacher", now shown to cap BELOW
+##       teacher from an above-fixed-point start.
+## NEXT: distinguish A vs B by re-running with a TRAINED frozen race net. CAVEAT: value-head
+## format changed at v9 (joint cumulative) so pre-v9 race nets (distributed_race_20260314,
+## 128×3) are WRONG format; recent good race nets (v7/v11) are 256×5. Options: train a fresh
+## 128×3 (or 256×5) race net in current format first, or run a cheap diagnostic. Checkpoints
+## saved every 5 iters in exp5 dir for inspection.
+
 ## Phase 3 — Contact training (small net + exact-race-frontier curriculum)
 - [ ] Race-frontier truncation for contact traces: at a race position, evaluate with
       combined table (covered) else frozen race NN, stop rollout there. EXP2 only
