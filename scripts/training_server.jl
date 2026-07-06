@@ -1140,8 +1140,13 @@ end
 # Load buffer checkpoint if resuming (must happen after replay_buffer is created)
 if @isdefined(RESUME_BUFFER_DIR)
     buf_path = joinpath(RESUME_BUFFER_DIR, "buffer", "buffer_iter_$START_ITER.jls")
-    load_buffer!(replay_buffer, buf_path)
-    println("Loaded buffer checkpoint from $buf_path")
+    if isfile(buf_path)
+        load_buffer!(replay_buffer, buf_path)
+        println("Loaded buffer checkpoint from $buf_path")
+    else
+        println("Resume: no buffer checkpoint at $buf_path — starting with EMPTY buffer " *
+                "(warm weights, cold buffer). Intended for weights-only resume (e.g. bootstrap→self-play).")
+    end
 end
 
 # Training functions (extracted from train_distributed.jl)
