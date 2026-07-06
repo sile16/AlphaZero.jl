@@ -152,6 +152,19 @@ one interface per engine; evals valid/strong/fast/frequent.
 ## larger/diverse bootstrap set, held-out bootstrap validation, LR schedule/early stop,
 ## and/or PER/Reanalyze only after the supervised rung can reach the gate target.
 
+## EXP4 LAUNCHED (2026-07-06): DATA-SCALING TEST — 300k vs EXP3's 100k, one clean
+## variable. Hypothesis: EXP3's iter-5 peak then monotone decline = OVERFIT/data-starved.
+## 300k soft-policy wildbg contact bootstrap, dual 128×3, bootstrap-only, 40 iters,
+## eval every 2 iters (resolve the early peak precisely). Everything else IDENTICAL to
+## EXP3 (same net, PER/Reanalyze off, constant LR/MCTS, 200-pos×2 eval @ 200 MCTS).
+## Decisive read: if peak win% rises (24% → 30%+) the imitation ceiling is DATA-BOUND
+## (keep scaling / distill); if it stays ~24% it's ARCHITECTURE/OBJECTIVE-bound (noisy
+## outcome value target, net capacity) → redirect to value-distillation / arch, NOT more data.
+## Data gen: 20 shards (8 Jarvis seeds 101-108 + 12 Neo seeds 201-212), 15k each, merged
+## via scripts/merge_bootstrap_shards.jl → contact_bootstrap_wildbg_300k.jls (811MB).
+## Data-dir /home/sile/alphazero-contact-exp4-bootstrap300k. Eval clients on BOTH Jarvis
+## (localhost) + Neo (192.168.20.40:9090, eval file copied local).
+
 ## Phase 3 — Contact training (small net + exact-race-frontier curriculum)
 - [ ] Race-frontier truncation for contact traces: at a race position, evaluate with
       combined table (covered) else frozen race NN, stop rollout there. EXP2 only
