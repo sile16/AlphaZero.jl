@@ -54,8 +54,8 @@ const OBS_TYPE_MAP = Dict(
 const OBS_TYPE_STR = get(ENV, "BACKGAMMON_OBS_TYPE", "minimal_flat")
 const OBSERVATION_TYPE = get(OBS_TYPE_MAP, OBS_TYPE_STR, :minimal_flat)
 
-# Action space: 676 actions (26*26 locations)
-const NUM_ACTIONS = 676
+# Action space: checker moves only; cube actions live outside this AlphaZero wrapper.
+const NUM_ACTIONS = BackgammonNet.CHECKER_ACTIONS
 
 # Get observation size from BackgammonNet
 # Handle hybrid observations (named tuples) by computing flattened size
@@ -220,7 +220,7 @@ function GI.chance_outcomes(g::GameEnv)
   return _CACHED_OUTCOMES
 end
 
-const PASS_ACTION = BackgammonNet.encode_action(25, 25)
+const PASS_ACTION = BackgammonNet.encode_action(BackgammonNet.PASS_LOC, BackgammonNet.PASS_LOC)
 
 """Handle forced passes (auto-play when only move is pass|pass)."""
 function _handle_forced_pass!(g::GameEnv)
@@ -353,31 +353,8 @@ function GI.action_string(::GameSpec, action)
 end
 
 function GI.parse_action(::GameSpec, str)
-  parts = split(str, "|")
-  if length(parts) != 2
-    return nothing
-  end
-
-  function parse_loc(s)
-    s = strip(lowercase(s))
-    if s == "bar"
-      return 0
-    elseif s == "pass"
-      return 25
-    else
-      loc = tryparse(Int, s)
-      return loc !== nothing && 1 <= loc <= 24 ? loc : nothing
-    end
-  end
-
-  loc1 = parse_loc(parts[1])
-  loc2 = parse_loc(parts[2])
-
-  if loc1 === nothing || loc2 === nothing
-    return nothing
-  end
-
-  return BackgammonNet.encode_action(loc1, loc2)
+  action = BackgammonNet.parse_action(str)
+  return action !== nothing && 1 <= action <= NUM_ACTIONS ? action : nothing
 end
 
 #####
@@ -385,33 +362,7 @@ end
 #####
 
 function GI.heuristic_value(g::GameEnv)
-  # Get pip difference as a simple heuristic
-  # Note: This uses internal game state, not observation
-  game = g.game
-
-  # Calculate pip counts manually from board state
-  p0_pip = 0
-  p1_pip = 0
-  for i in 1:24
-    v = game[i]
-    if v > 0
-      p0_pip += v * (25 - i)  # White moving toward point 0
-    elseif v < 0
-      p1_pip += abs(v) * i    # Black moving toward point 25
-    end
-  end
-  # Add bar pieces (25 pips to enter)
-  p0_pip += game[0] * 25   # White on bar
-  p1_pip += abs(game[25]) * 25  # Black on bar
-
-  pip_diff = p1_pip - p0_pip  # Positive = white ahead
-
-  if game.current_player == 1
-    pip_diff = -pip_diff
-  end
-
-  # Normalize to roughly [-1, 1] range
-  return Float64(pip_diff) / 100.0
+  return Float64(BackgammonNet.heuristic_value(g.game))
 end
 
 #####

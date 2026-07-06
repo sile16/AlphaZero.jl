@@ -115,6 +115,7 @@ using Dates
 using Printf
 using StaticArrays
 using BackgammonNet
+using BackgammonNet: BearoffK7, bearoff_turn_value
 
 ENV["BACKGAMMON_OBS_TYPE"] = ARGS["obs_type"]
 include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
@@ -124,11 +125,7 @@ const STATE_DIM = GI.state_dim(gspec)[1]
 const ORACLE_CFG = AlphaZero.BackgammonInference.OracleConfig(
     STATE_DIM, NUM_ACTIONS, gspec; vectorize_state! = vectorize_state_into!)
 
-const BEAROFF_SRC = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k7.jl")
-isfile(BEAROFF_SRC) || error("bearoff_k7.jl not found at $BEAROFF_SRC")
-include(BEAROFF_SRC)
-include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
-using .BearoffK7
+const BACKGAMMONNET_REPO = dirname(dirname(pathof(BackgammonNet)))
 
 @inline normalized_points(v::Real) = Float64(v) / 3.0
 
@@ -151,7 +148,7 @@ function find_bearoff_dir()
         return ARGS["bearoff_dir"]
     end
     candidates = [
-        joinpath(dirname(BEAROFF_SRC), "..", "tools", "bearoff_twosided", "bearoff_k7_twosided"),
+        joinpath(BACKGAMMONNET_REPO, "tools", "bearoff_twosided", "bearoff_k7_twosided"),
         joinpath(homedir(), "bearoff_k7_twosided"),
         "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
     ]
@@ -295,7 +292,7 @@ function exact_action_values(state::BackgammonNet.BackgammonGame, table)
 
         # Turn-aware exact value: handles terminal rewards (gammon multiplier),
         # completed turns (opponent pre-dice lookup), and doubles mid-turn states
-        # (recursion) — see scripts/bearoff_eval_common.jl for the doubles pitfall.
+        # (recursion) — see BackgammonNet.bearoff_turn_value for the doubles pitfall.
         move_val = normalized_points(bearoff_turn_value(table, work, mover))
         action_values[action] = move_val
     end

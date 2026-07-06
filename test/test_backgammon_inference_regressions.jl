@@ -44,6 +44,26 @@ end
         state_dim, num_actions, gspec;
         vectorize_state! = BGD.vectorize_state_into!)
 
+    @testset "deterministic wrapper delegates stable BackgammonNet APIs" begin
+        @test num_actions == BackgammonNet.CHECKER_ACTIONS
+        @test BGD.NUM_ACTIONS == BackgammonNet.CHECKER_ACTIONS
+
+        @test GI.parse_action(gspec, "Bar | 5") == BackgammonNet.encode_action(BackgammonNet.BAR_LOC, 5)
+        @test GI.parse_action(gspec, "Pass | Pass") ==
+              BackgammonNet.encode_action(BackgammonNet.PASS_LOC, BackgammonNet.PASS_LOC)
+        @test GI.parse_action(gspec, "Double") === nothing
+
+        env = GI.init(gspec)
+        @test GI.heuristic_value(env) ≈ Float64(BackgammonNet.heuristic_value(env.game)) atol=1e-12
+
+        env.game.terminated = true
+        env.game.reward = 2.0f0
+        env.game.current_player = Int8(0)
+        @test GI.heuristic_value(env) == 2.0
+        env.game.current_player = Int8(1)
+        @test GI.heuristic_value(env) == -2.0
+    end
+
     @testset "current_state returns owning clone" begin
         env = GI.init(gspec)
         while GI.is_chance_node(env)

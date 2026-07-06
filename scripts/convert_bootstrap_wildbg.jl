@@ -35,16 +35,10 @@ include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl")
 const gspec = GameSpec()
 println("Packages loaded in $(round(time()-t0, digits=1))s"); flush(stdout)
 
-# Load k=7 bearoff module for is_bearoff_position
-const BEAROFF_K7_PATH = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k7.jl")
-isfile(BEAROFF_K7_PATH) || error("bearoff_k7.jl not found at: $BEAROFF_K7_PATH")
-include(BEAROFF_K7_PATH)
-using .BearoffK7
-
 const INPUT_DIR = joinpath(homedir(), "github", "BackgammonNet.jl", "data", "bootstrap")
 const OUTPUT_PATH = "/homeshare/projects/AlphaZero.jl/eval_data/bootstrap_wildbg_1M.jls"
 const NUM_PARTS = 10
-const NUM_ACTIONS_CONST = 676
+const NUM_ACTIONS_CONST = BackgammonNet.CHECKER_ACTIONS
 const TARGET_TOTAL = 1_000_000
 const PER_PART = TARGET_TOTAL ÷ NUM_PARTS
 
@@ -82,7 +76,7 @@ function convert_part(part::Int, data, sample_indices)
 
         # Classification
         is_contact = BackgammonNet.is_contact_position(game)
-        is_bearoff = BearoffK7.is_bearoff_position(game.p0, game.p1)
+        is_bearoff = BackgammonNet.BearoffK7.is_bearoff_position(game.p0, game.p1)
 
         if is_contact
             n_contact += 1

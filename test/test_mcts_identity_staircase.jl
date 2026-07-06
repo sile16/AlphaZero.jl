@@ -53,15 +53,15 @@ using StaticArrays
 using AlphaZero
 using AlphaZero: GI, MCTS, BatchedMCTS
 import BackgammonNet
-using BackgammonNet: BackgammonGame
+using BackgammonNet: BackgammonGame, BearoffK7, bearoff_best_move_value, bearoff_turn_value
 
 # ── Optional dependency discovery (table-optional guard) ────────────────────
 
-const _K7_SRC = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k7.jl")
+const _BGN_REPO = dirname(dirname(pathof(BackgammonNet)))
 
 function _find_k7_table_dir()
     for d in [
-        joinpath(dirname(_K7_SRC), "..", "tools", "bearoff_twosided", "bearoff_k7_twosided"),
+        joinpath(_BGN_REPO, "tools", "bearoff_twosided", "bearoff_k7_twosided"),
         joinpath(homedir(), "bearoff_k7_twosided"),
         "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
     ]
@@ -70,22 +70,15 @@ function _find_k7_table_dir()
     return nothing
 end
 
-const _K7_TABLE_DIR = isfile(_K7_SRC) ? _find_k7_table_dir() : nothing
+const _K7_TABLE_DIR = _find_k7_table_dir()
 
 if _K7_TABLE_DIR === nothing
-    @warn "k=7 bear-off table (or bearoff_k7.jl) not found — SKIPPING MCTS identity staircase (Rungs 1-3). This is a hard SKIP, not a pass."
+    @warn "k=7 bear-off table not found — SKIPPING MCTS identity staircase (Rungs 1-3). This is a hard SKIP, not a pass."
     @testset "MCTS Identity Staircase (SKIPPED — no k=7 table)" begin
         @test_skip true
     end
 else
-    # ── Load table + turn-aware helpers + game wrapper (mirror existing tests) ─
-    if !isdefined(Main, :BearoffK7)
-        include(_K7_SRC)
-        using .BearoffK7
-    end
-    if !isdefined(Main, :bearoff_turn_value)
-        include(joinpath(@__DIR__, "..", "scripts", "bearoff_eval_common.jl"))
-    end
+    # ── Load table + game wrapper ────────────────────────────────────────────
     if !isdefined(Main, :BackgammonDeterministic)
         include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "main.jl"))
     end

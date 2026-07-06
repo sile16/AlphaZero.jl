@@ -19,18 +19,14 @@ using Serialization
 using Printf
 using Statistics
 using Random
+using BackgammonNet: BearoffK6
 
-# ── Load BearoffK6 ──────────────────────────────────────────────────────
-
-const BEAROFF_SRC = joinpath(dirname(dirname(pathof(BackgammonNet))), "src", "bearoff_k6.jl")
-include(BEAROFF_SRC)
-using .BearoffK6
-
-const TABLE_DIR = joinpath(dirname(BEAROFF_SRC), "..", "tools", "bearoff_twosided", "bearoff_k6_twosided")
+const BACKGAMMONNET_REPO = dirname(dirname(pathof(BackgammonNet)))
+const TABLE_DIR = joinpath(BACKGAMMONNET_REPO, "tools", "bearoff_twosided", "bearoff_k6_twosided")
 if !isdir(TABLE_DIR)
     error("Bearoff table not found at: $TABLE_DIR")
 end
-const TABLE = BearoffTable(TABLE_DIR)
+const TABLE = BearoffK6.BearoffTable(TABLE_DIR)
 println("Bearoff table loaded: c14=$(TABLE.c14_pairs) pairs, c15=$(TABLE.c15_pairs) pairs")
 
 # ── Parse args ──────────────────────────────────────────────────────────

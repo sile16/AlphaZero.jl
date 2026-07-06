@@ -8,9 +8,9 @@
 # scripts/eval_table_vs_wildbg.jl: the exact table policy measurably LOST to
 # wildbg (-0.022 ± 0.010 paired) before the fix.
 #
-# The turn-aware helpers (scripts/bearoff_eval_common.jl) recurse through
-# mid-turn states. The recursion and terminal handling are exercised here
-# WITHOUT the 88GB table (only the chance-node branch needs it).
+# The turn-aware BackgammonNet helpers recurse through mid-turn states. The
+# recursion and terminal handling are exercised here WITHOUT the 88GB table
+# (only the chance-node branch needs it).
 
 using Test
 using Random
@@ -19,19 +19,8 @@ using StaticArrays
 using AlphaZero
 import BackgammonNet
 using BackgammonNet: BackgammonGame
-
-const BEAROFF_K7_SRC = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k7.jl")
-
-if !isfile(BEAROFF_K7_SRC)
-    @warn "bearoff_k7.jl not found — skipping doubles regression tests"
-else
-    if !isdefined(Main, :BearoffK7)
-        include(BEAROFF_K7_SRC)
-        using .BearoffK7
-    end
-    if !isdefined(Main, :bearoff_turn_value)
-        include(joinpath(@__DIR__, "..", "scripts", "bearoff_eval_common.jl"))
-    end
+using BackgammonNet: bearoff_best_move_value, bearoff_turn_value, bearoff_turn_value_equity
+using BackgammonNet: bearoff_value_to_nn_scale
 
     @testset "Doubles mid-turn recursion (no table needed)" begin
         # White (P0): 11 off, 4 checkers on point 24. Black (P1): 15 in home,
@@ -108,4 +97,3 @@ else
         @test eq_win == Float32[1, 1, 0, 0, 0]
         @test bearoff_value_to_nn_scale(v_win, 3.0) ≈ 2 / 3
     end
-end

@@ -100,13 +100,7 @@ const ORACLE_CFG = AlphaZero.BackgammonInference.OracleConfig(
     _state_dim, NUM_ACTIONS, gspec; vectorize_state! = vectorize_state_into!)
 const REWARD_SCALE = Float64(GI.reward_scale(gspec))
 
-# is_bearoff_position (for the pre-bearoff filter) from the k=7 module.
-const BEAROFF_SRC = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k7.jl")
-if isfile(BEAROFF_SRC) && !isdefined(Main, :BearoffK7)
-    include(BEAROFF_SRC)
-    using .BearoffK7
-end
-_is_bearoff(p0, p1) = isdefined(Main, :BearoffK7) ? BearoffK7.is_bearoff_position(p0, p1) : false
+_is_bearoff(p0, p1) = BackgammonNet.BearoffK7.is_bearoff_position(p0, p1)
 
 function find_wildbg_lib()
     isempty(ARGS["wildbg_lib"]) || return ARGS["wildbg_lib"]

@@ -5,6 +5,7 @@
 using Test
 using AlphaZero
 using AlphaZero.GI
+using BackgammonNet
 import AlphaZero.Network
 import AlphaZero.FluxLib
 
@@ -116,6 +117,25 @@ end
     eq = FluxLib.EquityOutput(0.6f0, 0.12f0, 0.0f0, 0.12f0, 0.0f0)
     expected = (2f0 * 0.6f0 - 1f0) + (0.12f0 - 0.12f0) + (0f0 - 0f0)
     @test FluxLib.compute_equity(eq) ≈ expected
+
+    valid_heads = [
+      (0.62f0, 0.18f0, 0.04f0, 0.11f0, 0.03f0),
+      (1.0f0, 1.0f0, 1.0f0, 0.0f0, 0.0f0),
+      (0.0f0, 0.0f0, 0.0f0, 1.0f0, 1.0f0),
+      (0.5f0, 0.1f0, 0.02f0, 0.1f0, 0.02f0),
+    ]
+    for h in valid_heads
+      out = FluxLib.EquityOutput(h...)
+      @test FluxLib.compute_equity(out) ≈ BackgammonNet.compute_equity_joint(h) atol=1e-6
+    end
+
+    pw = Float32[h[1] for h in valid_heads]
+    gw = Float32[h[2] for h in valid_heads]
+    bgw = Float32[h[3] for h in valid_heads]
+    gl = Float32[h[4] for h in valid_heads]
+    bgl = Float32[h[5] for h in valid_heads]
+    @test FluxLib.compute_equity(pw, gw, bgw, gl, bgl) ≈
+          BackgammonNet.compute_equity_joint.(valid_heads) atol=1e-6
   end
 
   @testset "EquityTargets from GameOutcome" begin
@@ -157,6 +177,10 @@ end
   end
 
   @testset "Equity vector helpers" begin
+    @test AlphaZero.VALUE_HEAD_CONTRACT == BackgammonNet.VALUE_HEAD_CONTRACT
+    @test AlphaZero.VALUE_HEAD_ORDER == BackgammonNet.VALUE_HEAD_ORDER
+    @test AlphaZero.VALUE_HEAD_STRICT_TOL == BackgammonNet.VALUE_HEAD_STRICT_TOL
+
     outcome = GI.GameOutcome(true, true, false)
     vec_white = AlphaZero.equity_vector_from_outcome(outcome, true)
     vec_black = AlphaZero.equity_vector_from_outcome(outcome, false)
@@ -170,6 +194,9 @@ end
     flipped = AlphaZero.flip_equity_perspective(soft)
     @test flipped == Float32[0.38, 0.4, 0.1, 0.25, 0.05]
     @test AlphaZero.flip_equity_perspective(flipped) == soft
+    @test AlphaZero.flip_equity_perspective(soft) == BackgammonNet.flip_equity_perspective(soft)
+    @test FluxLib.compute_equity(FluxLib.EquityOutput(soft...)) ≈
+          -FluxLib.compute_equity(FluxLib.EquityOutput(flipped...)) atol=1e-6
   end
 
   @testset "BCEWithLogits numerical correctness" begin

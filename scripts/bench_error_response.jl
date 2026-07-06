@@ -61,22 +61,16 @@ using Printf
 using AlphaZero
 using AlphaZero: GI, MCTS, BatchedMCTS
 import BackgammonNet
-using BackgammonNet: BackgammonGame
+using BackgammonNet: BackgammonGame, BearoffK7, bearoff_best_move_value, bearoff_turn_value
 
 ENV["BACKGAMMON_OBS_TYPE"] = "minimal_flat"
 include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
 const GSPEC = GameSpec()
 
-# ── k=7 exact table + turn-aware helpers ────────────────────────────────
-const BEAROFF_SRC = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k7.jl")
-isfile(BEAROFF_SRC) || error("bearoff_k7.jl not found at $BEAROFF_SRC")
-include(BEAROFF_SRC)
-using .BearoffK7
-include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
-
+const BACKGAMMONNET_REPO = dirname(dirname(pathof(BackgammonNet)))
 const TABLE = let
     candidates = [
-        joinpath(dirname(BEAROFF_SRC), "..", "tools", "bearoff_twosided", "bearoff_k7_twosided"),
+        joinpath(BACKGAMMONNET_REPO, "tools", "bearoff_twosided", "bearoff_k7_twosided"),
         joinpath(homedir(), "bearoff_k7_twosided"),
         "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
     ]

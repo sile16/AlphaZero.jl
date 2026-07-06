@@ -3,6 +3,12 @@
 ##### Datastructure to collect self-play experience
 #####
 
+import BackgammonNet
+
+const VALUE_HEAD_CONTRACT = BackgammonNet.VALUE_HEAD_CONTRACT
+const VALUE_HEAD_ORDER = BackgammonNet.VALUE_HEAD_ORDER
+const VALUE_HEAD_STRICT_TOL = BackgammonNet.VALUE_HEAD_STRICT_TOL
+
 """
     EquityTargets
 
@@ -112,14 +118,7 @@ then the returned vector is:
 `[P(lose), P(lose∧gammon+), P(lose∧bg), P(win∧gammon+), P(win∧bg)]`
 """
 function flip_equity_perspective(eq::AbstractVector{T}) where T <: Real
-  length(eq) == 5 || throw(ArgumentError("expected 5 equity heads, got $(length(eq))"))
-  return T[
-    one(T) - eq[1],
-    eq[4],
-    eq[5],
-    eq[2],
-    eq[3],
-  ]
+  return BackgammonNet.flip_equity_perspective(eq)
 end
 
 """

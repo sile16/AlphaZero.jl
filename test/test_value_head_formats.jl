@@ -19,28 +19,12 @@ using Random
 using Printf
 using StaticArrays
 
-# ── Load BackgammonNet + BearoffK6 ──────────────────────────────────────
-
 using BackgammonNet
+using BackgammonNet: BearoffK6
 
-# BearoffK6 module (same include path as selfplay_client.jl)
-const BEAROFF_SRC_DIR = let
-    local_path = joinpath(dirname(@__DIR__), "..", "BackgammonNet.jl", "src", "bearoff_k6.jl")
-    pkg_path = joinpath(dirname(dirname(pathof(BackgammonNet))), "src", "bearoff_k6.jl")
-    if isfile(local_path)
-        dirname(local_path)
-    elseif isfile(pkg_path)
-        dirname(pkg_path)
-    else
-        error("Cannot find bearoff_k6.jl")
-    end
-end
-
-include(joinpath(BEAROFF_SRC_DIR, "bearoff_k6.jl"))
-using .BearoffK6
-
-const TABLE_DIR = joinpath(BEAROFF_SRC_DIR, "..", "tools", "bearoff_twosided", "bearoff_k6_twosided")
-const TABLE = BearoffTable(TABLE_DIR)
+const BACKGAMMONNET_REPO = dirname(dirname(pathof(BackgammonNet)))
+const TABLE_DIR = joinpath(BACKGAMMONNET_REPO, "tools", "bearoff_twosided", "bearoff_k6_twosided")
+const TABLE = BearoffK6.BearoffTable(TABLE_DIR)
 
 # ── Board helpers (from test_bearoff_bellman.jl) ────────────────────────
 

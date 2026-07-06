@@ -129,6 +129,9 @@ using AlphaZero: ConstSchedule
 using AlphaZero: GameLoop
 import Flux
 import BackgammonNet
+using BackgammonNet: BearoffK7, BearoffOneSided, CombinedBearoff
+using BackgammonNet: bearoff_best_move_value, bearoff_covers, bearoff_equity, bearoff_lookup
+using BackgammonNet: bearoff_turn_value_equity, bearoff_value_to_nn_scale
 import JSON3
 const CPU_INFERENCE_BACKEND = AlphaZero.BackgammonInference.resolve_cpu_backend(ARGS["inference_backend"])
 # Fail-fast: the :flux CPU oracle reads the MUTABLE network object that the
@@ -283,28 +286,7 @@ end
 ##### Bear-off table (mandatory — loaded locally, too large to serve over HTTP)
 #####
 
-const BEAROFF_SRC_DIR = let
-    local_path = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k7.jl")
-    pkg_path = joinpath(dirname(pathof(BackgammonNet)), "bearoff_k7.jl")
-    if isfile(local_path)
-        dirname(local_path)
-    elseif isfile(pkg_path)
-        dirname(pkg_path)
-    else
-        error("Cannot find bearoff_k7.jl. Expected at:\n  $local_path\n  $pkg_path")
-    end
-end
-
-include(joinpath(BEAROFF_SRC_DIR, "bearoff_k7.jl"))
-using .BearoffK7
-include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
-# One-sided (n=18 race) + combined position-dispatch. Modules always present in the
-# repo; the combined TABLE is loaded below only if its data dir exists. This lets the
-# self-play/eval MCTS use the EXACT race frontier (combined = exact k7 where it applies,
-# else n=18 one-sided race), not just deep k7 bearoff.
-include(joinpath(BEAROFF_SRC_DIR, "bearoff_onesided.jl"))
-using .BearoffOneSided
-include(joinpath(@__DIR__, "bearoff_combined.jl"))
+const BACKGAMMONNET_REPO_CLIENT = dirname(dirname(pathof(BackgammonNet)))
 
 # F1/F3: bearoff is a CLUSTER-WIDE decision made by the server (config["use_bearoff"],
 # derived from its --no-bearoff). When ON, EVERY client must have the LOCAL k=7 table:
@@ -323,7 +305,7 @@ const BEAROFF_TABLE = let
     else
         # Prefer local copy (mmap over NFS can cause bus errors on large files)
         candidates = [
-            joinpath(BEAROFF_SRC_DIR, "..", "tools", "bearoff_twosided", "bearoff_k7_twosided"),
+            joinpath(BACKGAMMONNET_REPO_CLIENT, "tools", "bearoff_twosided", "bearoff_k7_twosided"),
             joinpath(homedir(), "bearoff_k7_twosided"),
             "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
         ]
@@ -341,14 +323,14 @@ const BEAROFF_TABLE = let
             "table-equipped clients.\n  Fix: copy bearoff_k7_twosided/ to ~/bearoff_k7_twosided/, " *
             "or run the server with --no-bearoff to disable bearoff for the whole cluster.")
         println("Loading k=7 bear-off table from $table_dir ...")
-        k7 = BearoffTable(table_dir)
+        k7 = BearoffK7.BearoffTable(table_dir)
         println("  c14: $(round(length(k7.c14_data)/1e9, digits=1)) GB")
         println("  c15: $(round(length(k7.c15_data)/1e9, digits=1)) GB")
         # Optional n=18 one-sided race table — extends EXACT coverage to disengaged
         # races ≤18 pips/side. Present → COMBINED (exact race frontier for the contact
         # curriculum); absent → k7-only (deep bearoff exact; >7pt races → NN).
         os_candidates = [
-            joinpath(BEAROFF_SRC_DIR, "..", "tools", "bearoff_onesided", "bearoff_n18"),
+            joinpath(BACKGAMMONNET_REPO_CLIENT, "tools", "bearoff_onesided", "bearoff_n18"),
             joinpath(homedir(), "bearoff_n18"),
             "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_n18",
         ]
@@ -446,8 +428,7 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
 
     # Compute in mover's perspective (maximize), then convert to white-relative.
     # bearoff_turn_value_equity handles terminal (reward carries gammon multiplier),
-    # completed-turn chance nodes (table lookup), AND doubles mid-turn states
-    # (recursion) — see scripts/bearoff_eval_common.jl for the doubles pitfall.
+    # completed-turn chance nodes (table lookup), AND doubles mid-turn states.
     best_mover_value = -Inf
     best_mover_equity = nothing  # 5-elem joint vector from mover's perspective
     bg_copy = BackgammonNet.clone(game)
@@ -516,7 +497,7 @@ function make_bearoff_evaluator(table)
 
         # Decision node (post-dice): enumerate moves to get exact Q(board, dice).
         # bearoff_best_move_value handles terminal rewards (gammon multiplier) and
-        # doubles mid-turn recursion — see scripts/bearoff_eval_common.jl.
+        # doubles mid-turn recursion.
         actions = BackgammonNet.legal_actions(bg)
         if isempty(actions)
             return nothing

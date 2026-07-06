@@ -84,34 +84,20 @@ using StaticArrays
 using AlphaZero
 using AlphaZero: GI, GameLoop
 import BackgammonNet
-using BackgammonNet: BackgammonGame
+using BackgammonNet: BackgammonGame, BearoffK7, BearoffOneSided
+using BackgammonNet: bearoff_best_move_value, bearoff_covers, bearoff_lookup
+using BackgammonNet: bearoff_objective_value, bearoff_turn_value, load_combined_bearoff
 
 # Backgammon game wrapper (GameEnv, GameSpec) — same pattern as eval_race.jl
 include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
 
-# ── k=7 table ───────────────────────────────────────────────────────────
-
-const BEAROFF_SRC = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k7.jl")
-isfile(BEAROFF_SRC) || error("bearoff_k7.jl not found at $BEAROFF_SRC")
-include(BEAROFF_SRC)
-using .BearoffK7
-using .BearoffK7: BearoffTable
-include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
-
 const TABLE_KIND = Symbol(ARGS_D["table"])
 TABLE_KIND in (:k7, :onesided, :combined) || error("--table must be k7|onesided|combined")
-
-# One-sided module + combined dispatch — only loaded when needed. These add the
-# one-sided/combined methods to the generic bearoff_lookup/bearoff_covers.
-if TABLE_KIND != :k7
-    include(joinpath(dirname(BEAROFF_SRC), "bearoff_onesided.jl"))
-    using .BearoffOneSided
-    include(joinpath(@__DIR__, "bearoff_combined.jl"))
-end
+const BACKGAMMONNET_REPO = dirname(dirname(pathof(BackgammonNet)))
 
 function _find_k7_dir()
     candidates = [
-        joinpath(dirname(BEAROFF_SRC), "..", "tools", "bearoff_twosided", "bearoff_k7_twosided"),
+        joinpath(BACKGAMMONNET_REPO, "tools", "bearoff_twosided", "bearoff_k7_twosided"),
         joinpath(homedir(), "bearoff_k7_twosided"),
         "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
     ]
@@ -123,7 +109,7 @@ end
 function _find_onesided_dir()
     isempty(ARGS_D["onesided_dir"]) || return ARGS_D["onesided_dir"]
     for d in [
-        joinpath(dirname(BEAROFF_SRC), "..", "tools", "bearoff_onesided", "bearoff_n18"),
+        joinpath(BACKGAMMONNET_REPO, "tools", "bearoff_onesided", "bearoff_n18"),
         joinpath(homedir(), "bearoff_n18"),
     ]
         isdir(d) && isfile(joinpath(d, "onesided_all.bin")) && return d
@@ -132,7 +118,7 @@ function _find_onesided_dir()
 end
 
 const TABLE = if TABLE_KIND == :k7
-    d = _find_k7_dir(); println("Loading k=7 table from $d ..."); BearoffTable(d)
+    d = _find_k7_dir(); println("Loading k=7 table from $d ..."); BearoffK7.BearoffTable(d)
 elseif TABLE_KIND == :onesided
     d = _find_onesided_dir(); println("Loading n=18 one-sided table from $d ..."); BearoffOneSided.OneSidedTable(d)
 else  # combined
@@ -264,7 +250,7 @@ function make_objective_bearoff_evaluator(table, weights)
         bearoff_covers(table, bg.p0, bg.p1) || return nothing
         if BackgammonNet.is_chance_node(bg)
             r = bearoff_lookup(table, bg)
-            mover_eq = _bearoff_objective_value(r, weights) / 3.0
+            mover_eq = bearoff_objective_value(r, weights) / 3.0
             return bg.current_player == 0 ? mover_eq : -mover_eq
         end
         acts = BackgammonNet.legal_actions(bg)

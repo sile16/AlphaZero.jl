@@ -93,30 +93,23 @@ const ORACLE_CFG = AlphaZero.BackgammonInference.OracleConfig(
     _state_dim, NUM_ACTIONS, gspec; vectorize_state! = vectorize_state_into!)
 
 # ── Optional exact bear-off evaluator (--bearoff-eval) ──────────────────
-# DEFAULT OFF. Without the flag, BEAROFF_EVALUATOR stays `nothing`, the k=7
-# table/BearoffK7 are never loaded, and the eval is byte-identical to the
-# historical standard. With the flag, MCTS agents get an exact endgame
+# DEFAULT OFF. Without the flag, BEAROFF_EVALUATOR stays `nothing` and no table
+# is mmap'd, so the eval is byte-identical to the historical standard. With the
+# flag, MCTS agents get an exact endgame
 # evaluator: pre-dice table lookup at chance nodes, exact best-move value at
 # decision nodes. Every race game funnels into bearoff, so this removes wasted
 # sims re-deriving endgame values and eliminates close-bearoff misplays.
 #
 # Pattern follows scripts/eval_table_vs_wildbg.jl (TABLE const) and
 # scripts/selfplay_client.jl (make_bearoff_evaluator). The doubles pitfall is
-# handled inside bearoff_eval_common.jl — we use bearoff_best_move_value, which
-# recurses through mid-turn doubles states. Returns WHITE-relative, NORMALIZED
-# /3 values to match the NN value scale [-1,1].
+# handled inside BackgammonNet.bearoff_best_move_value, which recurses through
+# mid-turn doubles states. Returns WHITE-relative, NORMALIZED /3 values to match
+# the NN value scale [-1,1].
 BEAROFF_EVALUATOR = nothing
 if ARGS["bearoff_eval"]
-    BEAROFF_SRC = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k7.jl")
-    isfile(BEAROFF_SRC) ||
-        error("--bearoff-eval requested but bearoff_k7.jl not found at $BEAROFF_SRC")
-    include(BEAROFF_SRC)
-    using .BearoffK7
-    using .BearoffK7: BearoffTable
-    include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
-
+    _bgn_repo = dirname(dirname(pathof(BackgammonNet)))
     _table_candidates = [
-        joinpath(dirname(BEAROFF_SRC), "..", "tools", "bearoff_twosided", "bearoff_k7_twosided"),
+        joinpath(_bgn_repo, "tools", "bearoff_twosided", "bearoff_k7_twosided"),
         joinpath(homedir(), "bearoff_k7_twosided"),
         "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
     ]
@@ -126,7 +119,7 @@ if ARGS["bearoff_eval"]
               join(_table_candidates, ", "))
     println("Loading k=7 bear-off table from $(_table_candidates[_tdir]) ...")
     flush(stdout)
-    global TABLE = BearoffTable(_table_candidates[_tdir])
+    global TABLE = BearoffK7.BearoffTable(_table_candidates[_tdir])
 
     # Mirrors selfplay_client.jl's make_bearoff_evaluator (money weights).
     # Single normalization point tied to GI.reward_scale (raw points → [-1,1]).

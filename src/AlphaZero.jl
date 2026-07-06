@@ -116,6 +116,7 @@ module AlphaZero
   # Memory buffer to hold samples generated during self-play
   include("memory.jl")
   export MemoryBuffer, get_experience
+  export VALUE_HEAD_CONTRACT, VALUE_HEAD_ORDER, VALUE_HEAD_STRICT_TOL
   export EquityTargets, equity_targets_from_outcome
   export equity_vector, equity_vector_from_outcome, flip_equity_perspective
 

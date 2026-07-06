@@ -418,6 +418,7 @@ const BEAROFF_EVAL_ROLLOUTS_PER_START = ARGS["bearoff_eval_rollouts_per_start"]
 
 # ── Eval Setup (wildbg on CPU) ─────────────────────────────────────────
 using BackgammonNet
+using BackgammonNet: BearoffK7, bearoff_turn_value
 using StaticArrays
 
 function find_wildbg_lib_server()
@@ -453,14 +454,11 @@ else
     Tuple[]
 end
 
-const BEAROFF_SRC = joinpath(homedir(), "github", "BackgammonNet.jl", "src", "bearoff_k7.jl")
-include(BEAROFF_SRC)
-using .BearoffK7
-include(joinpath(@__DIR__, "bearoff_eval_common.jl"))
+const BACKGAMMONNET_REPO_SERVER = dirname(dirname(pathof(BackgammonNet)))
 
 function find_bearoff_dir_server()
     candidates = [
-        joinpath(dirname(BEAROFF_SRC), "..", "tools", "bearoff_twosided", "bearoff_k7_twosided"),
+        joinpath(BACKGAMMONNET_REPO_SERVER, "tools", "bearoff_twosided", "bearoff_k7_twosided"),
         joinpath(homedir(), "bearoff_k7_twosided"),
         "/homeshare/projects/AlphaZero.jl/eval_data/bearoff_k7_twosided",
     ]
@@ -631,7 +629,7 @@ function exact_bearoff_action_values(state::BackgammonNet.BackgammonGame, table)
         BackgammonNet.apply_action!(work, action)
         # Turn-aware exact value: handles terminal rewards (gammon multiplier),
         # completed turns (opponent pre-dice lookup), and doubles mid-turn states
-        # (recursion) — see scripts/bearoff_eval_common.jl for the doubles pitfall.
+        # (recursion) — see BackgammonNet.bearoff_turn_value for the doubles pitfall.
         move_val = normalized_points_server(bearoff_turn_value(table, work, mover))
         action_values[action] = move_val
     end
@@ -1037,6 +1035,48 @@ const LEARNING_PARAMS = LearningParams(
     num_checkpoints=1
 )
 
+function _metadata_get(meta, key::Symbol, default=nothing)
+    if meta isa AbstractDict
+        haskey(meta, key) && return meta[key]
+        skey = String(key)
+        haskey(meta, skey) && return meta[skey]
+        return default
+    end
+    return hasproperty(meta, key) ? getproperty(meta, key) : default
+end
+
+function _validate_bootstrap_value_metadata!(bootstrap_samples)
+    if !(bootstrap_samples isa NamedTuple && hasproperty(bootstrap_samples, :metadata))
+        @warn "Bootstrap artifact has no metadata; cannot verify value-head contract before ingest"
+        return nothing
+    end
+
+    meta = bootstrap_samples.metadata
+    contract = _metadata_get(meta, :value_head_contract, nothing)
+    order = _metadata_get(meta, :value_head_order, nothing)
+    order_vec = order === nothing ? nothing : collect(order)
+    contract == AlphaZero.VALUE_HEAD_CONTRACT ||
+        error("Bootstrap value_head_contract mismatch: expected $(AlphaZero.VALUE_HEAD_CONTRACT), got $contract")
+    order_vec == collect(AlphaZero.VALUE_HEAD_ORDER) ||
+        error("Bootstrap value_head_order mismatch: expected $(collect(AlphaZero.VALUE_HEAD_ORDER)), got $order")
+    return nothing
+end
+
+function _check_bootstrap_equity_heads!(eq, label::AbstractString)
+    length(eq) == 5 || error("$label expected 5 value heads, got $(length(eq))")
+    vals = Float64.(eq)
+    tol = Float64(AlphaZero.VALUE_HEAD_STRICT_TOL)
+    for x in vals
+        isfinite(x) || error("$label has non-finite value head: $eq")
+        0.0 <= x <= 1.0 || error("$label has probability outside [0,1]: $eq")
+    end
+    vals[3] <= vals[2] + tol || error("$label violates p_bg_win <= p_gammon_win: $eq")
+    vals[2] <= vals[1] + tol || error("$label violates p_gammon_win <= p_win: $eq")
+    vals[5] <= vals[4] + tol || error("$label violates p_bg_loss <= p_gammon_loss: $eq")
+    vals[4] <= (1.0 - vals[1]) + tol || error("$label violates p_gammon_loss <= 1 - p_win: $eq")
+    return nothing
+end
+
 # PER buffer (columnar, pre-allocated)
 replay_buffer = PERBuffer(BUFFER_CAPACITY, _state_dim, NUM_ACTIONS;
                            beta_init=PER_BETA_INIT, annealing_iters=ARGS["total_iterations"])
@@ -1049,6 +1089,7 @@ if !isempty(ARGS["bootstrap_file"])
         println("\nLoading bootstrap data from: $bootstrap_path")
         flush(stdout)
         bootstrap_samples = Serialization.deserialize(bootstrap_path)
+        _validate_bootstrap_value_metadata!(bootstrap_samples)
 
         # Supported bootstrap formats:
         # 1) Vector of per-sample NamedTuples with state/policy/value/equity/flags
@@ -1091,6 +1132,7 @@ if !isempty(ARGS["bootstrap_file"])
                         @inbounds policies[a, j] = Float32(raw_policy[a])
                     end
                     eq = equity_chunk[j]
+                    _check_bootstrap_equity_heads!(eq, "bootstrap sample $(start_idx + j - 1)")
                     @inbounds for k in 1:5
                         equities[k, j] = Float32(eq[k])
                     end
@@ -1109,6 +1151,9 @@ if !isempty(ARGS["bootstrap_file"])
                     policies = policies_raw[1:NUM_ACTIONS, :]
                 end
                 values = Float32[s.value for s in chunk]
+                for (j, s) in enumerate(chunk)
+                    s.has_equity && _check_bootstrap_equity_heads!(s.equity, "bootstrap sample $(start_idx + j - 1)")
+                end
                 equities = hcat([s.equity for s in chunk]...)
                 has_equity = Bool[s.has_equity for s in chunk]
                 is_chance = Bool[s.is_chance for s in chunk]
