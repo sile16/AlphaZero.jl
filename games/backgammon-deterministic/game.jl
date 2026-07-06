@@ -11,7 +11,7 @@
 # - doubles_only=true: Only doubles dice rolls (simpler game)
 # - OBSERVATION_TYPE: :minimal_flat (344), :full_flat, :minimal (44×1×26), :full (62×1×26)
 #
-# BackgammonNet v0.6.0+ required
+# BackgammonNet v0.6.4+ required
 
 import AlphaZero.GI
 using StaticArrays
