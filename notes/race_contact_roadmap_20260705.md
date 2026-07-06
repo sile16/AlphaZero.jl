@@ -165,6 +165,40 @@ one interface per engine; evals valid/strong/fast/frequent.
 ## Data-dir /home/sile/alphazero-contact-exp4-bootstrap300k. Eval clients on BOTH Jarvis
 ## (localhost) + Neo (192.168.20.40:9090, eval file copied local).
 
+## EXP4 COMPLETED (2026-07-06 ~11:55→12:00): 300k bootstrap-only, dual 128×3, 40 iters,
+## eval every 2. Data-dir /home/sile/alphazero-contact-exp4-bootstrap300k. Both machines
+## evaluated (Jarvis localhost + Neo via reverse SSH tunnel — Neo's Julia-LAN EHOSTUNREACH
+## gremlin returned post-reboot; nc/curl/ssh reach 9090 but Julia HTTP.jl does not, so
+## tunnelled Neo→loopback→Jarvis). Run: ~13s/iter, ~3 min total. contact_loss 5.09→3.92.
+## Eval trajectory (win% vs wildbg large, 200pos×2sides=400 games, 200 MCTS):
+##   iter 0  -1.7525  8.8%      iter 22 -0.7975 25.8%
+##   iter 2  -1.12   18.5%      iter 24 -0.82   25.2%
+##   iter 6  -0.9625 23.0%      iter 26 -0.9025 22.5%
+##   iter 10 -0.7625 26.0%      iter 28 -0.7525 27.3%
+##   iter 12 -0.84   25.2%      iter 30 -0.8175 25.8%
+##   iter 14 -0.885  23.0%      iter 32 -0.805  25.0%
+##   iter 16 -0.97   22.0%      iter 34 -0.71   27.5%  <- BEST equity
+##   iter 20 -0.91   22.0%      iter 36 -0.75   29.2%  <- BEST win%
+##                              iter 38 -0.84   22.8%
+##                              iter 40 -0.7875 25.8%
+##   (iters 4/8/18 skipped — eval job replaced when training briefly outran eval.)
+## VERDICT — MIXED, leans METHOD/OBJECTIVE-bound:
+## - 3x data FIXED EXP3's overfit collapse: EXP3(100k) peaked iter5 24% then fell to 17%
+##   by iter60; EXP4(300k) does NOT collapse — holds -0.7..-0.9 band, best equity -0.71
+##   (vs EXP3 ~-0.92), equity mildly IMPROVING late. So EXP3's decline WAS data starvation.
+## - BUT the CEILING moved only modestly: peak win% 24% -> 29% (+5pts), still FAR from the
+##   ~35-40% gate. 3x data bought ~+5% win = diminishing returns; reaching 40% by data
+##   volume alone would need >>1M samples. The residual gap is NOT primarily data-bound.
+## - Best measured contact-imitation point to date: iter34 -0.71 eq / iter36 29.2% win.
+## NEXT (recommended) EXP5 = VALUE DISTILLATION (objective change, no extra games):
+##   regenerate bootstrap with wildbg's per-position EQUITY ESTIMATE as the value/5-head
+##   target (low variance) instead of the single-game OUTCOME ±1/±2/±3 (high variance).
+##   Hypothesis: the noisy outcome value target caps MCTS-eval play quality; distilling
+##   wildbg's equity should lift the ceiling without more data. Same 300k states, 128x3,
+##   bootstrap-only, eval every 2 — one clean variable (value target) vs EXP4. If this
+##   also plateaus ~29%, the ceiling is capacity/policy-search-bound → curriculum/search.
+## Artifacts: contact_bootstrap_wildbg_300k.jls (811MB, kept); 20 shards deleted post-merge.
+
 ## Phase 3 — Contact training (small net + exact-race-frontier curriculum)
 - [ ] Race-frontier truncation for contact traces: at a race position, evaluate with
       combined table (covered) else frozen race NN, stop rollout there. EXP2 only
