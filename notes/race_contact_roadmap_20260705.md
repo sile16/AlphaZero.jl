@@ -28,6 +28,9 @@ one interface per engine; evals valid/strong/fast/frequent.
       the final iter eval before exit, or run final eval out-of-band. DONE: patched
       stats.num_games, added handler regression, factored final eval logging, and
       added bounded final-eval wait.
+- [x] Operational launch note: from the Codex exec environment, plain `nohup ... &`
+      children were reaped after the shell returned. Use `setsid bash -c 'exec julia ...'`
+      for detached Jarvis training/eval processes; verified with EXP3.
 - [ ] Stop orphan self-play client wrapper after bounded runs, or teach start_client.sh /
       selfplay_client to exit cleanly when the server is intentionally complete.
       Partial: added selfplay_client --eval-only so bootstrap/eval runs can avoid
@@ -105,7 +108,10 @@ one interface per engine; evals valid/strong/fast/frequent.
 ## - [x] Ensure final eval completes before training process exits.
 ## - [ ] Standalone eval contact_iter_200/contact_latest (same 200-pos, 200-MCTS quick
 ##       eval, then larger eval if promising).
-## - [ ] Run bootstrap-only/pretrain sweep from contact_bootstrap_wildbg.jls before
+## - [x] Launch first bootstrap-only/pretrain rung from contact_bootstrap_wildbg.jls before
+##       self-play: 100k samples, 60 train iters, eval every 5 iters. This isolates
+##       supervised bootstrap quality before self-play contamination.
+## - [ ] Continue bootstrap-only/pretrain sweep from contact_bootstrap_wildbg.jls before
 ##       self-play: 100k vs 300k+ samples, 15/30/60 train iters, evaluate each.
 ##       Gate to EXP3 self-play only when bootstrap checkpoint is much closer to
 ##       wildbg (target at least ~35-40% win quick eval, not 20%).
@@ -114,6 +120,25 @@ one interface per engine; evals valid/strong/fast/frequent.
 ##       if eval path is clean; compare bearoff_truncation=false vs true as a controlled
 ##       A/B only after bootstrap quality is acceptable.
 ## - [ ] Keep contact net small (128×3/×5) until method breaks the contact plateau.
+
+## EXP3 BOOTSTRAP-ONLY RUNG LAUNCHED (2026-07-06 ~10:55): dual 128×3,
+## 100k soft contact bootstrap, bootstrap-only, 60 iters, no self-play uploads.
+## Data-dir: /home/sile/alphazero-contact-exp3-bootstrap100k-60.
+## Commit: 92b22b0. Server PID 2484306, eval-only client PID 2485524, both detached
+## with setsid. Logs: exp3_bootstrap_server_setsid.log /
+## exp3_bootstrap_eval_client_setsid.log.
+## Config facts: PER=false, Reanalyze=false, eval 200 positions x 2 sides,
+## 200 MCTS, eval every 5 iters, combined k7+n18 exact evaluator loaded by
+## eval client; server fixed bearoff eval/gate disabled. Live validation:
+## status reached iter 15, iter 15 checkpoints saved, client registered as jarvis.
+## Early eval trajectory:
+##   iter 0  -1.752 equity,  8.8% win
+##   iter 5  -0.935 equity, 24.25% win
+##   iter 10 -1.010 equity, 20.5% win
+##   iter 15 in progress; first chunk -0.64 equity, 30.0% win
+## Next: monitor 15/30/60 eval points and only launch self-play if the
+## bootstrap-only checkpoint is materially closer to wildbg than EXP2's ~24-26%
+## plateau.
 
 ## Phase 3 — Contact training (small net + exact-race-frontier curriculum)
 - [ ] Race-frontier truncation for contact traces: at a race position, evaluate with
