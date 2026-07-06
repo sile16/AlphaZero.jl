@@ -26,6 +26,7 @@ Usage:
 """
 
 using ArgParse
+include(joinpath(@__DIR__, "_backgammon_data_paths.jl"))
 
 function parse_args_gt()
     s = ArgParseSettings(description="Pre-bearoff race value ground-truth eval", autofix_names=true)
@@ -63,7 +64,7 @@ function parse_args_gt()
             default = ""
         "--positions-file"
             arg_type = String
-            default = joinpath(dirname(@__DIR__), "eval_data", "race_eval_2000.jls")
+            default = backgammonnet_eval_data_file("race_eval_2000.jls")
         "--pre-bearoff-only"
             help = "Keep only positions NOT yet in the k=7 bearoff range (the pre-bearoff band)"
             action = :store_true

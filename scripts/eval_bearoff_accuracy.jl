@@ -20,6 +20,7 @@ Example:
 """
 
 using ArgParse
+include(joinpath(@__DIR__, "_backgammon_data_paths.jl"))
 
 function parse_args()
     s = ArgParseSettings(description="Evaluate bearoff value and move accuracy", autofix_names=true)
@@ -55,12 +56,11 @@ function parse_args()
         "--bootstrap-file"
             arg_type = String
             default = get(ENV, "BACKGAMMONNET_BOOTSTRAP_FILE",
-                          joinpath(dirname(dirname(@__DIR__)), "BackgammonNet.jl",
-                                   "data", "bootstrap", "bootstrap_5000g_bgblitz1ply.jls"))
+                          backgammonnet_bootstrap_file("bootstrap_5000g_bgblitz1ply.jls"))
             help = "Raw bootstrap with BackgammonGame states (fallback source)"
         "--start-positions-file"
             arg_type = String
-            default = "eval_data/race_eval_2000.jls"
+            default = backgammonnet_eval_data_file("race_eval_2000.jls")
             help = "Canonical race start positions used to generate bearoff eval states"
         "--rollouts-per-start"
             arg_type = Int

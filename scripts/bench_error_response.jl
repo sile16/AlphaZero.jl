@@ -27,6 +27,7 @@ NOT git-committed; coexists with eval_race.jl (use --threads 8).
 """
 
 using ArgParse
+include(joinpath(@__DIR__, "_backgammon_data_paths.jl"))
 
 function parse_cli()
     s = ArgParseSettings(description="MCTS error-response curves (rungs 6-7)", autofix_names=true)
@@ -146,6 +147,10 @@ end
 function find_positions_file()
     isempty(ARGS_D["positions_file"]) || return ARGS_D["positions_file"]
     for f in [
+        backgammonnet_eval_data_file("race_starts_tuples_bootstrap_no_eval_no_bo.jls"),
+        backgammonnet_eval_data_file("race_starts_tuples_bootstrap_no_eval.jls"),
+        backgammonnet_eval_data_file("race_starts_tuples_no_eval.jls"),
+        backgammonnet_eval_data_file("race_starts_tuples.jls"),
         joinpath(@__DIR__, "..", "eval_data", "race_starts_tuples_bootstrap_no_eval_no_bo.jls"),
         joinpath(@__DIR__, "..", "eval_data", "race_starts_tuples_no_eval.jls"),
         joinpath(@__DIR__, "..", "eval_data", "race_starts_tuples.jls"),

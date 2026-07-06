@@ -42,6 +42,8 @@ using Dates
 using Random
 using Statistics
 
+include(joinpath(@__DIR__, "_backgammon_data_paths.jl"))
+
 const SelfPlayRNG = Random.Xoshiro
 
 new_selfplay_rng(seed::Integer) = SelfPlayRNG(seed)
@@ -102,7 +104,7 @@ function parse_args()
         "--eval-positions-file"
             help = "Path to fixed eval positions file (portable tuples)"
             arg_type = String
-            default = joinpath(dirname(@__DIR__), "eval_data", "race_eval_2000.jls")
+            default = backgammonnet_eval_data_file("race_eval_2000.jls")
     end
 
     return ArgParse.parse_args(s)
@@ -513,6 +515,7 @@ function find_or_download(filename::String; required::Bool=true)
     # Search local paths
     candidates = [
         filename,  # full path (if provided)
+        joinpath(backgammonnet_eval_data_dir(), name),
         joinpath(dirname(@__DIR__), "eval_data", name),
         joinpath(homedir(), "eval_data", name),
     ]
@@ -520,7 +523,7 @@ function find_or_download(filename::String; required::Bool=true)
         isfile(p) && return p
     end
     # Download from server
-    local_path = joinpath(dirname(@__DIR__), "eval_data", name)
+    local_path = joinpath(backgammonnet_eval_data_dir(), name)
     mkpath(dirname(local_path))
     println("Downloading $name from server...")
     try

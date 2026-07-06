@@ -548,11 +548,14 @@ function create_router(state::ServerState, buffer::PERBuffer)
         end
         # Search known data directories
         search_paths = [
-            joinpath(@__DIR__, "..", "..", "eval_data"),  # project eval_data/
+            get(ENV, "BACKGAMMONNET_EVAL_DATA_DIR", ""),
+            joinpath(@__DIR__, "..", "..", "..", "BackgammonNet.jl", "data", "eval"),
+            joinpath(@__DIR__, "..", "..", "eval_data"),  # legacy project eval_data/
             get(state.config, "eval_data_dir", ""),
             get(state.config, "data_dir", ""),
         ]
         for dir in search_paths
+            isempty(dir) && continue
             path = joinpath(dir, filename)
             if isfile(path)
                 data = read(path)

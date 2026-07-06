@@ -16,6 +16,7 @@ Usage:
 """
 
 using ArgParse
+include(joinpath(@__DIR__, "_backgammon_data_paths.jl"))
 
 function parse_args_eval()
     s = ArgParseSettings(description="Evaluate race model on fixed positions", autofix_names=true)
@@ -48,7 +49,7 @@ function parse_args_eval()
             default = ""
         "--positions-file"
             arg_type = String
-            default = joinpath(dirname(@__DIR__), "eval_data", "race_eval_2000.jls")
+            default = backgammonnet_eval_data_file("race_eval_2000.jls")
         "--inference-batch-size"
             arg_type = Int
             default = 50
@@ -230,7 +231,7 @@ function main()
     # Load positions
     positions_file = ARGS["positions_file"]
     if !isfile(positions_file)
-        error("Positions file not found: $positions_file\nRun scripts/generate_race_positions.jl first")
+        error("Positions file not found: $positions_file\nRun BackgammonNet.jl/scripts/generate_race_positions.jl first")
     end
     all_positions = deserialize(positions_file)
     println("Loaded $(length(all_positions)) race positions from $positions_file")
