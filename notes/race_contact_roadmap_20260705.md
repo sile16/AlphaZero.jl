@@ -15,11 +15,23 @@ one interface per engine; evals valid/strong/fast/frequent.
       3.0→reward_scale, removed dead _sample_chance.
 - [x] Housekeeping: deleted 225GB Neo work_* intermediates; n18 table copying Neo→Jarvis
       (background, ~slow; NOT on critical path — experiment runs on Neo which has the table).
-- [ ] WIRE COMBINED TABLE INTO MCTS (next, testable on Neo): make_bearoff_evaluator +
-      bearoff_table_equity + bearoff_post_dice_equity → generic bearoff_covers/bearoff_lookup;
-      include bearoff_onesided.jl + bearoff_combined.jl in selfplay_client; BEAROFF_TABLE =
-      CombinedBearoff(k7, onesided) when onesided present else k7-only. TEST on Neo: combined
-      evaluator returns correct exact race values; k7-only path unchanged.
+- [x] WIRE COMBINED TABLE INTO MCTS (ad6eb72): make_bearoff_evaluator +
+      bearoff_table_equity + bearoff_post_dice_equity use generic bearoff_covers/bearoff_lookup;
+      selfplay_client loads CombinedBearoff(k7, n18 onesided) when present else k7-only.
+      EXP2 log confirmed Jarvis loaded k7 + n18 and used the combined exact evaluator.
+      NOTE: this is MCTS leaf evaluation. EXP2 had bearoff_truncation=false, so it did
+      NOT stop rollouts/training traces at the race frontier.
+- [x] Fix distributed eval submit/finalization before next run: src/distributed/server.jl
+      final-chunk path uses stats.n_games, but EvalManager.finalize_eval returns
+      num_games. Symptom: final eval submit returns HTTP 400 then retry 409, although
+      the training loop later finalizes most jobs. Also make training_server wait for
+      the final iter eval before exit, or run final eval out-of-band. DONE: patched
+      stats.num_games, added handler regression, factored final eval logging, and
+      added bounded final-eval wait.
+- [ ] Stop orphan self-play client wrapper after bounded runs, or teach start_client.sh /
+      selfplay_client to exit cleanly when the server is intentionally complete.
+      Partial: added selfplay_client --eval-only so bootstrap/eval runs can avoid
+      self-play upload contamination.
 - [ ] Game-loop consolidation: fold eval_game_from_position (#4, the outlier) into play_game;
       dedup PositionValueSample + _sample_from_policy (3 copies). Defer full self-play
       unification (zero-alloc constraint, CLAUDE.md lesson 13).
@@ -37,6 +49,9 @@ one interface per engine; evals valid/strong/fast/frequent.
       confirm NN accuracy on the UNCOVERED band (this is what "finalize race" needs).
 - [ ] Contact eval: DIRECT MATCH vs wildbg = primary metric; rollout/exact diagnostics
       for weakness-finding only (wildbg-capped).
+- [ ] Add direct post-run eval script/checklist for final checkpoints. EXP2 created
+      iter-200 eval, then exited before clients could run it; best measured point is
+      iter 195, not iter 200.
 
 ## Phase 2 — Finalize race
 - [ ] Definitive race eval across candidate checkpoints (current fixed code) → pick best.
@@ -47,17 +62,65 @@ one interface per engine; evals valid/strong/fast/frequent.
 ## eval-vs-wildbg every 10 iters (contact_eval_2000.jls, 200 games). Server PID on Jarvis
 ## (data-dir /home/sile/alphazero-contact-exp1, port 9090); eval-capable client on
 ## Jarvis-localhost (Neo blocked by Julia-LAN networking). Combined-table curriculum ACTIVE
-## (self-play truncates at exact race frontier). Signal = match win% vs wildbg (goal >50%).
+## as MCTS exact leaf evaluator (not trace truncation unless --bearoff-truncation is set).
+## Signal = match win% vs wildbg (goal >50%).
 ## Logs: exp1_server.log / exp1_client.log. Validated live: combined table loads, contact
 ## opening, self-play ~2 games/sec, eval chunks assigned. NOTE cold-start won't reach parity
 ## fast — watching trajectory; if it plateaus below wildbg, next lever = bootstrap-to-parity
 ## then chance-node A/B (passthrough vs progressive-widening).
 
+## BOOTSTRAP LEVER BUILT (2026-07-05 ~15:45): scripts/generate_contact_bootstrap.jl —
+## wildbg-vs-wildbg contact imitation samples with SOFT policy target from wildbg
+## per-move eval + outcome value/equity, matches convert_trace_to_samples.
+## Actual generated file: 100k samples, 271MB, 4505 wildbg games →
+## /homeshare/projects/AlphaZero.jl/eval_data/contact_bootstrap_wildbg.jls.
+
+## EXP2 COMPLETED (2026-07-05 15:52→23:02): dual 128×3, 200 iters, 100k soft
+## contact bootstrap, 15 bootstrap-train iters, then self-play. Data-dir:
+## /home/sile/alphazero-contact-exp2. Logs: exp2_server.log / exp2_client.log.
+## Config facts: PER=false, Reanalyze=false, constant 400 selfplay MCTS, eval 200
+## MCTS, eval every 5 iters, 400 games/eval, combined k7+n18 exact MCTS leaf
+## evaluator loaded; bearoff_truncation=false; fixed bearoff eval/gate disabled.
+## Result: learned, but NOT near parity. Eval trajectory:
+##   iter 0   -1.752 equity,  8.8% win
+##   iter 5   -0.980 equity, 20.8% win
+##   iter 10  -1.122 equity, 19.0% win  (EXP1 cold-start iter10 was -1.418/11.5)
+##   iter 50  -1.145 equity, 16.5% win
+##   iter 100 -0.912 equity, 22.2% win
+##   iter 145 -0.838 equity, 25.2% win
+##   iter 180 -0.812 equity, 26.5% win
+##   iter 195 -0.798 equity, 24.2% win  (best measured equity)
+##   iter 200 checkpoint saved, but final eval was created then server exited; run
+##            standalone final eval before ranking iter200.
+## Lessons: 100k bootstrap helps cold-start but is far below "bootstrap-to-parity";
+## after bootstrap buffer clear at iter16, self-play recovers slowly but plateaus
+## around -0.8 to -0.9 equity. This does NOT test PER/Reanalyze, promotion gate, or
+## trace truncation. It DOES test combined exact MCTS leaf evaluator + soft bootstrap
+## plumbing under load.
+
+## NEXT EXPERIMENT (EXP3 candidate): fix eval first, then bootstrap-to-parity before
+## self-play. Proposed rung:
+## - [x] Stop orphan Jarvis selfplay client from EXP2 (server exited; client retries).
+## - [x] Patch stats.n_games→stats.num_games and add regression for final chunk submit.
+## - [x] Ensure final eval completes before training process exits.
+## - [ ] Standalone eval contact_iter_200/contact_latest (same 200-pos, 200-MCTS quick
+##       eval, then larger eval if promising).
+## - [ ] Run bootstrap-only/pretrain sweep from contact_bootstrap_wildbg.jls before
+##       self-play: 100k vs 300k+ samples, 15/30/60 train iters, evaluate each.
+##       Gate to EXP3 self-play only when bootstrap checkpoint is much closer to
+##       wildbg (target at least ~35-40% win quick eval, not 20%).
+##       Use selfplay_client --eval-only so eval chunks run without self-play uploads.
+## - [ ] EXP3 self-play: start from best bootstrap checkpoint; enable PER + Reanalyze
+##       if eval path is clean; compare bearoff_truncation=false vs true as a controlled
+##       A/B only after bootstrap quality is acceptable.
+## - [ ] Keep contact net small (128×3/×5) until method breaks the contact plateau.
+
 ## Phase 3 — Contact training (small net + exact-race-frontier curriculum)
-- [ ] Race-frontier truncation for contact MCTS: at a race position, evaluate with
-      combined table (covered) else frozen race NN, stop rollout there.
+- [ ] Race-frontier truncation for contact traces: at a race position, evaluate with
+      combined table (covered) else frozen race NN, stop rollout there. EXP2 only
+      used the combined table as MCTS leaf evaluator; trace truncation remains untested.
 - [ ] `contact` training mode: freeze race net, train small contact net (128×3/×5).
 - [ ] Loop: contact self-play → match-eval vs wildbg + diagnostics → iterate.
 
 ## Housekeeping
-- [ ] Delete ~240GB intermediate work_* files on Neo (final n18 table is ~118GB, keep).
+- [x] Delete ~240GB intermediate work_* files on Neo (final n18 table is ~118GB, keep).

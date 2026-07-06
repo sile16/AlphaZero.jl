@@ -88,6 +88,9 @@ function parse_args()
         "--eval-capable"
             help = "Enable eval mode (client does eval when server has eval jobs)"
             action = :store_true
+        "--eval-only"
+            help = "Run distributed eval chunks only; do not generate or upload self-play samples"
+            action = :store_true
         "--eval-mcts-iters"
             help = "DEPRECATED — now controlled by server config"
             arg_type = Int
@@ -111,6 +114,8 @@ const NUM_WORKERS = ARGS["num_workers"] > 0 ? ARGS["num_workers"] : Threads.nthr
 const GPU_WORKERS = ARGS["gpu_workers"]
 const USE_GPU = GPU_WORKERS > 0
 const EVAL_CAPABLE = ARGS["eval_capable"]
+const EVAL_ONLY = ARGS["eval_only"]
+EVAL_ONLY && !EVAL_CAPABLE && error("--eval-only requires --eval-capable")
 
 println("=" ^ 60)
 println("AlphaZero Self-Play Client")
@@ -140,6 +145,7 @@ println("Workers: $NUM_WORKERS CPU" * (GPU_WORKERS > 0 ? " + $GPU_WORKERS GPU" :
 println("GPU: $(GPU_WORKERS > 0 ? "Metal ($GPU_WORKERS workers)" : "disabled")")
 println("CPU inference: $(AlphaZero.BackgammonInference.cpu_backend_summary(CPU_INFERENCE_BACKEND))")
 println("Eval capable: $EVAL_CAPABLE")
+println("Eval only: $EVAL_ONLY")
 println("=" ^ 60)
 flush(stdout)
 
@@ -1378,6 +1384,9 @@ if EVAL_CAPABLE
         println("Eval: wildbg lib = $WILDBG_LIB_EVAL")
     end
 end
+if EVAL_ONLY && (EVAL_POSITIONS === nothing || isempty(WILDBG_LIB_EVAL))
+    error("--eval-only requested, but eval positions or wildbg are unavailable")
+end
 
 # Re-register with eval capability now that WILDBG_LIB_EVAL is known
 if EVAL_CAPABLE
@@ -1622,6 +1631,36 @@ function submit_eval_results(chunk_id::Int, rewards, val_nn, val_opp, val_is_con
     return false
 end
 
+"""Poll the server's explicit eval checkout endpoint.
+
+Normal self-play clients receive eval chunks piggy-backed on sample-upload
+responses. Eval-only clients never upload samples, so they must actively poll.
+Returns true when a chunk was queued for processing.
+"""
+function poll_eval_checkout!()
+    !EVAL_CAPABLE && return false
+    try
+        body = MsgPack.pack(Dict("client_name" => client.client_id))
+        resp = HTTP.post("$(client.server_url)/api/eval/checkout",
+                         vcat(auth_headers(client), ["Content-Type" => "application/msgpack"]),
+                         body; status_exception=false, connect_timeout=10, readtimeout=30)
+        if resp.status != 200
+            println("[EVAL] Checkout failed: HTTP $(resp.status) — $(String(resp.body))")
+            return false
+        end
+        data = JSON.parse(String(resp.body))
+        chunk_id = Int(get(data, "chunk_id", 0))
+        if chunk_id > 0
+            put!(EVAL_CHANNEL, Dict{String,Any}(data))
+            println("[EVAL] Chunk $chunk_id queued from checkout (iter=$(data["eval_iter"]))")
+            return true
+        end
+    catch e
+        println("[EVAL] Checkout error: $e")
+    end
+    return false
+end
+
 """Process eval chunk with all worker threads in parallel.
 
 Pre-creates per-thread agents (mutable MCTS tree) and wildbg backends
@@ -1742,12 +1781,16 @@ end
 function main_loop()
     # Start all workers as continuous background threads
     tasks = Task[]
-    for w in 1:NUM_WORKERS
-        rng = isnothing(MAIN_SEED) ? new_selfplay_rng() : new_selfplay_rng(MAIN_SEED + w * 104729)
-        t = Threads.@spawn continuous_worker(w, rng)
-        push!(tasks, t)
+    if EVAL_ONLY
+        println("Eval-only mode: self-play workers disabled")
+    else
+        for w in 1:NUM_WORKERS
+            rng = isnothing(MAIN_SEED) ? new_selfplay_rng() : new_selfplay_rng(MAIN_SEED + w * 104729)
+            t = Threads.@spawn continuous_worker(w, rng)
+            push!(tasks, t)
+        end
+        println("Started $NUM_WORKERS continuous CPU workers")
     end
-    println("Started $NUM_WORKERS continuous CPU workers")
     flush(stdout)
 
     # Wait briefly so workers can start and JIT-compile before we block on channel
@@ -1772,6 +1815,17 @@ function main_loop()
                 Base.showerror(stdout, e, catch_backtrace())
                 println()
             end
+        end
+
+        if EVAL_ONLY
+            # No sample uploads occur in eval-only mode, so actively ask the
+            # server for work. Processing remains serial at the chunk level; each
+            # chunk internally uses all available eval worker slots.
+            if !isready(EVAL_CHANNEL)
+                poll_eval_checkout!()
+            end
+            sleep(2)
+            continue
         end
 
         # Drain selfplay games — poll with timeout so we can check eval between waits

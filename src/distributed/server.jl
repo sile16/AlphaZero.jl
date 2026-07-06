@@ -463,7 +463,7 @@ function handle_eval_submit(req::HTTP.Request, state::ServerState)
                 # Finalize: aggregate results and log to TensorBoard
                 stats = EvalManager.finalize_eval(job)
                 iter = job.iter
-                println("Eval iter $iter complete: equity=$(round(stats.equity, digits=4)), win%=$(round(stats.win_pct * 100, digits=1)), $(stats.n_games) games")
+                println("Eval iter $iter complete: equity=$(round(stats.equity, digits=4)), win%=$(round(stats.win_pct * 100, digits=1)), $(stats.num_games) games")
                 try
                     with_logger(TB_LOGGER) do
                         @info "eval/equity" value=stats.equity log_step_increment=0
@@ -472,7 +472,7 @@ function handle_eval_submit(req::HTTP.Request, state::ServerState)
                         @info "eval/black_equity" value=stats.black_equity log_step_increment=0
                         @info "eval/value_mse" value=stats.value_mse log_step_increment=0
                         @info "eval/value_corr" value=stats.value_corr log_step_increment=0
-                        @info "eval/games" value=stats.n_games log_step_increment=0
+                        @info "eval/games" value=stats.num_games log_step_increment=0
                     end
                 catch e
                     @warn "Failed to log eval to TensorBoard" exception=e

@@ -1440,6 +1440,65 @@ with_logger(TB_LOGGER) do
     @info "config" text=repro_text log_step_increment=0
 end
 
+function finalize_eval_job!(job; source::String="training-loop")
+    # finalize_eval aggregates client-submitted value arrays and can throw
+    # (e.g. DimensionMismatch on a malformed submission). This runs inside the
+    # training task, so guard it and always clear the job.
+    saved_step = TB_LOGGER.global_step
+    try
+        result = EvalManager.finalize_eval(job)
+        @info "Eval completed iter $(job.iter)" source equity=round(result.equity, digits=3) win_pct=round(result.win_pct * 100, digits=1) games=result.num_games
+        # Log to TB at the eval iteration (not the current training iteration).
+        TB_LOGGER.global_step = job.iter
+        with_logger(TB_LOGGER) do
+            @info "eval/equity" value=result.equity log_step_increment=0
+            @info "eval/win_pct" value=result.win_pct * 100 log_step_increment=0
+            @info "eval/white_equity" value=result.white_equity log_step_increment=0
+            @info "eval/black_equity" value=result.black_equity log_step_increment=0
+            @info "eval/value_mse" value=result.value_mse log_step_increment=0
+            @info "eval/value_corr" value=result.value_corr log_step_increment=0
+            @info "eval/games" value=result.num_games log_step_increment=0
+        end
+    catch e
+        @error "finalize_eval failed; discarding eval job for iter $(job.iter)" source exception=(e, catch_backtrace())
+    finally
+        TB_LOGGER.global_step = saved_step
+        EVAL_JOB[] = nothing
+    end
+end
+
+function wait_for_final_eval!()
+    deadline = time() + EVAL_JOB_TIMEOUT
+    announced = false
+    while true
+        wait_more = false
+        lock(EVAL_LOCK) do
+            job = EVAL_JOB[]
+            if job === nothing
+                return
+            elseif EvalManager.is_complete(job)
+                finalize_eval_job!(job; source="final-wait")
+                return
+            elseif time() >= deadline
+                st = EvalManager.status(job)
+                @warn "Final eval timed out; discarding unfinished eval job" iter=job.iter completed=st.completed total_chunks=st.total_chunks timeout_s=EVAL_JOB_TIMEOUT
+                EVAL_JOB[] = nothing
+                return
+            else
+                if !announced
+                    st = EvalManager.status(job)
+                    println("Waiting for final eval iter $(job.iter) to complete ($(st.completed)/$(st.total_chunks) chunks)...")
+                    flush(stdout)
+                    announced = true
+                end
+                wait_more = true
+            end
+        end
+        wait_more || return
+        sleep(10)
+    end
+end
+
 # Server config (served to clients via GET /api/config)
 const SERVER_CONFIG = Dict{String, Any}(
     "mcts_iters" => ARGS["mcts_iters"],
@@ -1953,33 +2012,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     lock(EVAL_LOCK) do
         job = EVAL_JOB[]
         if job !== nothing && EvalManager.is_complete(job)
-            # finalize_eval aggregates client-submitted value arrays and can throw
-            # (e.g. DimensionMismatch on a malformed submission). This runs inside
-            # the training task — an unguarded throw here KILLS training. Guard it
-            # and ALWAYS clear the job so one bad eval can't wedge or crash the run.
-            # Capture TB step BEFORE the try so the finally always restores it,
-            # even if a log call throws mid-eval-logging.
-            saved_step = TB_LOGGER.global_step
-            try
-                result = EvalManager.finalize_eval(job)
-                @info "Eval completed iter $(job.iter)" equity=round(result.equity, digits=3) win_pct=round(result.win_pct * 100, digits=1) games=result.num_games
-                # Log to TB at the eval iteration (not the current training iteration)
-                TB_LOGGER.global_step = job.iter
-                with_logger(TB_LOGGER) do
-                    @info "eval/equity" value=result.equity log_step_increment=0
-                    @info "eval/win_pct" value=result.win_pct * 100 log_step_increment=0
-                    @info "eval/white_equity" value=result.white_equity log_step_increment=0
-                    @info "eval/black_equity" value=result.black_equity log_step_increment=0
-                    @info "eval/value_mse" value=result.value_mse log_step_increment=0
-                    @info "eval/value_corr" value=result.value_corr log_step_increment=0
-                    @info "eval/games" value=result.num_games log_step_increment=0
-                end
-            catch e
-                @error "finalize_eval failed; discarding eval job for iter $(job.iter)" exception=(e, catch_backtrace())
-            finally
-                TB_LOGGER.global_step = saved_step
-                EVAL_JOB[] = nothing
-            end
+            finalize_eval_job!(job; source="training-loop")
         end
     end
 
@@ -2007,6 +2040,8 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
         end
     end
 end
+
+wait_for_final_eval!()
 
 println("\nTraining complete!")
 println("Checkpoints at: $CHECKPOINT_DIR")

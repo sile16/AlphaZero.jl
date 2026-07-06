@@ -5,6 +5,15 @@ if !isdefined(Main, :EvalManager)
 end
 using .EvalManager
 
+module EvalSubmitServerHarness
+    using Logging
+
+    struct PERBuffer end
+    const TB_LOGGER = NullLogger()
+
+    include(joinpath(@__DIR__, "..", "src", "distributed", "server.jl"))
+end
+
 @testset "Eval Submit Flow" begin
 
     @testset "Full eval flow: create → checkout → submit → finalize" begin
@@ -311,6 +320,38 @@ using .EvalManager
         @test s2.completed == 1
         @test s2.checked_out == 0
         @test s2.available == 1
+    end
+
+    @testset "HTTP final chunk submit returns num_games response" begin
+        H = EvalSubmitServerHarness
+        H.EVAL_JOB[] = H.EvalManager.create_eval_job(7, 1, 3; chunk_size=1)
+        state = H.ServerState(api_key="test-key", config=Dict{String,Any}("seed" => 1))
+
+        for expected_complete in (false, true)
+            chunk = H.EvalManager.checkout_chunk!(H.EVAL_JOB[], "eval-client")
+            @test chunk !== nothing
+            body = H.MsgPack.pack(Dict(
+                "chunk_id" => chunk.chunk_id,
+                "client_name" => "eval-client",
+                "rewards" => [0.5],
+                "value_nn" => Float64[],
+                "value_opp" => Float64[],
+                "value_is_contact" => Bool[],
+            ))
+            req = H.HTTP.Request(
+                "POST", "/api/eval/submit",
+                ["Authorization" => "Bearer test-key",
+                 "Content-Type" => "application/msgpack"],
+                body,
+            )
+            resp = H.handle_eval_submit(req, state)
+            @test resp.status == 200
+            data = H.JSON.parse(String(resp.body))
+            @test data["accepted"] == true
+            @test data["eval_complete"] == expected_complete
+        end
+
+        @test H.EVAL_JOB[] === nothing
     end
 
 end
