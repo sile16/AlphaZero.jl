@@ -8,7 +8,7 @@ Output: eval_data/bootstrap_wildbg_1M.jls
 
 Each output sample is a NamedTuple with:
   state::Vector{Float32}   (344-dim minimal_flat)
-  policy::Vector{Float32}  (676-dim)
+  policy::Vector{Float32}  (680-dim; legacy 676-wide inputs are zero-padded)
   value::Float32
   equity::Vector{Float32}  (5-element joint cumulative)
   has_equity::Bool
@@ -40,7 +40,7 @@ const INPUT_DIR = get(ENV, "BACKGAMMONNET_BOOTSTRAP_DIR",
 const OUTPUT_PATH = get(ENV, "ALPHAZERO_BOOTSTRAP_OUTPUT",
     joinpath(dirname(@__DIR__), "eval_data", "bootstrap_wildbg_1M.jls"))
 const NUM_PARTS = 10
-const NUM_ACTIONS_CONST = BackgammonNet.CHECKER_ACTIONS
+const NUM_ACTIONS_CONST = BackgammonNet.MAX_ACTIONS
 const TARGET_TOTAL = 1_000_000
 const PER_PART = TARGET_TOTAL ÷ NUM_PARTS
 

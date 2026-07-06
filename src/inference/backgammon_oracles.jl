@@ -2,8 +2,8 @@ module BackgammonInference
 
 using Base.Threads
 
-using ..AlphaZero: GI, Network
-using ..FastInference: FastWeights, FastBuffers, fast_forward_normalized!, extract_fast_weights
+using ..AlphaZero: GI, Network, NetLib
+using ..FastInference: FastWeights, FastBuffers, fast_forward_normalized_heads!, extract_fast_weights
 
 import BackgammonNet
 
@@ -210,18 +210,18 @@ function _store_results_with_actions!(scratch::OracleScratch, idxs::Vector{Int},
 end
 
 function _forward_fast!(scratch::OracleScratch, fw::FastWeights, fb::FastBuffers,
-                        input::InputBuffers, idxs::Vector{Int}, n::Int, cfg::OracleConfig)
+                        input::InputBuffers, idxs::Vector{Int}, states, n::Int, cfg::OracleConfig)
     n == 0 && return
-    P, V, _ = fast_forward_normalized!(fw, fb, input.X, input.A, n)
-    _store_results!(scratch, idxs, input.A, P, V, n, cfg.num_actions)
+    P, _, H, _ = fast_forward_normalized_heads!(fw, fb, input.X, input.A, n)
+    _store_results_from_prob_heads!(scratch, idxs, states, input.A, P, H, n, cfg.num_actions)
 end
 
 function _forward_fast_with_actions!(scratch::OracleScratch, fw::FastWeights, fb::FastBuffers,
-                                     input::InputBuffers, idxs::Vector{Int},
+                                     input::InputBuffers, idxs::Vector{Int}, states,
                                      actions_by_col::Vector{Vector{Int}}, n::Int)
     n == 0 && return
-    P, V, _ = fast_forward_normalized!(fw, fb, input.X, input.A, n)
-    _store_results_with_actions!(scratch, idxs, actions_by_col, P, V, n)
+    P, _, H, _ = fast_forward_normalized_heads!(fw, fb, input.X, input.A, n)
+    _store_results_from_prob_heads_with_actions!(scratch, idxs, states, actions_by_col, P, H, n)
 end
 
 function _new_fast_worker_buffers(cfg::OracleConfig, batch_size::Int,
@@ -261,52 +261,207 @@ function _task_buffer_resolver(initfn)
     return task_buffers
 end
 
+@inline _sigmoid32(x) = 1.0f0 / (1.0f0 + exp(-Float32(x)))
+
+@inline function _heads_from_probs(H::AbstractMatrix, j::Int)
+    return (H[1, j], H[2, j], H[3, j], H[4, j], H[5, j])
+end
+
+@inline function _heads_from_logits(Lw, Lgw, Lbgw, Lgl, Lbgl, j::Int)
+    return (
+        _sigmoid32(Lw[1, j]),
+        _sigmoid32(Lgw[1, j]),
+        _sigmoid32(Lbgw[1, j]),
+        _sigmoid32(Lgl[1, j]),
+        _sigmoid32(Lbgl[1, j]),
+    )
+end
+
+@inline function _state_search_value(state, heads::NTuple{5,<:Real})
+    if state isa BackgammonNet.BackgammonGame
+        return BackgammonNet.search_value(state, heads; mode=:auto)
+    end
+    return clamp(BackgammonNet.compute_equity_joint(heads) / 3.0f0, -1.0f0, 1.0f0)
+end
+
+@inline function _state_aware_multihead(net)
+    return isdefined(NetLib, :FCResNetMultiHead) && net isa NetLib.FCResNetMultiHead
+end
+
+function _store_results_from_prob_heads!(scratch::OracleScratch, idxs::Vector{Int}, states,
+                                         A::Matrix{Float32}, P::AbstractMatrix,
+                                         H::AbstractMatrix, n::Int, num_actions::Int)
+    @inbounds for j in 1:n
+        idx = idxs[j]
+        k = 0
+        for a in 1:num_actions
+            if A[a, j] > 0.0f0
+                k += 1
+            end
+        end
+        pv = Vector{Float32}(undef, k)
+        k = 0
+        for a in 1:num_actions
+            if A[a, j] > 0.0f0
+                k += 1
+                pv[k] = P[a, j]
+            end
+        end
+        scratch.results[idx] = (pv, _state_search_value(states[idx], _heads_from_probs(H, j)))
+    end
+end
+
+function _store_results_from_prob_heads_with_actions!(scratch::OracleScratch, idxs::Vector{Int}, states,
+                                                      actions_by_col::Vector{Vector{Int}},
+                                                      P::AbstractMatrix, H::AbstractMatrix, n::Int)
+    @inbounds for j in 1:n
+        idx = idxs[j]
+        actions = actions_by_col[j]
+        pv = Vector{Float32}(undef, length(actions))
+        for (k, action) in enumerate(actions)
+            pv[k] = P[action, j]
+        end
+        scratch.results[idx] = (pv, _state_search_value(states[idx], _heads_from_probs(H, j)))
+    end
+end
+
+function _store_results_from_logits!(scratch::OracleScratch, idxs::Vector{Int}, states,
+                                     A::Matrix{Float32}, P::AbstractMatrix,
+                                     Lw, Lgw, Lbgw, Lgl, Lbgl,
+                                     n::Int, num_actions::Int)
+    @inbounds for j in 1:n
+        idx = idxs[j]
+        k = 0
+        for a in 1:num_actions
+            if A[a, j] > 0.0f0
+                k += 1
+            end
+        end
+        pv = Vector{Float32}(undef, k)
+        k = 0
+        for a in 1:num_actions
+            if A[a, j] > 0.0f0
+                k += 1
+                pv[k] = P[a, j]
+            end
+        end
+        heads = _heads_from_logits(Lw, Lgw, Lbgw, Lgl, Lbgl, j)
+        scratch.results[idx] = (pv, _state_search_value(states[idx], heads))
+    end
+end
+
+function _store_results_from_logits_with_actions!(scratch::OracleScratch, idxs::Vector{Int}, states,
+                                                  actions_by_col::Vector{Vector{Int}},
+                                                  P::AbstractMatrix,
+                                                  Lw, Lgw, Lbgw, Lgl, Lbgl, n::Int)
+    @inbounds for j in 1:n
+        idx = idxs[j]
+        actions = actions_by_col[j]
+        pv = Vector{Float32}(undef, length(actions))
+        for (k, action) in enumerate(actions)
+            pv[k] = P[action, j]
+        end
+        heads = _heads_from_logits(Lw, Lgw, Lbgw, Lgl, Lbgl, j)
+        scratch.results[idx] = (pv, _state_search_value(states[idx], heads))
+    end
+end
+
 function _forward_gpu!(scratch::OracleScratch, net_gpu,
-                       input::InputBuffers, idxs::Vector{Int}, n::Int,
+                       input::InputBuffers, idxs::Vector{Int}, states, n::Int,
                        cfg::OracleConfig, gpu_array_fn, sync_fn, gpu_lock)
     n == 0 && return
-    local P_cpu, V_cpu
+    local P_cpu, V_cpu, Lw_cpu, Lgw_cpu, Lbgw_cpu, Lgl_cpu, Lbgl_cpu
     X_active = @view(input.X[:, 1:n])
     A_active = @view(input.A[:, 1:n])
     lock(gpu_lock) do
         X_g = gpu_array_fn(X_active)
         A_g = gpu_array_fn(A_active)
-        result = Network.forward_normalized(net_gpu, X_g, A_g)
-        sync_fn()
-        P_cpu = Array(result[1])
-        V_cpu = Array(result[2])
+        if _state_aware_multihead(net_gpu)
+            result = NetLib.forward_normalized_multihead(net_gpu, X_g, A_g)
+            sync_fn()
+            P_cpu, Lw_cpu, Lgw_cpu, Lbgw_cpu, Lgl_cpu, Lbgl_cpu, _ =
+                Network.convert_output_tuple(net_gpu, result)
+        else
+            result = Network.forward_normalized(net_gpu, X_g, A_g)
+            sync_fn()
+            P_cpu = Array(result[1])
+            V_cpu = Array(result[2])
+        end
     end
-    _store_results!(scratch, idxs, input.A, P_cpu, V_cpu, n, cfg.num_actions)
+    if _state_aware_multihead(net_gpu)
+        _store_results_from_logits!(scratch, idxs, states, input.A, P_cpu,
+                                    Lw_cpu, Lgw_cpu, Lbgw_cpu, Lgl_cpu, Lbgl_cpu,
+                                    n, cfg.num_actions)
+    else
+        _store_results!(scratch, idxs, input.A, P_cpu, V_cpu, n, cfg.num_actions)
+    end
 end
 
 function _forward_gpu_with_actions!(scratch::OracleScratch, net_gpu,
-                                    input::InputBuffers, idxs::Vector{Int},
+                                    input::InputBuffers, idxs::Vector{Int}, states,
                                     actions_by_col::Vector{Vector{Int}}, n::Int,
                                     gpu_array_fn, sync_fn, gpu_lock)
     n == 0 && return
-    local P_cpu, V_cpu
+    local P_cpu, V_cpu, Lw_cpu, Lgw_cpu, Lbgw_cpu, Lgl_cpu, Lbgl_cpu
     X_active = @view(input.X[:, 1:n])
     A_active = @view(input.A[:, 1:n])
     lock(gpu_lock) do
         X_g = gpu_array_fn(X_active)
         A_g = gpu_array_fn(A_active)
-        result = Network.forward_normalized(net_gpu, X_g, A_g)
-        sync_fn()
-        P_cpu = Array(result[1])
-        V_cpu = Array(result[2])
+        if _state_aware_multihead(net_gpu)
+            result = NetLib.forward_normalized_multihead(net_gpu, X_g, A_g)
+            sync_fn()
+            P_cpu, Lw_cpu, Lgw_cpu, Lbgw_cpu, Lgl_cpu, Lbgl_cpu, _ =
+                Network.convert_output_tuple(net_gpu, result)
+        else
+            result = Network.forward_normalized(net_gpu, X_g, A_g)
+            sync_fn()
+            P_cpu = Array(result[1])
+            V_cpu = Array(result[2])
+        end
     end
-    _store_results_with_actions!(scratch, idxs, actions_by_col, P_cpu, V_cpu, n)
+    if _state_aware_multihead(net_gpu)
+        _store_results_from_logits_with_actions!(scratch, idxs, states, actions_by_col, P_cpu,
+                                                 Lw_cpu, Lgw_cpu, Lbgw_cpu, Lgl_cpu, Lbgl_cpu, n)
+    else
+        _store_results_with_actions!(scratch, idxs, actions_by_col, P_cpu, V_cpu, n)
+    end
+end
+
+function _forward_network!(scratch::OracleScratch, net,
+                           input::InputBuffers, idxs::Vector{Int}, states,
+                           n::Int, cfg::OracleConfig)
+    n == 0 && return
+    X_active = @view(input.X[:, 1:n])
+    A_active = @view(input.A[:, 1:n])
+    X_net, A_net = Network.convert_input_tuple(net, (X_active, A_active))
+    if _state_aware_multihead(net)
+        P, Lw, Lgw, Lbgw, Lgl, Lbgl, _ =
+            Network.convert_output_tuple(net, NetLib.forward_normalized_multihead(net, X_net, A_net))
+        _store_results_from_logits!(scratch, idxs, states, input.A, P,
+                                    Lw, Lgw, Lbgw, Lgl, Lbgl, n, cfg.num_actions)
+    else
+        P, V, _ = Network.convert_output_tuple(net, Network.forward_normalized(net, X_net, A_net))
+        _store_results!(scratch, idxs, input.A, P, V, n, cfg.num_actions)
+    end
 end
 
 function _forward_network_with_actions!(scratch::OracleScratch, net,
-                                        input::InputBuffers, idxs::Vector{Int},
+                                        input::InputBuffers, idxs::Vector{Int}, states,
                                         actions_by_col::Vector{Vector{Int}}, n::Int)
     n == 0 && return
     X_active = @view(input.X[:, 1:n])
     A_active = @view(input.A[:, 1:n])
     X_net, A_net = Network.convert_input_tuple(net, (X_active, A_active))
-    P, V, _ = Network.convert_output_tuple(net, Network.forward_normalized(net, X_net, A_net))
-    _store_results_with_actions!(scratch, idxs, actions_by_col, P, V, n)
+    if _state_aware_multihead(net)
+        P, Lw, Lgw, Lbgw, Lgl, Lbgl, _ =
+            Network.convert_output_tuple(net, NetLib.forward_normalized_multihead(net, X_net, A_net))
+        _store_results_from_logits_with_actions!(scratch, idxs, states, actions_by_col, P,
+                                                 Lw, Lgw, Lbgw, Lgl, Lbgl, n)
+    else
+        P, V, _ = Network.convert_output_tuple(net, Network.forward_normalized(net, X_net, A_net))
+        _store_results_with_actions!(scratch, idxs, actions_by_col, P, V, n)
+    end
 end
 
 function _gpu_server_loop!(server_scratch::OracleScratch, request_channel::Channel{GpuOracleRequest},
@@ -401,21 +556,21 @@ function _gpu_server_loop!(server_scratch::OracleScratch, request_channel::Chann
 
         if combined_actions === nothing
             n_primary, n_secondary = _pack_states!(server_scratch, combined_states, cfg)
-            _forward_gpu!(server_scratch, primary_net_gpu, server_scratch.primary_input, server_scratch.primary_idxs, n_primary,
+            _forward_gpu!(server_scratch, primary_net_gpu, server_scratch.primary_input, server_scratch.primary_idxs, combined_states, n_primary,
                           cfg, gpu_array_fn, sync_fn, gpu_lock)
         else
             n_primary, n_secondary = _pack_states_with_actions!(server_scratch, combined_states, combined_actions, cfg)
             _forward_gpu_with_actions!(server_scratch, primary_net_gpu, server_scratch.primary_input,
-                                       server_scratch.primary_idxs, server_scratch.primary_actions,
+                                       server_scratch.primary_idxs, combined_states, server_scratch.primary_actions,
                                        n_primary, gpu_array_fn, sync_fn, gpu_lock)
         end
         if dual
             if combined_actions === nothing
-                _forward_gpu!(server_scratch, secondary_net_gpu, server_scratch.secondary_input, server_scratch.secondary_idxs, n_secondary,
+                _forward_gpu!(server_scratch, secondary_net_gpu, server_scratch.secondary_input, server_scratch.secondary_idxs, combined_states, n_secondary,
                               cfg, gpu_array_fn, sync_fn, gpu_lock)
             else
                 _forward_gpu_with_actions!(server_scratch, secondary_net_gpu, server_scratch.secondary_input,
-                                           server_scratch.secondary_idxs, server_scratch.secondary_actions,
+                                           server_scratch.secondary_idxs, combined_states, server_scratch.secondary_actions,
                                            n_secondary, gpu_array_fn, sync_fn, gpu_lock)
             end
         end
@@ -467,43 +622,22 @@ function make_cpu_oracles(backend::Union{Symbol, AbstractString},
                 scratch = flux_task_buffers()
                 n_primary, n_secondary = _pack_states_with_actions!(scratch, states, actions_by_state, cfg)
                 _forward_network_with_actions!(scratch, primary_net, scratch.primary_input,
-                                               scratch.primary_idxs, scratch.primary_actions, n_primary)
+                                               scratch.primary_idxs, states, scratch.primary_actions, n_primary)
                 if dual
                     _forward_network_with_actions!(scratch, secondary_net, scratch.secondary_input,
-                                                   scratch.secondary_idxs, scratch.secondary_actions, n_secondary)
+                                                   scratch.secondary_idxs, states, scratch.secondary_actions, n_secondary)
                 end
                 return @view(scratch.results[1:n])
             end
-            if !dual
-                return Network.evaluate_batch(primary_net, states)
+            scratch = flux_task_buffers()
+            n_primary, n_secondary = _pack_states!(scratch, states, cfg)
+            _forward_network!(scratch, primary_net, scratch.primary_input,
+                              scratch.primary_idxs, states, n_primary, cfg)
+            if dual
+                _forward_network!(scratch, secondary_net, scratch.secondary_input,
+                                  scratch.secondary_idxs, states, n_secondary, cfg)
             end
-            primary_states = eltype(states)[]
-            secondary_states = eltype(states)[]
-            primary_idxs = Int[]
-            secondary_idxs = Int[]
-            for (idx, state) in enumerate(states)
-                if cfg.route_state(state) == 2
-                    push!(secondary_states, state)
-                    push!(secondary_idxs, idx)
-                else
-                    push!(primary_states, state)
-                    push!(primary_idxs, idx)
-                end
-            end
-            results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
-            if !isempty(primary_states)
-                evals = Network.evaluate_batch(primary_net, primary_states)
-                for (j, idx) in enumerate(primary_idxs)
-                    results[idx] = evals[j]
-                end
-            end
-            if !isempty(secondary_states)
-                evals = Network.evaluate_batch(secondary_net, secondary_states)
-                for (j, idx) in enumerate(secondary_idxs)
-                    results[idx] = evals[j]
-                end
-            end
-            return results
+            return @view(scratch.results[1:n])
         end
         flux_single_oracle(state) = flux_batch_oracle([state])[1]
         return flux_single_oracle, flux_batch_oracle
@@ -539,17 +673,17 @@ function make_cpu_oracles(backend::Union{Symbol, AbstractString},
         scratch = worker.scratch
         if actions_by_state === nothing
             n_primary, n_secondary = _pack_states!(scratch, states, cfg)
-            _forward_fast!(scratch, pfw, worker.primary_fast, scratch.primary_input, scratch.primary_idxs, n_primary, cfg)
+            _forward_fast!(scratch, pfw, worker.primary_fast, scratch.primary_input, scratch.primary_idxs, states, n_primary, cfg)
             if dual
-                _forward_fast!(scratch, sfw, worker.secondary_fast, scratch.secondary_input, scratch.secondary_idxs, n_secondary, cfg)
+                _forward_fast!(scratch, sfw, worker.secondary_fast, scratch.secondary_input, scratch.secondary_idxs, states, n_secondary, cfg)
             end
         else
             n_primary, n_secondary = _pack_states_with_actions!(scratch, states, actions_by_state, cfg)
             _forward_fast_with_actions!(scratch, pfw, worker.primary_fast, scratch.primary_input,
-                                        scratch.primary_idxs, scratch.primary_actions, n_primary)
+                                        scratch.primary_idxs, states, scratch.primary_actions, n_primary)
             if dual
                 _forward_fast_with_actions!(scratch, sfw, worker.secondary_fast, scratch.secondary_input,
-                                            scratch.secondary_idxs, scratch.secondary_actions, n_secondary)
+                                            scratch.secondary_idxs, states, scratch.secondary_actions, n_secondary)
             end
         end
         return @view(scratch.results[1:n])
@@ -579,20 +713,20 @@ function make_gpu_oracles(primary_net_gpu,
         scratch = worker.scratch
         if actions_by_state === nothing
             n_primary, n_secondary = _pack_states!(scratch, states, cfg)
-            _forward_gpu!(scratch, primary_net_gpu, scratch.primary_input, scratch.primary_idxs, n_primary,
+            _forward_gpu!(scratch, primary_net_gpu, scratch.primary_input, scratch.primary_idxs, states, n_primary,
                           cfg, gpu_array_fn, sync_fn, gpu_lock)
             if dual
-                _forward_gpu!(scratch, secondary_net_gpu, scratch.secondary_input, scratch.secondary_idxs, n_secondary,
+                _forward_gpu!(scratch, secondary_net_gpu, scratch.secondary_input, scratch.secondary_idxs, states, n_secondary,
                               cfg, gpu_array_fn, sync_fn, gpu_lock)
             end
         else
             n_primary, n_secondary = _pack_states_with_actions!(scratch, states, actions_by_state, cfg)
             _forward_gpu_with_actions!(scratch, primary_net_gpu, scratch.primary_input,
-                                       scratch.primary_idxs, scratch.primary_actions,
+                                       scratch.primary_idxs, states, scratch.primary_actions,
                                        n_primary, gpu_array_fn, sync_fn, gpu_lock)
             if dual
                 _forward_gpu_with_actions!(scratch, secondary_net_gpu, scratch.secondary_input,
-                                           scratch.secondary_idxs, scratch.secondary_actions,
+                                           scratch.secondary_idxs, states, scratch.secondary_actions,
                                            n_secondary, gpu_array_fn, sync_fn, gpu_lock)
             end
         end

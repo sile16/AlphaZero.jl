@@ -34,6 +34,27 @@ function random_decision_states(gspec, n; seed=0)
     return states
 end
 
+_sigmoid32(x) = 1.0f0 / (1.0f0 + exp(-Float32(x)))
+_logit32(p) = Float32(log(Float32(p) / (1.0f0 - Float32(p))))
+
+function force_constant_heads!(nn::FluxLib.FCResNetMultiHead, heads)
+    for (head, p) in zip((nn.vhead_win, nn.vhead_gw, nn.vhead_bgw, nn.vhead_gl, nn.vhead_bgl), heads)
+        dense = head.layers[end]
+        fill!(dense.weight, 0.0f0)
+        fill!(dense.bias, _logit32(p))
+    end
+    return nn
+end
+
+function expected_backgammon_search_value(nn::FluxLib.FCResNetMultiHead, gspec, state)
+    X = reshape(Float32.(vec(GI.vectorize_state(gspec, state))), :, 1)
+    A = reshape(Float32.(GI.actions_mask(gspec, state)), :, 1)
+    _, Lw, Lgw, Lbgw, Lgl, Lbgl, _ = FluxLib.forward_normalized_multihead(nn, X, A)
+    heads = (_sigmoid32(Lw[1, 1]), _sigmoid32(Lgw[1, 1]), _sigmoid32(Lbgw[1, 1]),
+             _sigmoid32(Lgl[1, 1]), _sigmoid32(Lbgl[1, 1]))
+    return BackgammonNet.search_value(state, heads; mode=:auto)
+end
+
 @testset "Backgammon Inference Regressions" begin
     gspec = BGD.GameSpec()
     state_dim = let env = GI.init(gspec)
@@ -45,16 +66,42 @@ end
         vectorize_state! = BGD.vectorize_state_into!)
 
     @testset "deterministic wrapper delegates stable BackgammonNet APIs" begin
-        @test num_actions == BackgammonNet.CHECKER_ACTIONS
-        @test BGD.NUM_ACTIONS == BackgammonNet.CHECKER_ACTIONS
+        @test num_actions == BackgammonNet.MAX_ACTIONS
+        @test BGD.NUM_ACTIONS == BackgammonNet.MAX_ACTIONS
 
         @test GI.parse_action(gspec, "Bar | 5") == BackgammonNet.encode_action(BackgammonNet.BAR_LOC, 5)
         @test GI.parse_action(gspec, "Pass | Pass") ==
               BackgammonNet.encode_action(BackgammonNet.PASS_LOC, BackgammonNet.PASS_LOC)
-        @test GI.parse_action(gspec, "Double") === nothing
+        @test GI.parse_action(gspec, "No Double") == BackgammonNet.ACTION_CUBE_NO_DOUBLE
+        @test GI.parse_action(gspec, "Double") == BackgammonNet.ACTION_CUBE_DOUBLE
+        @test GI.parse_action(gspec, "Take") == BackgammonNet.ACTION_CUBE_TAKE
+        @test GI.parse_action(gspec, "Drop") == BackgammonNet.ACTION_CUBE_PASS
 
         env = GI.init(gspec)
+        @test env.game.cube_enabled == BGD.CUBE_ENABLED
+        @test env.game.jacoby_enabled == BGD.JACOBY_ENABLED
         @test GI.heuristic_value(env) ≈ Float64(BackgammonNet.heuristic_value(env.game)) atol=1e-12
+
+        disabled_game = BackgammonNet.initial_state(cube_enabled=false, jacoby_enabled=false, obs_type=:minimal_flat)
+        BackgammonNet.sample_chance!(disabled_game, MersenneTwister(501))
+        ctx = BackgammonNet.context_observation(disabled_game)
+        @test ctx[5:7] == Float32[0, 0, 0]  # cube ownership all-zero means cube disabled
+        @test ctx[14] == 0.0f0              # may_double is also off
+
+        cube_env = GI.init(gspec)
+        cube_env.game.cube_enabled = true
+        cube_env.game.cube_owner = Int8(-1)
+        cube_env.game.phase = BackgammonNet.PHASE_CUBE_DECISION
+        @test BackgammonNet.may_double(cube_env.game)
+        @test GI.available_actions(cube_env) == [BackgammonNet.ACTION_CUBE_NO_DOUBLE, BackgammonNet.ACTION_CUBE_DOUBLE]
+        cube_mask = GI.actions_mask(cube_env)
+        @test length(cube_mask) == BackgammonNet.MAX_ACTIONS
+        @test findall(cube_mask) == [BackgammonNet.ACTION_CUBE_NO_DOUBLE, BackgammonNet.ACTION_CUBE_DOUBLE]
+
+        response_env = GI.init(gspec)
+        response_env.game.cube_enabled = true
+        response_env.game.phase = BackgammonNet.PHASE_CUBE_RESPONSE
+        @test GI.available_actions(response_env) == [BackgammonNet.ACTION_CUBE_TAKE, BackgammonNet.ACTION_CUBE_PASS]
 
         env.game.terminated = true
         env.game.reward = 2.0f0
@@ -198,7 +245,7 @@ end
         @test single[1][2] == 1.0f0
     end
 
-    @testset "shared backgammon oracles match canonical evaluation" begin
+    @testset "shared backgammon oracles match state-aware evaluation" begin
         contact_net = FluxLib.FCResNetMultiHead(
             gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1))
         states = random_decision_states(gspec, 6; seed=2)
@@ -214,13 +261,47 @@ end
             @test length(shared) == length(canonical)
             for i in eachindex(shared)
                 p_shared, v_shared = shared[i]
-                p_canon, v_canon = canonical[i]
+                p_canon, _ = canonical[i]
+                v_canon = expected_backgammon_search_value(contact_net, gspec, states[i])
                 @test length(p_shared) == length(p_canon)
                 @test isapprox(sum(p_shared), 1.0f0; atol=1f-4)
                 @test isapprox(sum(p_canon), 1.0f0; atol=1f-4)
                 @test maximum(abs.(p_shared .- p_canon)) ≤ 5f-4
                 @test isapprox(v_shared, v_canon; atol=5f-4)
             end
+        end
+    end
+
+    @testset "shared backgammon oracles use cubeful search value" begin
+        heads = (0.62f0, 0.18f0, 0.04f0, 0.11f0, 0.03f0)
+        contact_net = force_constant_heads!(
+            FluxLib.FCResNetMultiHead(gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1)),
+            heads)
+
+        state = GI.current_state(GI.init(gspec))
+        state.cube_enabled = true
+        state.jacoby_enabled = false
+        state.cube_value = Int16(4)
+        state.cube_owner = state.current_player
+
+        raw_value = BackgammonNet.compute_equity_joint(heads) / 3.0f0
+        expected = BackgammonNet.search_value(state, heads; mode=:auto)
+        @test !isapprox(expected, raw_value; atol=1f-3)
+
+        disabled_state = BackgammonNet.clone(state)
+        disabled_state.cube_enabled = false
+        expected_disabled = BackgammonNet.search_value(disabled_state, heads; mode=:auto)
+        @test isapprox(expected_disabled, raw_value; atol=1f-6)
+
+        for backend in (:fast, :flux)
+            _, batch_oracle = AlphaZero.BackgammonInference.make_cpu_oracles(
+                backend, contact_net, cfg;
+                batch_size=2, nslots=max(Threads.nthreads(), 1))
+
+            _, v_cube = batch_oracle([state])[1]
+            _, v_disabled = batch_oracle([disabled_state])[1]
+            @test isapprox(v_cube, expected; atol=5f-5)
+            @test isapprox(v_disabled, expected_disabled; atol=5f-5)
         end
     end
 
@@ -271,7 +352,8 @@ end
         @test length(shared) == 4
         for i in 1:4
             expected_net = routed_cfg.route_state(states[i]) == 2 ? secondary_net : primary_net
-            p_canon, v_canon = Network.evaluate_batch(expected_net, [states[i]])[1]
+            p_canon, _ = Network.evaluate_batch(expected_net, [states[i]])[1]
+            v_canon = expected_backgammon_search_value(expected_net, gspec, states[i])
             p_shared, v_shared = shared[i]
             @test length(p_shared) == length(p_canon)
             @test maximum(abs.(p_shared .- p_canon)) ≤ 5f-4

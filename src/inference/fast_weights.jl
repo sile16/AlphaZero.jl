@@ -9,7 +9,7 @@
 module FastInference
 
 export FastWeights, FastBuffers
-export fast_forward_normalized!, extract_fast_weights, refresh_fast_weights!
+export fast_forward_normalized!, fast_forward_normalized_heads!, extract_fast_weights, refresh_fast_weights!
 
 #####
 ##### Weight extraction
@@ -178,6 +178,7 @@ struct FastBuffers
     skip::Matrix{Float32}
     vt::Matrix{Float32}
     p::Matrix{Float32}
+    heads::Matrix{Float32}
     ln_mean::Vector{Float32}
     ln_rstd::Vector{Float32}
     result_vecs::Vector{Vector{Float32}}
@@ -191,6 +192,7 @@ function FastBuffers(width::Int, nactions::Int, max_batch::Int)
         zeros(Float32, width, max_batch),
         zeros(Float32, width, max_batch),
         zeros(Float32, nactions, max_batch),
+        zeros(Float32, 5, max_batch),
         zeros(Float32, max_batch),
         zeros(Float32, max_batch),
         [Vector{Float32}(undef, nactions) for _ in 1:max_batch],
@@ -314,10 +316,11 @@ end
 #####
 
 """
-    fast_forward_normalized!(fw, fb, X, A, n) -> (P_masked, V_equity, n)
+    fast_forward_normalized_heads!(fw, fb, X, A, n) -> (P_masked, V_equity, heads, n)
 
 Allocation-free forward pass through FCResNetMultiHead.
-Returns masked+normalized policy, scalar equity values, and batch size.
+Returns masked+normalized policy, raw cubeless scalar equity values, value-head
+probabilities, and batch size.
 
 - `fw`: FastWeights extracted from network
 - `fb`: FastBuffers pre-allocated for this worker
@@ -325,8 +328,8 @@ Returns masked+normalized policy, scalar equity values, and batch size.
 - `A`: Action mask matrix (num_actions × n), 1.0 for legal actions
 - `n`: Batch size (number of active columns in X and A)
 """
-function fast_forward_normalized!(fw::FastWeights, fb::FastBuffers,
-                                   X::AbstractMatrix, A::AbstractMatrix, n::Int)
+function fast_forward_normalized_heads!(fw::FastWeights, fb::FastBuffers,
+                                        X::AbstractMatrix, A::AbstractMatrix, n::Int)
     w = size(fw.W_in, 1)
 
     # Input layer: Dense + LayerNorm + ReLU
@@ -380,6 +383,11 @@ function fast_forward_normalized!(fw::FastWeights, fb::FastBuffers,
         p_wbg = 1.0f0 / (1.0f0 + exp(-p_wbg))
         p_lg = 1.0f0 / (1.0f0 + exp(-p_lg))
         p_lbg = 1.0f0 / (1.0f0 + exp(-p_lbg))
+        fb.heads[1, j] = p_win
+        fb.heads[2, j] = p_wg
+        fb.heads[3, j] = p_wbg
+        fb.heads[4, j] = p_lg
+        fb.heads[5, j] = p_lbg
         # Joint equity formula: (2pw-1) + (wg-lg) + (wbg-lbg), normalized to [-1,1]
         V_equity[j] = ((2.0f0 * p_win - 1.0f0) + (p_wg - p_lg) + (p_wbg - p_lbg)) / 3.0f0
     end
@@ -415,7 +423,19 @@ function fast_forward_normalized!(fw::FastWeights, fb::FastBuffers,
         end
     end
 
-    return fb.p, V_equity, n
+    return fb.p, V_equity, fb.heads, n
+end
+
+"""
+    fast_forward_normalized!(fw, fb, X, A, n) -> (P_masked, V_equity, n)
+
+Compatibility wrapper returning the same cubeless scalar value as
+`Network.forward` for FCResNetMultiHead.
+"""
+function fast_forward_normalized!(fw::FastWeights, fb::FastBuffers,
+                                  X::AbstractMatrix, A::AbstractMatrix, n::Int)
+    P, V, _, n_active = fast_forward_normalized_heads!(fw, fb, X, A, n)
+    return P, V, n_active
 end
 
 end  # module FastInference

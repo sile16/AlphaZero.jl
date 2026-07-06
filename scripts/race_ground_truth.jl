@@ -5,8 +5,8 @@ Pre-bearoff race value-head ground-truth eval (two-sided wildbg-vs-wildbg MC).
 Measures NN value-head accuracy in the pre-bearoff race band — the band where
 v12 plateaued invisibly at wildbg parity because nothing measured ground truth.
 
-Design (correct baseline; the one-sided analytic variance-reduction of
-notes/race_ground_truth_plan_20260703.md is the documented follow-on):
+Design (correct baseline; a one-sided analytic variance-reduction is the
+documented follow-on):
 - For each fixed pre-bearoff race position, roll dice to a POST-DICE decision
   node — the NN value head is trained on decision nodes and is OUT OF
   DISTRIBUTION at pre-dice chance nodes (see the "never use NN as pre-dice

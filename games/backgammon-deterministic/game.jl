@@ -24,6 +24,16 @@ using BackgammonNet
 const SHORT_GAME = true  # Shorter games for faster learning (intentionally different starting position)
 const DOUBLES_ONLY = false  # Full 21 dice outcomes for proper stochastic testing
 
+_env_bool(name::String, default::Bool) = begin
+  v = lowercase(strip(get(ENV, name, default ? "true" : "false")))
+  v in ("1", "true", "yes", "on") && return true
+  v in ("0", "false", "no", "off") && return false
+  error("Invalid boolean value for $name: $(get(ENV, name, ""))")
+end
+
+const CUBE_ENABLED = _env_bool("BACKGAMMON_CUBE_ENABLED", false)
+const JACOBY_ENABLED = _env_bool("BACKGAMMON_JACOBY_ENABLED", CUBE_ENABLED)
+
 # Observation type: Symbol-based configuration (v0.3.2+)
 # Can be overridden via environment variable BACKGAMMON_OBS_TYPE
 # Available types (flat = MLP input, conv = tensor, hybrid = named tuple):
@@ -54,10 +64,8 @@ const OBS_TYPE_MAP = Dict(
 const OBS_TYPE_STR = get(ENV, "BACKGAMMON_OBS_TYPE", "minimal_flat")
 const OBSERVATION_TYPE = get(OBS_TYPE_MAP, OBS_TYPE_STR, :minimal_flat)
 
-# Action space: checker moves only. BackgammonNet supports cube/match/MET play,
-# but the current AlphaZero curriculum intentionally keeps cube decisions outside
-# this wrapper until the network/action head is extended beyond checker moves.
-const NUM_ACTIONS = BackgammonNet.CHECKER_ACTIONS
+# Unified action space: 1:676 checker actions, 677:680 cube actions.
+const NUM_ACTIONS = BackgammonNet.MAX_ACTIONS
 
 # Get observation size from BackgammonNet
 # Handle hybrid observations (named tuples) by computing flattened size
@@ -182,6 +190,8 @@ function GI.init(::GameSpec)
   game = BackgammonNet.initial_state(;
     short_game=SHORT_GAME,
     doubles_only=DOUBLES_ONLY,
+    cube_enabled=CUBE_ENABLED,
+    jacoby_enabled=JACOBY_ENABLED,
     obs_type=OBSERVATION_TYPE
   )
   rng = MersenneTwister()
@@ -200,8 +210,29 @@ function GI.white_reward(g::GameEnv)
   return Float64(g.game.reward)
 end
 
-# Terminal rewards are ±1/±2/±3 (win/gammon/backgammon). MCTS divides rewards
-# by this so tree Q-values match the NN value output scale (equity/3 ∈ [-1,1]).
+function GI.game_outcome(g::GameEnv)
+  BackgammonNet.game_terminated(g.game) || return nothing
+  white_won = g.game.reward > 0
+
+  # Cube drops terminate before a checker bearoff outcome exists. They are
+  # single wins for the probability heads, regardless of board contact/off state.
+  winner_off = white_won ?
+      BackgammonNet.get_count(g.game.p0, 25) :
+      BackgammonNet.get_count(g.game.p1, 0)
+  if winner_off != 15
+    return GI.GameOutcome(white_won, false, false)
+  end
+
+  heads = BackgammonNet.terminal_heads_target(g.game, 0)
+  is_gammon = white_won ? heads.p_gammon_win > 0.5f0 : heads.p_gammon_loss > 0.5f0
+  is_backgammon = white_won ? heads.p_bg_win > 0.5f0 : heads.p_bg_loss > 0.5f0
+  return GI.GameOutcome(white_won, is_gammon, is_backgammon)
+end
+
+# Cubeless terminal rewards are ±1/±2/±3 (win/gammon/backgammon). MCTS divides
+# rewards by this so ordinary terminal outcomes match the NN value scale
+# (equity/3 in [-1, 1]). Cubed games can exceed this range; value-head targets
+# still represent outcome probabilities, while cube stakes are carried by reward.
 GI.reward_scale(::GameSpec) = 3.0
 
 #####
@@ -285,7 +316,7 @@ function GI.actions_mask(::GameSpec, state::BackgammonNet.BackgammonGame)
   return mask
 end
 
-# Override default available_actions to avoid expensive collect(1:676) + indexing.
+# Override default available_actions to avoid expensive collect(1:680) + indexing.
 # Returns sorted legal action indices directly from BackgammonNet.
 function GI.available_actions(g::GameEnv)
   if BackgammonNet.game_terminated(g.game) || BackgammonNet.is_chance_node(g.game)
@@ -320,6 +351,7 @@ function GI.render(g::GameEnv)
   println("=" ^ 50)
   println("Backgammon STOCHASTIC (short_game=$SHORT_GAME, doubles=$DOUBLES_ONLY)")
   println("Observation type: $(game.obs_type) ($(OBS_SIZE) features)")
+  println("Cube: enabled=$(game.cube_enabled), value=$(game.cube_value), owner=$(game.cube_owner)")
   println("-" ^ 50)
 
   # Display board state using canonical indexing (27=my off, 28=opp off)
@@ -345,7 +377,7 @@ function GI.render(g::GameEnv)
     player = game.current_player == 0 ? "Player 0" : "Player 1"
     d1, d2 = game.dice
     remaining = game.remaining_actions
-    println("$player's turn - Dice: ($d1, $d2), Actions remaining: $remaining")
+    println("$player's turn - Phase: $(game.phase), Dice: ($d1, $d2), Actions remaining: $remaining")
   end
   println("=" ^ 50)
 end

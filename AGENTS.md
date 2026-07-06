@@ -5,7 +5,7 @@ BackgammonNet source files into AlphaZero or include them by path.
 
 ## Current Contract
 
-- Required BackgammonNet version: `0.6.3+`.
+- Required BackgammonNet version: `0.6.4+`.
 - Backgammon value-head contract: use `BackgammonNet.VALUE_HEAD_CONTRACT`,
   `BackgammonNet.VALUE_HEAD_ORDER`, and `BackgammonNet.check_probability_contract`.
 - Equity perspective is side-to-move unless a local API explicitly says
@@ -46,9 +46,11 @@ experiments.
 
 BackgammonNet supports cube, match equity tables, Janowski conversion, and
 rule-aware search values. The current `games/backgammon-deterministic/`
-AlphaZero wrapper intentionally exposes only the 676 checker actions. Cube
-actions are out of the current training curriculum until the policy/action
-contract is expanded.
+AlphaZero wrapper exposes BackgammonNet's unified 680-action space:
+checker actions `1:676` plus no-double/double/take/pass cube actions
+`677:680`. Money-play cube is disabled by default for initial checker-only
+training and can be enabled with `BACKGAMMON_CUBE_ENABLED=true`; the policy
+head size stays 680 either way.
 
 # Goal 1
 Train a NN that outputs value and policy for board positions for Race positions that uses MCTS for better tree search of best moves.

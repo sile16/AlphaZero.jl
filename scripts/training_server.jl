@@ -542,8 +542,24 @@ function _eval_forward_network(net, states)
             end
         end
     end
-    P_raw, V, _ = Network.convert_output_tuple(
-        net, Network.forward_normalized(net, X, A))
+    if net isa FluxLib.FCResNetMultiHead
+        P_raw, Lw, Lgw, Lbgw, Lgl, Lbgl, _ = Network.convert_output_tuple(
+            net, FluxLib.forward_normalized_multihead(net, X, A))
+        V = zeros(Float32, 1, n)
+        @inbounds for i in 1:n
+            heads = (
+                Float32(Flux.sigmoid(Lw[1, i])),
+                Float32(Flux.sigmoid(Lgw[1, i])),
+                Float32(Flux.sigmoid(Lbgw[1, i])),
+                Float32(Flux.sigmoid(Lgl[1, i])),
+                Float32(Flux.sigmoid(Lbgl[1, i])),
+            )
+            V[1, i] = BackgammonNet.search_value(states[i], heads; mode=:auto)
+        end
+    else
+        P_raw, V, _ = Network.convert_output_tuple(
+            net, Network.forward_normalized(net, X, A))
+    end
     results = Vector{Tuple{Vector{Float32}, Float32}}(undef, n)
     for i in 1:n
         legal = @view(A[:, i]) .> 0

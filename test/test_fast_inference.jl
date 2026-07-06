@@ -4,7 +4,7 @@
 # Guards the allocation-free CPU forward pass used by selfplay_client.jl:
 # - _gemm_bias! against a Float64 reference on shapes hitting every remainder
 #   path (k-tile tail, 4-step k-unroll tail, 4-column tail, single columns)
-# - fast_forward_normalized! against the Flux FCResNetMultiHead forward
+# - fast_forward_normalized! / fast_forward_normalized_heads! against the Flux FCResNetMultiHead forward
 # - refresh_fast_weights! equivalence with a fresh extraction
 # - zero allocations (per-move allocations destroy threaded selfplay throughput)
 
@@ -121,10 +121,14 @@ fwd_alloc(fw, fb, X, A, n) = @allocated fast_forward_normalized!(fw, fb, X, A, n
     for n in (1, 4, 7)  # hit the 4-column kernel path and both tails
       X = randn(rng, Float32, FastInfTestGame.STATE_DIM, n)
       A = random_mask(rng, nact, n)
-      P, V, _ = fast_forward_normalized!(fw, fb, X, A, n)
+      P, V, H, _ = fast_forward_normalized_heads!(fw, fb, X, A, n)
       P_ref, V_ref = flux_reference(nn, X, A)
+      _, Lw, Lgw, Lbgw, Lgl, Lbgl, _ = FluxLib.forward_normalized_multihead(nn, X, A)
+      H_ref = vcat(Flux.sigmoid.(Lw), Flux.sigmoid.(Lgw), Flux.sigmoid.(Lbgw),
+                   Flux.sigmoid.(Lgl), Flux.sigmoid.(Lbgl))
       @test maximum(abs.(P[:, 1:n] .- P_ref)) < 1e-4
       @test maximum(abs.(V[1:n] .- V_ref)) < 1e-4
+      @test maximum(abs.(H[:, 1:n] .- H_ref)) < 1e-4
     end
   end
 

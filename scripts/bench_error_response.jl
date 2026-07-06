@@ -3,9 +3,8 @@
 Rungs 6-7 of the MCTS validation staircase: the ERROR-RESPONSE CURVE.
 
 Rungs 1-3 (test/test_mcts_identity_staircase.jl) proved the MCTS arithmetic is
-EXACT (Q == input values to machine epsilon). The convergence sweep
-(notes/mcts_convergence_sweep_20260703.md) showed finite-budget allocation noise
-with EXACT values (400 iters = knee). So any move error measured here is
+EXACT (Q == input values to machine epsilon). A convergence sweep showed
+finite-budget allocation noise with EXACT values (400 iters = knee). So any move error measured here is
 attributable to INJECTED input error interacting with search — the machinery is
 clean.
 

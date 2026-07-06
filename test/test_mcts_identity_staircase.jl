@@ -15,7 +15,7 @@
 #   (2) finite-budget SUBOPTIMALITY — at low simulation counts MCTS allocates
 #       visits imperfectly; the argmax can miss the true-best move by a hair.
 #       This is EXPECTED, is a smooth function of the sim budget, and is measured
-#       elsewhere as convergence curves (notes/mcts_convergence_sweep_20260703.md).
+#       elsewhere as convergence curves.
 #
 # Behavioral / play-strength tests (eval_table_vs_wildbg.jl etc.) conflate the
 # two: they catch bugs only STATISTICALLY and cannot distinguish "the arithmetic

@@ -19,7 +19,9 @@ function batches_equal(a::SampleBatch, b::SampleBatch)
     a.is_bearoff == b.is_bearoff
 end
 
-function make_batch(n; state_dim=344, num_actions=676)
+DEFAULT_PROTOCOL_ACTIONS = 680
+
+function make_batch(n; state_dim=344, num_actions=DEFAULT_PROTOCOL_ACTIONS)
     SampleBatch(
         Int32(n),
         rand(Float32, state_dim, n),
@@ -39,7 +41,7 @@ end
     recovered = unpack_samples(bytes)
     @test batches_equal(batch, recovered)
     @test size(recovered.states) == (344, 10)
-    @test size(recovered.policies) == (676, 10)
+    @test size(recovered.policies) == (DEFAULT_PROTOCOL_ACTIONS, 10)
     @test size(recovered.equities) == (5, 10)
     @test length(recovered.values) == 10
     @test length(recovered.has_equity) == 10
@@ -109,7 +111,7 @@ end
     batch = SampleBatch(
         Int32(n),
         zeros(Float32, 344, n),
-        zeros(Float32, 676, n),
+        zeros(Float32, DEFAULT_PROTOCOL_ACTIONS, n),
         zeros(Float32, n),
         zeros(Float32, 5, n),
         fill(false, n),
@@ -129,7 +131,7 @@ end
     batch = SampleBatch(
         Int32(n),
         ones(Float32, 344, n),
-        ones(Float32, 676, n),
+        ones(Float32, DEFAULT_PROTOCOL_ACTIONS, n),
         ones(Float32, n),
         ones(Float32, 5, n),
         fill(true, n),
@@ -155,7 +157,7 @@ end
     batch = SampleBatch(
         Int32(n),
         rand(Float32, 344, n),
-        rand(Float32, 676, n),
+        rand(Float32, DEFAULT_PROTOCOL_ACTIONS, n),
         rand(Float32, n),
         eq,
         has_eq,
@@ -178,7 +180,7 @@ end
     samples = [
         (
             state = rand(Float32, 344),
-            policy = rand(Float32, 676),
+            policy = rand(Float32, DEFAULT_PROTOCOL_ACTIONS),
             value = 0.5f0,
             equity = Float32[0.6, 0.1, 0.0, 0.05, 0.0],
             has_equity = true,
@@ -188,7 +190,7 @@ end
         ),
         (
             state = rand(Float32, 344),
-            policy = rand(Float32, 676),
+            policy = rand(Float32, DEFAULT_PROTOCOL_ACTIONS),
             value = -0.3f0,
             equity = Float32[0.0, 0.0, 0.0, 0.0, 0.0],
             has_equity = false,
@@ -198,7 +200,7 @@ end
         ),
         (
             state = rand(Float32, 344),
-            policy = rand(Float32, 676),
+            policy = rand(Float32, DEFAULT_PROTOCOL_ACTIONS),
             value = 1.0f0,
             equity = Float32[0.9, 0.3, 0.05, 0.0, 0.0],
             has_equity = true,
@@ -211,7 +213,7 @@ end
     batch = samples_to_batch(samples)
     @test batch.n == Int32(3)
     @test size(batch.states) == (344, 3)
-    @test size(batch.policies) == (676, 3)
+    @test size(batch.policies) == (DEFAULT_PROTOCOL_ACTIONS, 3)
     @test batch.values == Float32[0.5, -0.3, 1.0]
     @test batch.has_equity == Bool[true, false, true]
     @test batch.is_chance == Bool[false, false, true]
@@ -250,7 +252,7 @@ end
     samples = [
         (
             state = rand(Float32, 344),
-            policy = rand(Float32, 676),
+            policy = rand(Float32, DEFAULT_PROTOCOL_ACTIONS),
             value = Float32(i / 10),
             equity = rand(Float32, 5),
             has_equity = isodd(i),

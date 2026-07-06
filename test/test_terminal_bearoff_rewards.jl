@@ -79,3 +79,38 @@ end
   end
   @test AlphaZero.GI.reward_scale(Main.BackgammonDeterministic.GameSpec()) == 3.0
 end
+
+@testset "Backgammon GameOutcome ignores cube multiplier" begin
+  games_dir = joinpath(@__DIR__, "..", "games")
+  if !isdefined(Main, :BackgammonDeterministic)
+    include(joinpath(games_dir, "backgammon-deterministic", "main.jl"))
+  end
+
+  p0_off = UInt128(15) << (25 * 4)
+  p1_single = ((UInt128(14) << (1 * 4)) | UInt128(1))
+  env = Main.BackgammonDeterministic.GameEnv(
+    BackgammonGame(p0_off, p1_single, SVector{2, Int8}(0, 0), Int8(0), Int8(0), true, 4.0f0;
+                   obs_type=:minimal_flat),
+    MersenneTwister(1),
+  )
+  env.game.cube_enabled = true
+  env.game.cube_value = Int16(4)
+
+  outcome = AlphaZero.GI.game_outcome(env)
+  @test outcome !== nothing
+  @test outcome.white_won
+  @test !outcome.is_gammon
+  @test !outcome.is_backgammon
+
+  drop_env = AlphaZero.GI.init(Main.BackgammonDeterministic.GameSpec())
+  drop_env.game.cube_enabled = true
+  drop_env.game.cube_owner = Int8(-1)
+  drop_env.game.phase = BackgammonNet.PHASE_CUBE_DECISION
+  apply_action!(drop_env.game, BackgammonNet.ACTION_CUBE_DOUBLE)
+  apply_action!(drop_env.game, BackgammonNet.ACTION_CUBE_PASS)
+  drop_outcome = AlphaZero.GI.game_outcome(drop_env)
+  @test drop_outcome !== nothing
+  @test drop_outcome.white_won == (drop_env.game.reward > 0)
+  @test !drop_outcome.is_gammon
+  @test !drop_outcome.is_backgammon
+end
