@@ -121,7 +121,7 @@ one interface per engine; evals valid/strong/fast/frequent.
 ##       A/B only after bootstrap quality is acceptable.
 ## - [ ] Keep contact net small (128×3/×5) until method breaks the contact plateau.
 
-## EXP3 BOOTSTRAP-ONLY RUNG LAUNCHED (2026-07-06 ~10:55): dual 128×3,
+## EXP3 BOOTSTRAP-ONLY RUNG COMPLETED (2026-07-06 10:55→11:07): dual 128×3,
 ## 100k soft contact bootstrap, bootstrap-only, 60 iters, no self-play uploads.
 ## Data-dir: /home/sile/alphazero-contact-exp3-bootstrap100k-60.
 ## Commit: 92b22b0. Server PID 2484306, eval-only client PID 2485524, both detached
@@ -129,16 +129,28 @@ one interface per engine; evals valid/strong/fast/frequent.
 ## exp3_bootstrap_eval_client_setsid.log.
 ## Config facts: PER=false, Reanalyze=false, eval 200 positions x 2 sides,
 ## 200 MCTS, eval every 5 iters, combined k7+n18 exact evaluator loaded by
-## eval client; server fixed bearoff eval/gate disabled. Live validation:
-## status reached iter 15, iter 15 checkpoints saved, client registered as jarvis.
-## Early eval trajectory:
-##   iter 0  -1.752 equity,  8.8% win
-##   iter 5  -0.935 equity, 24.25% win
-##   iter 10 -1.010 equity, 20.5% win
-##   iter 15 in progress; first chunk -0.64 equity, 30.0% win
-## Next: monitor 15/30/60 eval points and only launch self-play if the
-## bootstrap-only checkpoint is materially closer to wildbg than EXP2's ~24-26%
-## plateau.
+## eval client; server fixed bearoff eval/gate disabled. Client registered as jarvis;
+## Neo was not used. Final eval completed before server exit; orphan eval-only client
+## was stopped after it began polling the completed server.
+## Eval trajectory:
+##   iter 0  -1.7525 equity,  8.8% win
+##   iter 5  -0.9350 equity, 24.2% win
+##   iter 10 -1.0100 equity, 20.5% win
+##   iter 15 -0.9200 equity, 22.5% win
+##   iter 20 -0.9425 equity, 23.8% win
+##   iter 25 -1.0900 equity, 19.2% win
+##   iter 30 -0.9375 equity, 22.5% win
+##   iter 35 -1.0350 equity, 20.5% win
+##   iter 40 -1.0000 equity, 20.8% win
+##   iter 45 -1.0150 equity, 19.2% win
+##   iter 50 -1.0350 equity, 18.5% win
+##   iter 55 -1.0700 equity, 18.2% win
+##   iter 60 -1.1175 equity, 17.0% win
+## Result: 60 iters bootstrap-only overfit/regressed after the early iter-5 peak and
+## did NOT beat EXP2's ~24-26% plateau. Do not launch EXP3 self-play from iter60.
+## Next bootstrap rung should change the data/optimization setup, not just train longer:
+## larger/diverse bootstrap set, held-out bootstrap validation, LR schedule/early stop,
+## and/or PER/Reanalyze only after the supervised rung can reach the gate target.
 
 ## Phase 3 — Contact training (small net + exact-race-frontier curriculum)
 - [ ] Race-frontier truncation for contact traces: at a race position, evaluate with
