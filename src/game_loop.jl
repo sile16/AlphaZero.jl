@@ -185,7 +185,18 @@ function select_action(agent::ExternalAgent, ::Nothing, env)
     game = env.game
     # Use BackgammonNet's agent_move protocol
     bg_agent = _make_backend_agent(agent.backend)
-    action = _agent_move(bg_agent, game)
+    action = try
+        _agent_move(bg_agent, game)
+    catch e
+        # Robustness: some engine bridges (e.g. wildbg) can fail to match their chosen full-turn
+        # move to a legal action sequence on rare doubles positions ("returned no move for
+        # doubles ..."). Rather than abort a whole eval, fall back to a legal action for that one
+        # decision (rare → negligible bias) and warn.
+        legal = GI.available_actions(env)
+        isempty(legal) && rethrow(e)
+        @warn "ExternalAgent move failed; using a legal fallback move" exception=(e, catch_backtrace()) maxlog=5
+        first(legal)
+    end
     return (action, Float32[], Int[])
 end
 
