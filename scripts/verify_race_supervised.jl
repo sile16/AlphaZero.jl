@@ -115,6 +115,14 @@ function main()
     corr = cor(pred, exact)
     bias = mean(err)
 
+    # Split by doubles vs non-doubles (targets for doubles positions may be affected
+    # by multi-part-turn handling — measure them separately).
+    isdbl = [Bool(d.states[i].dice[1] == d.states[i].dice[2]) for i in 1:n]
+    nd = .!isdbl
+    @printf("\n=== VALUE by dice type ===\n")
+    @printf("  non-doubles (%d): corr=%.5f  MAE=%.5f\n", count(nd), cor(pred[nd], exact[nd]), mean(abs.(err[nd])))
+    @printf("  doubles     (%d): corr=%.5f  MAE=%.5f\n", count(isdbl), cor(pred[isdbl], exact[isdbl]), mean(abs.(err[isdbl])))
+
     println("\n=== VALUE (raw points, exact ∈ [$(round(minimum(exact),digits=2)),$(round(maximum(exact),digits=2))]) ===")
     @printf("  correlation : %.5f\n", corr)
     @printf("  MSE         : %.5f\n", mse)

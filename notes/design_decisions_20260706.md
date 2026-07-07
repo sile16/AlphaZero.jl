@@ -147,6 +147,39 @@ table equity: **corr(single-game outcome, exact) = 0.73–0.77 ≈ the self-play
 saturated at the single-MC-outcome information limit. Supervised (exact expectation targets) → 0.99.
 Lever = value-TARGET quality (lower variance): MCTS root value, reanalyze, exact-frontier truncation.
 
+### RESOLUTION (2026-07-06, later): the "plateau" was a DOUBLES target-generation bug, NOT a real plateau
+
+`validate_rollout_vs_k7.jl` on exact-k7 deep bearoff, split by dice type:
+- **non-doubles: corr(rollout-mean, k7-exact) = 0.9996, MAE 0.013** — rollout + tables are EXACT.
+- **doubles: corr 0.147, MAE 0.79** — garbage.
+
+Root cause: my hand-rolled `move_eq` (in `generate_race_table_supervised.jl` AND the diagnostics)
+does ONE `apply_action!` per move, but a DOUBLES roll is a multi-part turn — after one action the
+SAME player is still on turn (mid-turn), so the unconditional sign flip `-compute_equity(lookup(child))`
+is wrong. Production `BackgammonNet.bearoff_best_move_value` recurses through mid-turn doubles
+correctly; my generator did not. So ~28% of my supervised TARGET values (doubles) are wrong.
+
+Re-measuring corr split by dice type (test set = my generator's values):
+- SUPERVISED net: non-dbl 0.9988 / dbl 0.9985 (it faithfully reproduced its own buggy targets).
+- SELF-PLAY net (covered iter 60): **non-dbl 0.992** / dbl 0.117. Trained on real game outcomes
+  (encoding-agnostic) → learns CORRECT values → matches exact on non-doubles (0.992 ≈ supervised),
+  DISAGREES with the buggy doubles targets (0.117), which drags the average to the fake "0.74".
+
+**CONCLUSIONS (Milestone 3 corrected):**
+1. Tables (k7 AND n18) are EXACT. Finding B DISSOLVED.
+2. The self-play RL loop WORKS — corr 0.992 on the trustworthy (non-doubles) subset, vs supervised
+   0.999. There is NO plateau. The small remaining gap (0.992 vs 0.999) is the expected MC-target
+   noise (Finding A's mechanism, but tiny — not a ceiling).
+3. My `generate_race_table_supervised.jl` (and verify/diagnostic move_eq) have a DOUBLES bug →
+   supervised targets wrong for ~28% of positions. FIX: use production `bearoff_best_move_value` /
+   post-dice recursion for doubles, regenerate train+test, re-measure full-set (expect self-play to
+   jump to ~0.99 overall once the reference is correct).
+
+Historical note: this doubles bug is a strong candidate for the ORIGINAL "~0.74 contact plateau" too
+(same move_eq pattern anywhere doubles are evaluated one-action-at-a-time).
+
+---
+_Superseded investigation note (kept for context):_
 **Finding B (open, foundational) — optimal-rollout mean ≠ one-sided-table equity by ~0.29 MAE.**
 Averaging rollouts barely helps: mean-of-25 corr 0.75, mean-of-200 corr 0.80, **MAE stuck ~0.29**
 (variance-only would give MAE ≤ ~0.11 at K=200). So there is a SYSTEMATIC gap between actual
