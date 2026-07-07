@@ -20,6 +20,17 @@ and every gnubg call is globally serialized by an internal lock. Per-worker back
 instances all resolve to that same runtime, so gnubg moves are thread-safe but do
 not run concurrently; parallelism still benefits the AZ (MCTS) side.
 
+IMPORTANT (ply >= 2): gnubg's multi-ply evaluator spins up its OWN internal worker
+thread pool, which can DEADLOCK (all pool threads stuck in pthread_cond_wait) on
+certain positions. This is a gnubg-internal 2-ply threading bug, independent of the
+number of Julia workers: it is hit far more often under many Julia workers (a 40-game
+run hangs in minutes), and forcing --num-workers 1 greatly reduces — but does NOT fully
+eliminate — the hang (an 80-game single-worker run still eventually locked up; a 6-game
+one completed). ply-0 does not use that path and runs fine with many workers. To get
+ply>=2 numbers reliably, run small single-worker batches (e.g. <=10 games/side) and
+aggregate the ones that complete; expect ~6-7 games/min (gnubg is globally serialized,
+so worker count barely affects throughput anyway).
+
 Optionally uses GPU (Metal.jl) for a subset of workers (--gpu-workers).
 
 Usage:
@@ -94,7 +105,8 @@ function parse_eval_args()
             arg_type = Int
             default = 100
         "--gnubg-ply"
-            help = "gnubg search ply (0 = 1-ply NN, 2 = 2-ply stronger, range 0:7)"
+            help = "gnubg search ply (0 = 1-ply NN, 2 = 2-ply stronger, range 0:7). " *
+                   "IMPORTANT: ply >= 2 deadlocks under multiple workers — use --num-workers 1."
             arg_type = Int
             default = 0
         "--batch"
@@ -524,6 +536,16 @@ function main()
     gnubg_ply = ARGS["gnubg_ply"]
     println("gnubg backend: GnubgCLibBackend(ply=$gnubg_ply)")
     HAS_METAL && println("Metal.jl loaded: $(Metal.current_device())")
+
+    # ply >= 2 deadlocks under multiple worker threads (gnubg's multi-ply evaluator
+    # is not safe to invoke from varying OS threads). Force single worker.
+    if gnubg_ply >= 2 && ARGS["num_workers"] > 1
+        @warn "gnubg ply=$gnubg_ply can deadlock in its internal 2-ply thread pool; forcing " *
+              "--num-workers=1 to greatly reduce (not fully eliminate) the hang. Prefer small " *
+              "game batches at ply>=2. gnubg is globally serialized, so throughput is ~unchanged."
+        ARGS["num_workers"] = 1
+        ARGS["gpu_workers"] = 0
+    end
 
     gpu_workers = ARGS["gpu_workers"]
 
