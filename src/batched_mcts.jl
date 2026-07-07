@@ -490,6 +490,28 @@ function batch_evaluate(benv::BatchedEnv, states::Vector, actions_by_state=nothi
         return Tuple{Vector{Float32}, Float32}[]
     end
 
+    # The batched inference oracle has a fixed-width buffer sized to benv.batch_size.
+    # The passthrough/training path never enqueues more than batch_size states per wave
+    # (one leaf per sim), so it always takes the single-call path below unchanged. The
+    # EVAL-ONLY :exact_expectation path can enqueue up to ~21 chance-children per sim, so
+    # chunk to batch_size to avoid overflowing the oracle buffer (behaviour identical to
+    # calling it batch_size states at a time).
+    maxw = benv.batch_size
+    if length(states) > maxw && (benv.batch_oracle_with_actions !== nothing || benv.batch_oracle !== nothing)
+        results = Tuple{Vector{Float32}, Float32}[]
+        sizehint!(results, length(states))
+        for i in 1:maxw:length(states)
+            j = min(i + maxw - 1, length(states))
+            chunk = if actions_by_state !== nothing && benv.batch_oracle_with_actions !== nothing
+                benv.batch_oracle_with_actions(states[i:j], actions_by_state[i:j])
+            else
+                benv.batch_oracle(states[i:j])
+            end
+            append!(results, chunk)
+        end
+        return results
+    end
+
     if actions_by_state !== nothing && benv.batch_oracle_with_actions !== nothing
         return benv.batch_oracle_with_actions(states, actions_by_state)
     elseif benv.batch_oracle !== nothing
