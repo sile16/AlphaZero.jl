@@ -194,7 +194,7 @@ function select_action(agent::ExternalAgent, ::Nothing, env)
         # decision (rare → negligible bias) and warn.
         legal = GI.available_actions(env)
         isempty(legal) && rethrow(e)
-        @warn "ExternalAgent move failed; using a legal fallback move" exception=(e, catch_backtrace()) maxlog=5
+        @warn "ExternalAgent move failed; using a legal fallback move (msg: $(sprint(showerror, e)))" maxlog=3
         first(legal)
     end
     return (action, Float32[], Int[])
