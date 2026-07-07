@@ -570,7 +570,7 @@ function init_game(rng::AbstractRNG)
         p0, p1, cp = START_POSITIONS[rand(rng, 1:length(START_POSITIONS))]
         game = BackgammonNet.BackgammonGame(
             p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
-            obs_type=:minimal_flat)
+            obs_type=OBSERVATION_TYPE)
         GI.set_state!(env, game)
         # Roll initial dice
         BackgammonNet.sample_chance!(env.game, rng)
