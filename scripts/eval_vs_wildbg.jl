@@ -109,6 +109,10 @@ function parse_eval_args()
             help = "CPU inference backend: auto, fast, or flux"
             arg_type = String
             default = "auto"
+        "--chance-mode"
+            help = "Chance-node handling: exact_expectation (default, eval) or passthrough"
+            arg_type = String
+            default = "exact_expectation"
     end
 
     return ArgParse.parse_args(s)
@@ -268,7 +272,8 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
                              inference_backend::Union{Symbol, AbstractString}="auto",
                              gpu_workers::Int=0,
                              race_checkpoint_path::Union{String,Nothing}=nothing,
-                             race_width::Int=128, race_blocks::Int=3)
+                             race_width::Int=128, race_blocks::Int=3,
+                             chance_mode::Symbol=:exact_expectation)
     # Load contact/main network (CPU)
     contact_network = FluxLib.FCResNetMultiHead(
         gspec, FluxLib.FCResNetMultiHeadHP(width=width, num_blocks=blocks))
@@ -289,7 +294,9 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
         cpuct=1.5,
         temperature=ConstSchedule(0.0),
         dirichlet_noise_ϵ=0.0,
-        dirichlet_noise_α=1.0)
+        dirichlet_noise_α=1.0,
+        # EVAL-ONLY: exact expectimax over dice outcomes at chance nodes (default).
+        chance_mode=chance_mode)
 
     backend = AlphaZero.BackgammonInference.resolve_cpu_backend(inference_backend)
     println("  CPU inference: $(AlphaZero.BackgammonInference.cpu_backend_summary(backend))")
@@ -570,6 +577,7 @@ function main()
                     num_workers=ARGS["num_workers"],
                     gpu_workers=gpu_workers,
                     mcts_iters=ARGS["mcts_iters"],
+                    chance_mode=Symbol(ARGS["chance_mode"]),
                     batch_size=ARGS["inference_batch_size"],
                     inference_backend=ARGS["inference_backend"],
                     race_checkpoint_path=race_ckpt_path,
@@ -730,6 +738,7 @@ function main()
             num_workers=ARGS["num_workers"],
             gpu_workers=gpu_workers,
             mcts_iters=ARGS["mcts_iters"],
+                    chance_mode=Symbol(ARGS["chance_mode"]),
             batch_size=ARGS["inference_batch_size"],
             inference_backend=ARGS["inference_backend"],
             race_checkpoint_path=race_ckpt_path,

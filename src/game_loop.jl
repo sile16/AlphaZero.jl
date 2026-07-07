@@ -125,7 +125,9 @@ advanced stochastic chance handling is requested.
 """
 function create_player(agent::MctsAgent; rng::Random.AbstractRNG=Random.Xoshiro(rand(UInt)))
     cm = agent.mcts_params.chance_mode
-    if cm == :passthrough || cm == :full
+    # :exact_expectation is the EVAL-ONLY batched expectimax chance mode; it is
+    # gated inside the batched traversal, so route it to the batched player too.
+    if cm == :passthrough || cm == :full || cm == :exact_expectation
         return BatchedMCTS.BatchedMctsPlayer(
             agent.gspec, agent.oracle, agent.mcts_params;
             batch_size=agent.batch_size, batch_oracle=agent.batch_oracle,

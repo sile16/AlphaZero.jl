@@ -45,6 +45,24 @@ const EMPTY_INT_VEC = Int[]  # Shared empty vector for terminal/bearoff leaf_act
 
 """
 Stores the state of a simulation that's waiting for neural network evaluation.
+
+Chance-node handling (only active under `chance_mode == :exact_expectation`, an
+EVAL-ONLY mode) reuses this struct via the `kind` field:
+
+  - `:normal`        — decision leaf / terminal / bearoff leaf (the passthrough
+                       and training path always uses this; behaviour unchanged).
+  - `:chance_first`  — FIRST visit to a chance node: the chance node itself is the
+                       leaf; its pre-dice NN value becomes `ChanceNodeInfo.Vest`.
+  - `:chance_expand` — SECOND visit: expand ALL outcomes. Outcomes with a known
+                       value (terminal/bearoff/transposition) are filled during
+                       traversal; outcomes needing an NN eval are recorded in
+                       `expand_states`/`expand_actions`/`expand_out_idx` and filled
+                       in the batch. The chance node's expectation is the leaf value.
+
+`is_chance` runs parallel to `path`: a `true` entry marks a chance OUTCOME edge
+`(chance_state, outcome_idx)` (no reward, no gamma, no sign flip; the value
+propagated up is the chance node's probability-weighted expectation). A `false`
+entry marks an ordinary decision edge (existing reward/gamma/pswitch backup).
 """
 mutable struct PendingSimulation{S}
     leaf_state::S           # State to be evaluated
@@ -54,6 +72,13 @@ mutable struct PendingSimulation{S}
     player_switches::Vector{Bool}  # Whether player switched at each step
     is_new_node::Bool       # Whether this is a new node (needs oracle) or terminal
     terminal_value::Float64 # Value if terminal (no oracle needed)
+    # ── Chance-node fields (only used under :exact_expectation) ──────────────
+    kind::Symbol                       # :normal, :chance_first, :chance_expand
+    is_chance::Vector{Bool}            # parallel to path: true => chance outcome edge
+    chance_state::S                    # the chance node state (first/expand)
+    expand_states::Vector{S}           # outcome-child states needing an NN eval
+    expand_actions::Vector{Vector{Int}}  # child actions for each expand state
+    expand_out_idx::Vector{Int}        # outcome index (into chance_tree) for each
 end
 
 #####
@@ -81,6 +106,13 @@ mutable struct BatchedEnv{S, O, R, BO, BOWA, BE, G}
     _eval_states::Vector{S}
     _eval_actions::Vector{Vector{Int}}
     _eval_indices::Vector{Int}
+    # Routing buffers for :exact_expectation eval dispatch (stay empty otherwise, so
+    # the passthrough/training path never touches them). Parallel to _eval_states:
+    #   _eval_route_sim[k] = index of the pending sim that owns eval state k
+    #   _eval_route_out[k] = 0 => normal decision leaf; -1 => chance_first (Vest);
+    #                        >0 => chance_expand outcome index to fill
+    _eval_route_sim::Vector{Int}
+    _eval_route_out::Vector{Int}
     # Bear-off evaluator: (game) -> Union{Float64, Nothing}
     bearoff_evaluator::BE
     # 1 / GI.reward_scale(gspec): rewards are multiplied by this so tree Q-values
@@ -95,10 +127,13 @@ function BatchedEnv(env::MCTS.Env{S, O, R}, batch_size::Int;
     eval_states = S[]; sizehint!(eval_states, batch_size)
     eval_actions = Vector{Int}[]; sizehint!(eval_actions, batch_size)
     eval_indices = Int[]; sizehint!(eval_indices, batch_size)
+    eval_route_sim = Int[]; sizehint!(eval_route_sim, batch_size)
+    eval_route_out = Int[]; sizehint!(eval_route_out, batch_size)
     BatchedEnv{S, O, R, BO, BOWA, BE, game_type}(env, batch_size, PendingSimulation{S}[],
                               batch_oracle, batch_oracle_with_actions,
                               game_type[], PendingSimulation{S}[], eval_states,
-                              eval_actions, eval_indices, bearoff_evaluator,
+                              eval_actions, eval_indices, eval_route_sim, eval_route_out,
+                              bearoff_evaluator,
                               1.0 / GI.reward_scale(env.gspec))
 end
 
@@ -109,8 +144,13 @@ function _init_sim_pool!(benv::BatchedEnv{S}, game) where S
         path = Tuple{S, Int}[]; sizehint!(path, 12)
         rewards = Float64[]; sizehint!(rewards, 12)
         pswitches = Bool[]; sizehint!(pswitches, 12)
+        is_chance = Bool[]; sizehint!(is_chance, 12)
+        expand_states = S[]; sizehint!(expand_states, 24)
+        expand_actions = Vector{Int}[]; sizehint!(expand_actions, 24)
+        expand_out_idx = Int[]; sizehint!(expand_out_idx, 24)
         push!(benv.sim_pool, PendingSimulation{S}(
-            dummy_state, Int[], path, rewards, pswitches, false, 0.0
+            dummy_state, Int[], path, rewards, pswitches, false, 0.0,
+            :normal, is_chance, dummy_state, expand_states, expand_actions, expand_out_idx
         ))
     end
 end
@@ -140,6 +180,74 @@ function remove_virtual_loss!(env::MCTS.Env, state, action_id)
 end
 
 #####
+##### Exact-expectation chance-node helpers (EVAL-ONLY :exact_expectation mode)
+#####
+
+"""
+Probability-weighted expectation over a chance node's outcome children:
+
+    Σ o.prob * (o.N > 0 ? o.W/o.N : Vest)
+
+The `N==0 → Vest` fallback is load-bearing for batched-wave correctness: a
+follower's backprop may read this before the expander has filled an outcome
+(outcome still at N=0); using 0 there would silently drag the value toward 0 and
+that bias would be baked into the parent decision node's cumulative W.
+"""
+function chance_expectation(cinfo::MCTS.ChanceNodeInfo)
+    Vest = Float64(cinfo.Vest)
+    e = 0.0
+    @inbounds for o in cinfo.outcomes
+        e += o.prob * (o.N > 0 ? o.W / o.N : Vest)
+    end
+    return e
+end
+
+"""
+Resolve the player-relative value of a post-chance outcome child, or return
+`nothing` if it needs an NN eval (which enqueues it on `sim` for the batch).
+
+`apply_chance` does NOT switch the player-to-move, so the child's value is
+already on the chance node's (mover-relative) scale — it is combined UNFLIPPED.
+
+  - terminal            → 0.0  (dice never terminate backgammon; matches the
+                                recursive `expand_chance_node!` convention)
+  - bearoff-covered     → exact value (white-relative → player-relative)
+  - transposition (in env.tree with real visits) → its running mean W/N
+  - otherwise           → nothing; enqueued for an NN eval of the child
+"""
+function resolve_known_outcome_value!(benv::BatchedEnv, sim::PendingSimulation, child, out_idx::Int)
+    env = benv.env
+    if GI.game_terminated(child)
+        return 0.0
+    end
+    if benv.bearoff_evaluator !== nothing
+        val = benv.bearoff_evaluator(child)
+        if val !== nothing
+            wp = GI.white_playing(child)
+            return wp ? Float64(val) : -Float64(val)
+        end
+    end
+    cstate = GI.current_state(child)
+    cinfo = get(env.tree, cstate, nothing)
+    if cinfo !== nothing
+        ntot = MCTS.Ntot(cinfo)
+        if ntot > 0
+            wsum = 0.0
+            @inbounds for a in cinfo.stats; wsum += a.W; end
+            return wsum / ntot
+        else
+            return Float64(cinfo.Vest)
+        end
+    end
+    # Needs an NN eval: enqueue the child (a decision node) for the batch.
+    cactions = GI.available_actions(GI.spec(child), cstate)
+    push!(sim.expand_states, cstate)
+    push!(sim.expand_actions, cactions)
+    push!(sim.expand_out_idx, out_idx)
+    return nothing
+end
+
+#####
 ##### Non-blocking tree traversal
 #####
 
@@ -156,6 +264,12 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
     empty!(sim.path)
     empty!(sim.rewards)
     empty!(sim.player_switches)
+    # Chance-node bookkeeping reset (cheap; vectors stay empty on the passthrough path)
+    empty!(sim.is_chance)
+    empty!(sim.expand_states)
+    empty!(sim.expand_actions)
+    empty!(sim.expand_out_idx)
+    sim.kind = :normal
 
     depth = 0
     max_depth = 500
@@ -182,6 +296,80 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
                     sim.is_new_node = false
                     sim.terminal_value = player_val
                     return sim
+                end
+            end
+
+            # EVAL-ONLY exact-expectation chance node (first-class chance_tree entries).
+            # Gated on :exact_expectation ONLY — :full / :passthrough / training stay
+            # on the passthrough path below (byte-identical).
+            if env.chance_mode == :exact_expectation
+                cstate = GI.current_state(game)
+                cinfo = get(env.chance_tree, cstate, nothing)
+                if cinfo === nothing
+                    # FIRST VISIT: claim the node (so concurrent same-wave sims do not
+                    # both take the first-visit path). The chance node itself is the
+                    # leaf; its pre-dice NN value (filled in the batch) becomes Vest.
+                    outcomes = GI.chance_outcomes(game)
+                    ostats = [MCTS.ChanceOutcomeStats(prob, 0.0, 0.0) for (_, prob) in outcomes]
+                    env.chance_tree[cstate] = MCTS.ChanceNodeInfo(ostats, Float32(0), false)
+                    sim.kind = :chance_first
+                    sim.chance_state = cstate
+                    sim.leaf_state = cstate
+                    sim.leaf_actions = EMPTY_INT_VEC
+                    sim.is_new_node = false
+                    sim.terminal_value = 0.0
+                    return sim
+                elseif !cinfo.expanded
+                    # SECOND VISIT: expand ALL outcomes. Mark expanded FIRST so
+                    # same-wave followers take the expanded path. Known-value outcomes
+                    # are filled now; NN-needed outcomes are enqueued for the batch.
+                    cinfo.expanded = true
+                    cinfo.num_expanded = length(cinfo.outcomes)
+                    env.total_chance_nodes_expanded += 1
+                    outcomes = GI.chance_outcomes(game)
+                    wp_chance = GI.white_playing(game)
+                    @inbounds for k in eachindex(outcomes)
+                        child = GI.clone(game)
+                        GI.apply_chance!(child, outcomes[k][1])
+                        # apply_chance must not switch the player-to-move.
+                        @assert GI.game_terminated(child) || GI.white_playing(child) == wp_chance
+                        v = resolve_known_outcome_value!(benv, sim, child, k)
+                        if v !== nothing
+                            o = cinfo.outcomes[k]
+                            cinfo.outcomes[k] = MCTS.ChanceOutcomeStats(o.prob, o.W + v, o.N + 1)
+                        end
+                    end
+                    sim.kind = :chance_expand
+                    sim.chance_state = cstate
+                    sim.leaf_state = cstate
+                    sim.leaf_actions = EMPTY_INT_VEC
+                    sim.is_new_node = false
+                    sim.terminal_value = 0.0
+                    return sim
+                else
+                    # LATER VISIT: select an outcome by visit deficit, apply virtual
+                    # loss to that outcome edge, record the chance edge, descend.
+                    Ntot = 0.0
+                    @inbounds for o in cinfo.outcomes; Ntot += o.N; end
+                    best = 1; best_score = -Inf
+                    @inbounds for k in eachindex(cinfo.outcomes)
+                        o = cinfo.outcomes[k]
+                        score = o.prob - o.N / max(Ntot, 1.0)
+                        if score > best_score
+                            best_score = score; best = k
+                        end
+                    end
+                    o = cinfo.outcomes[best]
+                    cinfo.outcomes[best] = MCTS.ChanceOutcomeStats(o.prob, o.W - VIRTUAL_LOSS, o.N + 1)
+                    push!(sim.path, (cstate, best))
+                    push!(sim.rewards, 0.0)          # no reward at the chance hop
+                    push!(sim.player_switches, false)  # dice do not switch player-to-move
+                    push!(sim.is_chance, true)
+                    outcomes = GI.chance_outcomes(game)
+                    GI.apply_chance!(game, outcomes[best][1])
+                    depth += 1
+                    env.total_nodes_traversed += 1
+                    continue
                 end
             end
 
@@ -263,6 +451,7 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
 
         wp = GI.white_playing(game)
         push!(sim.path, (state, action_id))
+        push!(sim.is_chance, false)  # decision edge
 
         GI.play!(game, action)
         # Normalize by reward scale so terminal rewards (±1/±2/±3 in backgammon)
@@ -312,23 +501,48 @@ function batch_evaluate(benv::BatchedEnv, states::Vector, actions_by_state=nothi
     end
 end
 
-"""Evaluate pending simulations using a batched oracle call."""
+"""Evaluate pending simulations using a batched oracle call.
+
+Most sims contribute a single leaf state (`kind == :normal`, `is_new_node`). Under
+the EVAL-ONLY `:exact_expectation` mode two extra routes exist:
+  - `:chance_first`  contributes the pre-dice chance state (its V becomes Vest);
+  - `:chance_expand` contributes 0..N outcome-child states (each fills one outcome).
+The `_eval_route_*` buffers stay empty for the passthrough/training path, so its
+behaviour is unchanged.
+"""
 function batch_evaluate_pending!(benv::BatchedEnv{S}) where S
     env = benv.env
 
     # Reuse pre-allocated vectors (avoid per-call allocation)
     states_to_eval = benv._eval_states
     actions_to_eval = benv._eval_actions
-    eval_indices = benv._eval_indices
+    route_sim = benv._eval_route_sim
+    route_out = benv._eval_route_out
     empty!(states_to_eval)
     empty!(actions_to_eval)
-    empty!(eval_indices)
+    empty!(route_sim)
+    empty!(route_out)
 
     @inbounds for (i, sim) in enumerate(benv.pending)
-        if sim.is_new_node
-            push!(states_to_eval, sim.leaf_state)
-            push!(actions_to_eval, sim.leaf_actions)
-            push!(eval_indices, i)
+        if sim.kind === :normal
+            if sim.is_new_node
+                push!(states_to_eval, sim.leaf_state)
+                push!(actions_to_eval, sim.leaf_actions)
+                push!(route_sim, i)
+                push!(route_out, 0)          # normal decision leaf
+            end
+        elseif sim.kind === :chance_first
+            push!(states_to_eval, sim.chance_state)
+            push!(actions_to_eval, EMPTY_INT_VEC)  # zero action-mask for chance states
+            push!(route_sim, i)
+            push!(route_out, -1)             # chance_first: result V -> Vest
+        elseif sim.kind === :chance_expand
+            for j in eachindex(sim.expand_states)
+                push!(states_to_eval, sim.expand_states[j])
+                push!(actions_to_eval, sim.expand_actions[j])
+                push!(route_sim, i)
+                push!(route_out, sim.expand_out_idx[j])  # >0: fill this outcome
+            end
         end
     end
 
@@ -341,17 +555,39 @@ function batch_evaluate_pending!(benv::BatchedEnv{S}) where S
     length(results) == length(states_to_eval) ||
         error("Batched oracle result count mismatch: got $(length(results)) results for $(length(states_to_eval)) states")
 
-    # Initialize tree nodes with results
-    @inbounds for (i, result_idx) in enumerate(eval_indices)
-        sim = benv.pending[result_idx]
-        P, V = results[i]
-        if length(P) != length(sim.leaf_actions)
-            recomputed_actions = GI.available_actions(env.gspec, sim.leaf_state)
-            error("Oracle policy/action mismatch: length(P)=$(length(P)) length(actions)=$(length(sim.leaf_actions)) length(recomputed)=$(length(recomputed_actions)) same_actions=$(sim.leaf_actions == recomputed_actions) state=$(sim.leaf_state)")
+    # Route results back to the owning sim / tree / chance-tree entry.
+    @inbounds for k in eachindex(results)
+        P, V = results[k]
+        i = route_sim[k]
+        out = route_out[k]
+        sim = benv.pending[i]
+        if out == 0
+            # Normal decision leaf: create the tree node, store Vest for backprop.
+            if length(P) != length(sim.leaf_actions)
+                recomputed_actions = GI.available_actions(env.gspec, sim.leaf_state)
+                error("Oracle policy/action mismatch: length(P)=$(length(P)) length(actions)=$(length(sim.leaf_actions)) length(recomputed)=$(length(recomputed_actions)) same_actions=$(sim.leaf_actions == recomputed_actions) state=$(sim.leaf_state)")
+            end
+            info = MCTS.init_state_info(P, V, env.prior_temperature, sim.leaf_actions)
+            env.tree[sim.leaf_state] = info
+            sim.terminal_value = V  # Store for backpropagation
+        elseif out == -1
+            # chance_first: V is the pre-dice NN value estimate for the chance node.
+            cinfo = env.chance_tree[sim.chance_state]
+            cinfo.Vest = Float32(V)
+            sim.terminal_value = Float64(V)  # leaf value propagated up the path
+        else
+            # chance_expand outcome child: create its decision-node entry (so later
+            # followers can descend), and fill the outcome edge additively (W += V,
+            # N += 1) — mirrors the recursive expand_chance_node! per-outcome visit.
+            cstate = states_to_eval[k]
+            cactions = actions_to_eval[k]
+            length(P) == length(cactions) ||
+                error("Oracle policy/action mismatch at chance-expand child: length(P)=$(length(P)) length(actions)=$(length(cactions)) state=$(cstate)")
+            env.tree[cstate] = MCTS.init_state_info(P, V, env.prior_temperature, cactions)
+            cinfo = env.chance_tree[sim.chance_state]
+            o = cinfo.outcomes[out]
+            cinfo.outcomes[out] = MCTS.ChanceOutcomeStats(o.prob, o.W + Float64(V), o.N + 1)
         end
-        info = MCTS.init_state_info(P, V, env.prior_temperature, sim.leaf_actions)
-        env.tree[sim.leaf_state] = info
-        sim.terminal_value = V  # Store for backpropagation
     end
 end
 
@@ -364,7 +600,9 @@ Backpropagate value through the path, removing virtual losses.
 Combined remove_virtual_loss + update_state_info into single Dict lookup per node
 (was: 3 lookups per node = haskey + index for remove_VL + index for update).
 
-Chance nodes use passthrough (no tree entries, not in backprop path).
+Chance nodes: passthrough mode keeps no tree entries and adds nothing to the path.
+Under :exact_expectation, chance OUTCOME edges appear in the path (`is_chance[i]`)
+and back up the probability-weighted expectation with no reward/gamma/sign flip.
 
 Value/sign convention:
 - `sim.terminal_value` is player-relative at the leaf
@@ -380,7 +618,16 @@ function backpropagate!(benv::BatchedEnv, sim::PendingSimulation)
     env = benv.env
 
     # Get leaf value (single lookup via get instead of haskey + index)
-    if sim.is_new_node
+    if sim.kind === :chance_expand
+        # Leaf IS the chance node: its value is the probability-weighted expectation
+        # over the (now-filled) outcome children. Passes to the parent decision node
+        # exactly like a passthrough sample did.
+        cinfo = env.chance_tree[sim.chance_state]
+        q = chance_expectation(cinfo)
+    elseif sim.kind === :chance_first
+        # First visit: pre-dice NN value (stored in terminal_value from the batch).
+        q = sim.terminal_value
+    elseif sim.is_new_node
         leaf_info = get(env.tree, sim.leaf_state, nothing)
         q = leaf_info !== nothing ? Float64(leaf_info.Vest) : sim.terminal_value
     else
@@ -390,19 +637,34 @@ function backpropagate!(benv::BatchedEnv, sim::PendingSimulation)
     # Backpropagate through path in reverse
     @inbounds for i in length(sim.path):-1:1
         state, action_id = sim.path[i]
-        reward = sim.rewards[i]
-        pswitch = sim.player_switches[i]
 
-        # Compute Q-value for this step
-        q = pswitch ? -q : q
-        q = reward + env.gamma * q
+        if sim.is_chance[i]
+            # Chance OUTCOME edge: NO reward, NO gamma, NO sign flip (dice do not
+            # switch the player-to-move — the switch was captured at the preceding
+            # decision edge's pswitch). Remove virtual loss and add q additively
+            # (W += VL + q, N unchanged; net over descend+backup is W += q, N += 1),
+            # then propagate the chance node's expectation to the parent.
+            cinfo = get(env.chance_tree, state, nothing)
+            if cinfo !== nothing
+                o = cinfo.outcomes[action_id]
+                cinfo.outcomes[action_id] = MCTS.ChanceOutcomeStats(o.prob, o.W + VIRTUAL_LOSS + q, o.N)
+                q = chance_expectation(cinfo)
+            end
+        else
+            reward = sim.rewards[i]
+            pswitch = sim.player_switches[i]
 
-        # Decision node: remove virtual loss + update (1 lookup instead of 3)
-        # VL removal: W += VL, N -= 1; Update: W += q, N += 1; Net: W += (VL + q), N unchanged
-        info = get(env.tree, state, nothing)
-        if info !== nothing
-            astats = info.stats[action_id]
-            info.stats[action_id] = MCTS.ActionStats(astats.P, astats.W + VIRTUAL_LOSS + q, astats.N)
+            # Compute Q-value for this step
+            q = pswitch ? -q : q
+            q = reward + env.gamma * q
+
+            # Decision node: remove virtual loss + update (1 lookup instead of 3)
+            # VL removal: W += VL, N -= 1; Update: W += q, N += 1; Net: W += (VL + q), N unchanged
+            info = get(env.tree, state, nothing)
+            if info !== nothing
+                astats = info.stats[action_id]
+                info.stats[action_id] = MCTS.ActionStats(astats.P, astats.W + VIRTUAL_LOSS + q, astats.N)
+            end
         end
     end
 end

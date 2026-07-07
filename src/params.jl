@@ -55,9 +55,13 @@ In the original AlphaGo Zero paper:
   dirichlet_noise_α :: Float64
   prior_temperature :: Float64 = 1.
   # Chance node handling mode for stochastic games:
-  #   :full - expand all outcomes (full expectimax, expensive)
+  #   :full - expand all outcomes (full expectimax, expensive; classic recursive engine)
   #   :sampling - sample one outcome per visit (Monte Carlo, fast)
   #   :progressive - progressive widening with prior integration
+  #   :passthrough - sample one dice outcome, continue (batched player; training default path)
+  #   :exact_expectation - EVAL-ONLY batched expectimax over dice outcomes (first-class
+  #                        chance_tree entries). Must be requested explicitly; :full defaults
+  #                        everywhere, so honoring it in the batched player would flip training.
   chance_mode :: Symbol = :full
   # Progressive widening parameters (for :progressive mode)
   # Expand new outcome when N^α > num_expanded (α=0.5 expands at 1,4,9,16,25,36...)

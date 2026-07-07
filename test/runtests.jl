@@ -41,6 +41,10 @@ end
   include("test_mcts_identity_staircase.jl")
 end
 
+@testset "Batched Chance Exact Expectation" begin
+  include("test_batched_chance_exact_expectation.jl")
+end
+
 @testset "Promotion Gate" begin
   include("test_promotion_gate.jl")
 end
