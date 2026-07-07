@@ -133,3 +133,27 @@ Leading suspects to investigate next (one at a time):
 
 Diagnostic advantage: we now have a TRUSTED supervised reference + exact metric, so each fix can be
 A/B'd cleanly (does self-play corr move toward 0.99?).
+
+## Milestone 3 diagnosis (2026-07-06) — two findings
+
+**Ruled out distribution confound:** re-ran pure self-play seeded from the COVERED band itself
+(`covered_band_starts_8000.jls`, train == test distribution). Still corr flat ~0.74 (iters 10/30/60),
+while race_loss dropped to ~1.07 (lower than far-race). So the net FITS its targets (loss ↓) but the
+targets only ~0.74-correlate with exact equity → **the self-play TARGETS are the cap**, not net/obs/dist.
+
+**Finding A — self-play is at the MC-outcome ceiling.** `BackgammonNet/scripts/diagnose_mc_target_variance.jl`
+rolls out optimal (table-greedy) games from covered-band positions and correlates outcomes with the
+table equity: **corr(single-game outcome, exact) = 0.73–0.77 ≈ the self-play net's 0.74.** The net is
+saturated at the single-MC-outcome information limit. Supervised (exact expectation targets) → 0.99.
+Lever = value-TARGET quality (lower variance): MCTS root value, reanalyze, exact-frontier truncation.
+
+**Finding B (open, foundational) — optimal-rollout mean ≠ one-sided-table equity by ~0.29 MAE.**
+Averaging rollouts barely helps: mean-of-25 corr 0.75, mean-of-200 corr 0.80, **MAE stuck ~0.29**
+(variance-only would give MAE ≤ ~0.11 at K=200). So there is a SYSTEMATIC gap between actual
+optimal-play outcomes and the n18 one-sided-table equity. Either (a) the diagnostic's greedy rollout
+policy is suboptimal / has a bug, or (b) the n18 one-sided table is NOT exact on the full race band
+(it was only validated MAE 0.0007 vs k7 on the DEEP-bearoff OVERLAP; the broader ≤18-frame band is
+untested against true 2-sided outcomes). This matters: the table is the ground-truth reference behind
+the supervised targets, truncation, and the corr metric itself. MUST resolve before trusting the 0.74
+gap magnitude — validate the rollout on k7-exact deep bearoff (does rollout-mean → k7 equity?), and
+validate n18 vs k7 across the overlap + n18 vs rollouts.
