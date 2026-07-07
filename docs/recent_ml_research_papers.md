@@ -1297,6 +1297,62 @@ Use:
 - human expert-position test suites, if available
 ```
 
+## 13.5 Luck-adjusted evaluation and error-rate metrics (PRIMARY progress metric)
+
+Paired dice (§13.1) is correct but incomplete. Win rate over N games is a HIGH-VARIANCE, low-
+information estimator of strength. The backgammon community measures strength differently, and this
+project should too.
+
+### 13.5.1 Error rate / PR as the primary metric — not win rate
+
+Analyze the agent's own games with a reference analyzer (GNUbg via its scriptable Python interface,
+or XG) and track **average equity loss per unforced decision** — the "error rate", and its
+normalized cousin **PR (Performance Rating)**.
+
+```text
+error_rate = (1000 / N_unforced) * sum over unforced decisions of
+             ( equity(best move) - equity(move actually played) )     # milli-equity per decision
+PR         = error rate scaled to the community's normalized-luck convention (lower = stronger)
+```
+
+Reference points: wildbg reports error rate ~5.9 vs GNUbg 2-ply; Strehl (a top neural bot) reports
+PR ~1.06. This metric:
+
+```text
+- has FAR lower variance than win rate (every decision is a datum, not every game)
+- is the community's lingua franca for strength (directly comparable to gnubg/XG/wildbg/Strehl)
+- gives FREE phase + category breakdowns (checker-play error vs cube error; §13.3) at no extra cost
+- needs no opponent to "beat" — it measures distance to optimal play directly
+```
+
+Adopt error rate / PR as the PRIMARY progress metric. Keep win% only as a secondary, human-legible
+sanity check. Note: this is exactly the "move-regret" quantity — equity lost vs the best move —
+already computed against the EXACT bearoff table for the race band; extend the same idea to contact
+using a reference engine (wildbg/GNUbg per-move equities) as the "best move" oracle.
+
+### 13.5.2 Luck adjustment / variance reduction on evaluation matches
+
+GNUbg's rollout variance reduction uses the **ply-to-ply equity difference of each dice roll as a
+control variate** ("luck"): a roll that swings equity by +Δ was lucky by +Δ, independent of skill.
+
+```text
+luck(roll)          = V(position after roll, best play) - V(position before roll, on-roll)   # a control variate
+adjusted_score      = raw_score - sum(luck over the game)      # subtract the dice luck each side got
+```
+
+Apply the SAME luck-adjusted scoring to head-to-head evaluation matches ON TOP OF paired dice — it
+further shrinks the confidence interval on the equity/points estimate for the same number of games.
+(Paired dice removes symmetric luck; the control variate removes residual per-roll luck.)
+
+### 13.5.3 Relative vs absolute equity — justifies truncated-rollout reanalyse targets
+
+GNUbg's practical observation: **truncated rollouts estimate RELATIVE equities (move A vs move B)
+better than ABSOLUTE equities** — the correlated evaluation errors at the truncation horizon cancel
+in the difference. This is the same phenomenon as §8.6 (ranking candidates matters more than absolute
+value) and directly justifies using **truncated-rollout targets for reanalyse**: even a biased
+truncation evaluator yields good MOVE-SELECTION targets because the bias is common-mode across the
+candidate set.
+
 ---
 
 # 14. Implementation blueprint

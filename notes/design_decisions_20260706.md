@@ -229,6 +229,29 @@ before, recurse only for mid-turn (doubles). This makes the policy ranking match
 dice types (V2). Smoke-tested end-to-end. Also confirms `_turn_aware_value`/`tav` is correct (100% vs
 wildbg). Marked the superseded `diagnose_mc_target_variance.jl` (naive move_eq, invalid for doubles).
 
+### Eval metric upgrade — adopt ERROR RATE / PR as primary (2026-07-06)
+
+Per industry-standard feedback (documented in `docs/recent_ml_research_papers.md` §13.5): win% is
+high-variance and low-information. Adopt **error rate = mean equity loss per unforced decision**
+(and normalized **PR**) as the PRIMARY progress metric; keep win% as a secondary sanity check.
+References: wildbg error rate ~5.9 vs gnubg-2ply; Strehl PR ~1.06.
+
+This is exactly the **move-regret** we already compute:
+- RACE band: `verify_race_supervised.jl` / `verify_race_mcts.jl` already report mean move-regret
+  (equity lost vs the EXACT table best move) — that IS the exact error rate for races. ✅
+- CONTACT band (no exact table): measure error rate vs a reference engine's per-move equities
+  (wildbg/GNUbg) — same machinery as `validate_contact_doubles_policy.jl` (which already computes,
+  per decision, the net/agent move vs wildbg's turn-aware best). TODO: a `contact error-rate vs
+  wildbg` eval = mean( wildbg_eq(best) − wildbg_eq(agent_move) ) over unforced contact decisions.
+- Two variance reducers to add to head-to-head wildbg matches (on top of paired dice): **luck
+  adjustment** (subtract each roll's ply-to-ply equity swing as a control variate) — shrinks the CI
+  for the same game count. Also: truncated-rollout targets are good for MOVE SELECTION even when
+  absolute-equity-biased (relative errors cancel; §8.6 / §13.5.3) — justifies truncated reanalyse.
+
+Actionable for the self-play curriculum: the current eval reports win%/equity vs wildbg. Upgrade to
+report **contact error-rate vs wildbg** as the headline "are we beating wildbg" number (error rate
+< wildbg's own ~5.9 vs gnubg would be the real signal), phase-broken (checker vs cube).
+
 **Net takeaways:**
 - Exact bearoff tables (k7, n18) are TRUSTWORTHY.
 - The self-play RL loop WORKS end-to-end on races (corr 0.99). The whole multi-session "self-play
