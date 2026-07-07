@@ -84,4 +84,22 @@ the n18 table and scores whatever move the net picks. iter-40 race net on held-o
 - Raw-net policy is near-optimal on races; the ~6% tail (regret up to 1 pt) is where MCTS should help.
 - Confirms the earlier intuition (low agreement, ~0 regret). Policy head VERIFIED good.
 
-Next rung (2b): does Gumbel MCTS on top of the net LOWER move-regret vs the raw policy on races?
+## Milestone 2b — VERIFIED: MCTS improves race move quality (2026-07-06)
+
+`verify_race_mcts.jl` compares raw-net argmax vs the production MCTS move, both scored against
+the exact n18 table (MCTS uses the NN evaluator ONLY — no exact-table leaf — to isolate search).
+3000 held-out positions, 100 iters:
+- full set: raw mean regret 0.00255 → MCTS 0.00248 (2.5% lower, optimal% 93.9 both).
+- **hard subset** (6.1% where raw net is suboptimal, regret ≥0.01): raw 0.0365 → **MCTS 0.0332
+  (9.0% lower)**. Search helps where it matters, never hurts.
+- Modest overall because the raw net is already near-optimal on races AND its value head is
+  near-exact (so NN-leaf lookahead adds little). Search verified working.
+
+**FINDING (actionable):** the production MCTS (`BatchedMctsPlayer`/`batched_mcts.jl`) is **pUCT**,
+NOT Gumbel. `src/gumbel_mcts.jl` (sequential-halving Gumbel-root, the doc's #1 recommendation)
+EXISTS but is **not wired into the batched player** used by self-play/eval. So "add Gumbel root
+search" is a real, distinct future rung: wire gumbel into BatchedMCTS (or route the player to the
+gumbel Env), then re-run this exact regret comparison (pUCT vs Gumbel vs raw) to measure its value.
+
+Next rung: self-play on the solved race sub-domain (does the full RL loop converge to table play?)
+OR wire+verify Gumbel root search.
