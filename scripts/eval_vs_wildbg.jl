@@ -110,9 +110,12 @@ function parse_eval_args()
             arg_type = String
             default = "auto"
         "--chance-mode"
-            help = "Chance-node handling: exact_expectation (default, eval) or passthrough"
+            help = "Chance-node handling: passthrough (default) or exact_expectation. NOTE:
+                    exact_expectation measured WORSE at deep search (46% vs 54% @800) — its
+                    21-child expansions consume the iter budget, starving decision-tree depth
+                    (the dominant strength lever). Kept for the record; passthrough is better."
             arg_type = String
-            default = "exact_expectation"
+            default = "passthrough"
     end
 
     return ArgParse.parse_args(s)
@@ -273,7 +276,7 @@ function evaluate_checkpoint(checkpoint_path::String, wildbg_lib::String;
                              gpu_workers::Int=0,
                              race_checkpoint_path::Union{String,Nothing}=nothing,
                              race_width::Int=128, race_blocks::Int=3,
-                             chance_mode::Symbol=:exact_expectation)
+                             chance_mode::Symbol=:passthrough)
     # Load contact/main network (CPU)
     contact_network = FluxLib.FCResNetMultiHead(
         gspec, FluxLib.FCResNetMultiHeadHP(width=width, num_blocks=blocks))
