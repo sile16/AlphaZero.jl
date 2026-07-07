@@ -9,7 +9,10 @@
 # Configuration:
 # - short_game=true: Faster games with pieces closer to bearing off
 # - doubles_only=true: Only doubles dice rolls (simpler game)
-# - OBSERVATION_TYPE: :minimal_flat (344), :full_flat, :minimal (44×1×26), :full (62×1×26)
+# - OBSERVATION_TYPE: baseline :min_plus_flat (350). Also :minimal_flat (344), :full_flat (376),
+#   :biased_flat (436), :minimal (44×1×26), :full (76×1×26)
+# NOTE: OBS_TYPE_STR is a const read from ENV at PRECOMPILE time (baked). Changing
+#   BACKGAMMON_OBS_TYPE at runtime has no effect without a recompile — change the default below.
 #
 # BackgammonNet v0.6.4+ required
 
@@ -61,7 +64,7 @@ const OBS_TYPE_MAP = Dict(
     "full_hybrid" => :full_hybrid,
     "biased_hybrid" => :biased_hybrid,
 )
-const OBS_TYPE_STR = get(ENV, "BACKGAMMON_OBS_TYPE", "minimal_flat")
+const OBS_TYPE_STR = get(ENV, "BACKGAMMON_OBS_TYPE", "min_plus_flat")
 const OBSERVATION_TYPE = get(OBS_TYPE_MAP, OBS_TYPE_STR, :minimal_flat)
 
 # Unified action space: 1:676 checker actions, 677:680 cube actions.

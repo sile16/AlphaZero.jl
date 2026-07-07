@@ -375,7 +375,7 @@ include(joinpath(@__DIR__, "..", "src", "distributed", "promotion_gate.jl"))
 # Game setup
 const GAME_NAME = "backgammon-deterministic"
 if GAME_NAME == "backgammon-deterministic"
-    ENV["BACKGAMMON_OBS_TYPE"] = "minimal_flat"
+    ENV["BACKGAMMON_OBS_TYPE"] = get(ENV, "BACKGAMMON_OBS_TYPE", "min_plus_flat")
     include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
 else
     error("Unknown game: $GAME_NAME")

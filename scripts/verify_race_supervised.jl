@@ -1,0 +1,99 @@
+#!/usr/bin/env julia
+"""
+verify_race_supervised.jl — verify a supervised race net against EXACT-table targets.
+
+Loads a trained race checkpoint and a held-out exact-table-labeled test set
+(from generate_race_table_supervised.jl), forwards every position through the net,
+and reports value accuracy (correlation / MSE / MAE, raw points) and policy top-1
+agreement vs the exact best move. This is the trust check for the whole pipeline.
+
+Usage:
+  julia --project scripts/verify_race_supervised.jl <checkpoint> <test.jls> \
+        [--width=128] [--blocks=3] [--obs-type=min_plus_flat] [--batch=4096]
+"""
+
+using AlphaZero
+using AlphaZero: GI, Network, FluxLib
+import BackgammonNet
+using Serialization, Statistics, Printf
+import Flux
+
+parse_arg(args, key; default=nothing) = begin
+    for a in args
+        startswith(a, "--$key=") && return split(a, "=", limit=2)[2]
+    end
+    default
+end
+
+const CKPT = ARGS[1]
+const TEST = ARGS[2]
+const WIDTH = parse(Int, something(parse_arg(ARGS, "width"), "128"))
+const BLOCKS = parse(Int, something(parse_arg(ARGS, "blocks"), "3"))
+const BATCH = parse(Int, something(parse_arg(ARGS, "batch"), "4096"))
+
+ENV["BACKGAMMON_OBS_TYPE"] = something(parse_arg(ARGS, "obs-type"), "min_plus_flat")
+include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
+const gspec = GameSpec()
+const NUM_ACTIONS = GI.num_actions(gspec)
+const _state_dim = GI.state_dim(gspec)[1]
+const ORACLE_CFG = AlphaZero.BackgammonInference.OracleConfig(
+    _state_dim, NUM_ACTIONS, gspec; vectorize_state! = vectorize_state_into!)
+
+function main()
+    println("Loading test set: $TEST")
+    d = deserialize(TEST)
+    n = length(d.states)
+    println("  $n positions, obs=$(d.states[1].obs_type), state_dim=$_state_dim")
+
+    println("Loading net: $CKPT  ($(WIDTH)w×$(BLOCKS)b)")
+    net = FluxLib.FCResNetMultiHead(gspec, FluxLib.FCResNetMultiHeadHP(width=WIDTH, num_blocks=BLOCKS))
+    FluxLib.load_weights(CKPT, net)
+    net = Flux.cpu(net)
+    _, value_batch_oracle = AlphaZero.BackgammonInference.make_cpu_oracles(
+        :flux, net, ORACLE_CFG; batch_size=BATCH)
+
+    rs = Float64(GI.reward_scale(gspec))   # raw points ↔ NN scale
+    pred = Vector{Float64}(undef, n)
+    pol_top1 = 0
+    pol_total = 0
+
+    t0 = time()
+    for lo in 1:BATCH:n
+        hi = min(lo + BATCH - 1, n)
+        games = d.states[lo:hi]
+        out = value_batch_oracle(games)
+        for (k, i) in enumerate(lo:hi)
+            pol_i, val_i = out[k][1], out[k][2]
+            pred[i] = Float64(val_i) * rs            # NN scale → raw points
+            # policy top-1 vs exact best move. Oracle returns policy over LEGAL
+            # actions (ascending id order); align to sorted legal list.
+            exact_best = argmax(d.policies[i])
+            legal = sort(collect(BackgammonNet.legal_actions(games[k])))
+            if !isempty(legal) && length(pol_i) == length(legal)
+                nn_best = legal[argmax(pol_i)]
+                pol_top1 += (nn_best == exact_best)
+                pol_total += 1
+            end
+        end
+    end
+    dt = time() - t0
+
+    exact = Float64.(d.values)
+    err = pred .- exact
+    mse = mean(err .^ 2)
+    mae = mean(abs.(err))
+    corr = cor(pred, exact)
+    bias = mean(err)
+
+    println("\n=== VALUE (raw points, exact ∈ [$(round(minimum(exact),digits=2)),$(round(maximum(exact),digits=2))]) ===")
+    @printf("  correlation : %.5f\n", corr)
+    @printf("  MSE         : %.5f\n", mse)
+    @printf("  MAE         : %.5f\n", mae)
+    @printf("  bias (mean) : %+.5f\n", bias)
+    println("\n=== POLICY ===")
+    @printf("  top-1 agreement vs exact best move : %.2f%% (%d/%d)\n",
+            100 * pol_top1 / pol_total, pol_top1, pol_total)
+    @printf("\nForwarded %d positions in %.1fs (%.0f/s)\n", n, dt, n / dt)
+end
+
+main()
