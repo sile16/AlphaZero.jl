@@ -75,5 +75,13 @@ First trustworthy result of the reset. Pipeline: obs(min_plus_flat 350) → 128�
 - **Conclusion:** obs encoding + net + value head + loss + trainer are TRUSTWORTHY. The near-exact
   value net doubles as a reusable frozen RACE evaluator for later contact self-play.
 
-Follow-ups: policy top-1 undercounts (race near-ties) — add a move-regret metric later. Then next
-rung: verify the policy head + MCTS improvement, then self-play on the solved race sub-domain.
+## Milestone 2a — VERIFIED: race POLICY head via move-regret (2026-07-06)
+
+Top-1 agreement (65.6%) is misleading for races (many near-tied best moves). The proper metric
+is exact move-regret = equity lost vs the table's best move. `verify_race_supervised.jl` now loads
+the n18 table and scores whatever move the net picks. iter-40 race net on held-out 20k:
+- **mean regret 0.0022 pts, median 0.000, p95 0.012, optimal-move rate (regret<0.01) 94.2%**, max 1.0.
+- Raw-net policy is near-optimal on races; the ~6% tail (regret up to 1 pt) is where MCTS should help.
+- Confirms the earlier intuition (low agreement, ~0 regret). Policy head VERIFIED good.
+
+Next rung (2b): does Gumbel MCTS on top of the net LOWER move-regret vs the raw policy on races?

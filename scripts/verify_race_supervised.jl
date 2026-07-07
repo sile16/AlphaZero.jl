@@ -15,6 +15,7 @@ Usage:
 using AlphaZero
 using AlphaZero: GI, Network, FluxLib
 import BackgammonNet
+using BackgammonNet.BearoffOneSided: OneSidedTable, compute_equity, lookup
 using Serialization, Statistics, Printf
 import Flux
 
@@ -31,6 +32,9 @@ const WIDTH = parse(Int, something(parse_arg(ARGS, "width"), "128"))
 const BLOCKS = parse(Int, something(parse_arg(ARGS, "blocks"), "3"))
 const BATCH = parse(Int, something(parse_arg(ARGS, "batch"), "4096"))
 
+const TABLE_DIR = something(parse_arg(ARGS, "table-dir"),
+    joinpath(homedir(), "github", "BackgammonNet.jl", "data", "bearoff", "bearoff_n18"))
+
 ENV["BACKGAMMON_OBS_TYPE"] = something(parse_arg(ARGS, "obs-type"), "min_plus_flat")
 include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
 const gspec = GameSpec()
@@ -39,11 +43,28 @@ const _state_dim = GI.state_dim(gspec)[1]
 const ORACLE_CFG = AlphaZero.BackgammonInference.OracleConfig(
     _state_dim, NUM_ACTIONS, gspec; vectorize_state! = vectorize_state_into!)
 
+# Exact mover-relative equity of playing action `a` from decision node `g`.
+function move_equity(t::OneSidedTable, g, a, scratch)
+    BackgammonNet.copy_state!(scratch, g)
+    BackgammonNet.apply_action!(scratch, a)
+    if BackgammonNet.game_terminated(scratch)
+        return g.current_player == 0 ? Float64(scratch.reward) : -Float64(scratch.reward)
+    else
+        return -Float64(compute_equity(lookup(t, scratch)))
+    end
+end
+
 function main()
     println("Loading test set: $TEST")
     d = deserialize(TEST)
     n = length(d.states)
     println("  $n positions, obs=$(d.states[1].obs_type), state_dim=$_state_dim")
+
+    table = isdir(TABLE_DIR) ? (print("Loading table for move-regret... ");
+        t = OneSidedTable(TABLE_DIR); println("done."); t) : nothing
+    table === nothing && println("  (no table at $TABLE_DIR — skipping move-regret)")
+    scratch = BackgammonNet.clone(d.states[1])
+    regret = Float64[]
 
     println("Loading net: $CKPT  ($(WIDTH)w×$(BLOCKS)b)")
     net = FluxLib.FCResNetMultiHead(gspec, FluxLib.FCResNetMultiHeadHP(width=WIDTH, num_blocks=BLOCKS))
@@ -69,10 +90,19 @@ function main()
             # actions (ascending id order); align to sorted legal list.
             exact_best = argmax(d.policies[i])
             legal = sort(collect(BackgammonNet.legal_actions(games[k])))
-            if !isempty(legal) && length(pol_i) == length(legal)
+            nn_best = nothing
+            if length(legal) == 1
+                nn_best = legal[1]
+            elseif length(pol_i) == length(legal)
                 nn_best = legal[argmax(pol_i)]
+            end
+            if nn_best !== nothing
                 pol_top1 += (nn_best == exact_best)
                 pol_total += 1
+                if table !== nothing
+                    # regret = exact best value − exact value of the move the net picked (≥0)
+                    push!(regret, d.values[i] - move_equity(table, games[k], nn_best, scratch))
+                end
             end
         end
     end
@@ -90,9 +120,16 @@ function main()
     @printf("  MSE         : %.5f\n", mse)
     @printf("  MAE         : %.5f\n", mae)
     @printf("  bias (mean) : %+.5f\n", bias)
-    println("\n=== POLICY ===")
+    println("\n=== POLICY (raw net argmax) ===")
     @printf("  top-1 agreement vs exact best move : %.2f%% (%d/%d)\n",
             100 * pol_top1 / pol_total, pol_top1, pol_total)
+    if !isempty(regret)
+        clamp0 = max.(regret, 0.0)   # numerical: regret is ≥0 by construction
+        @printf("  move-regret (exact pts lost): mean=%.5f  median=%.5f  p95=%.4f  max=%.3f\n",
+                mean(clamp0), median(clamp0), quantile(clamp0, 0.95), maximum(clamp0))
+        @printf("  optimal-move rate (regret<0.01 pts): %.2f%%\n",
+                100 * count(<(0.01), clamp0) / length(clamp0))
+    end
     @printf("\nForwarded %d positions in %.1fs (%.0f/s)\n", n, dt, n / dt)
 end
 
