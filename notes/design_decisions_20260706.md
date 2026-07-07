@@ -101,5 +101,35 @@ EXISTS but is **not wired into the batched player** used by self-play/eval. So "
 search" is a real, distinct future rung: wire gumbel into BatchedMCTS (or route the player to the
 gumbel Env), then re-run this exact regret comparison (pUCT vs Gumbel vs raw) to measure its value.
 
-Next rung: self-play on the solved race sub-domain (does the full RL loop converge to table play?)
-OR wire+verify Gumbel root search.
+## Milestone 3 — KEY FINDING: self-play PLATEAUS far below supervised on races (2026-07-06)
+
+Ran self-play on the race sub-domain (seed from 5000 disengaged race starts, race training-mode,
+128×3 net, mcts-iters 100, ~3000 samples/iter, 100 train steps/iter). Measured value-corr +
+move-regret vs the EXACT table on the held-out 20k covered-band set each few iters.
+
+Two configs, same result:
+- **truncation ON** (exact frontier returns): corr flat ~0.72. (metric partly mismatched — truncation
+  doesn't train the covered band, so this alone is inconclusive.)
+- **pure self-play (--no-bearoff, no table crutch)**: covered band IS in-distribution (games play
+  through to terminal), so the test set is a valid yardstick. Result — **corr FLAT ~0.74 across
+  iters 5/15/30/60/100** (0.747, 0.741, 0.741, 0.747, 0.745); move-regret ~0.022; optimal% ~82.
+
+Compare **supervised on the IDENTICAL net/obs/domain/test set: corr 0.9987, regret 0.0022, 94%
+optimal.** The net is provably capable; **self-play stagnates ~0.74**. Both heads plateau together
+(policy stuck at 82% optimal → value targets stuck → policy stuck — classic self-play stagnation).
+
+**This isolates the long-standing "~0.74 plateau" against exact ground truth, with confounds ruled
+out: NOT net capacity, NOT observation, NOT target representability (supervised reaches 0.9987).
+The limiter is in the SELF-PLAY → target → training path.** corr is scale-invariant, so it is NOT a
+pure value-scale bug (that wouldn't decorrelate); it's something that DEGRADES the signal:
+search/policy improvement, policy/value target construction, or buffer/training dynamics.
+
+Leading suspects to investigate next (one at a time):
+1. MCTS not improving the policy (weak/mis-scaled search) — note [[review-findings-2026-07]] listed
+   an "MCTS value scale mismatch" High finding; re-verify it in this clean setting.
+2. Value/policy target construction from self-play traces (outcome bootstrapping, buffer [-3,3] vs
+   MCTS [-1,1] boundary, policy-from-visits degeneracy).
+3. Training dynamics (LR, steps/iter, buffer churn/overfit, PER off).
+
+Diagnostic advantage: we now have a TRUSTED supervised reference + exact metric, so each fix can be
+A/B'd cleanly (does self-play corr move toward 0.99?).
