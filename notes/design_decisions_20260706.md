@@ -210,6 +210,25 @@ supervised-v2) to confirm supervised now reaches ~0.99 on both dice types with c
     (doubles ⇒ mid-turn, current_player unchanged) and that turn-aware eval differs from the naive
     one-ply flip on mid-turn states. 256 assertions, green.
 
+### CONTACT bootstrap doubles bug FOUND + FIXED (2026-07-06) — highest-value follow-up
+
+Parity test `BackgammonNet/scripts/validate_contact_doubles_policy.jl` compared three first-action
+rankings on contact decision nodes vs wildbg's own (turn-aware) `best_move`:
+- **non-doubles: bootstrap V1 = 100%, turn-aware V2 = 100%** agreement with wildbg.
+- **doubles: bootstrap V1 = 41.8%, turn-aware V2 = 100%.** The bootstrap picked the WRONG best
+  first-action ~58% of the time on doubles.
+
+Cause: `soft_policy_and_move` scored each first-action by wildbg's eval of the SUCCESSOR board, but a
+doubles first-action leaves a MID-TURN board (remaining dice pending) that wildbg cannot value — same
+bug class as the race generator. So ~1/6 of contact POLICY targets (doubles) were mis-ranked. Strong
+candidate for the historical "contact plateau". (Value targets = game outcome were fine.)
+
+FIX (`generate_contact_bootstrap.jl`): added `_turn_aware_value` — recurse through mid-turn states,
+evaluate only at true turn boundaries; batch-eval the turn-complete (non-doubles) successors as
+before, recurse only for mid-turn (doubles). This makes the policy ranking match wildbg 100% on both
+dice types (V2). Smoke-tested end-to-end. Also confirms `_turn_aware_value`/`tav` is correct (100% vs
+wildbg). Marked the superseded `diagnose_mc_target_variance.jl` (naive move_eq, invalid for doubles).
+
 **Net takeaways:**
 - Exact bearoff tables (k7, n18) are TRUSTWORTHY.
 - The self-play RL loop WORKS end-to-end on races (corr 0.99). The whole multi-session "self-play
