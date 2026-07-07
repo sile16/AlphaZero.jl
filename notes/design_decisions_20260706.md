@@ -178,6 +178,30 @@ Re-measuring corr split by dice type (test set = my generator's values):
 Historical note: this doubles bug is a strong candidate for the ORIGINAL "~0.74 contact plateau" too
 (same move_eq pattern anywhere doubles are evaluated one-action-at-a-time).
 
+### CONFIRMED FIX (2026-07-06): doubles-correct generator → self-play scores 0.99 both
+
+Fixed `generate_race_table_supervised.jl` to use combined k7+n18 tables +
+`BackgammonNet.bearoff_turn_value_equity` (recurses through mid-turn doubles). Regenerated the 20k
+test set (v2) and re-measured the UNCHANGED nets against CORRECT targets:
+- **Self-play net (covered iter 60): non-doubles 0.992, doubles 0.991, overall 0.9917.** (was 0.745
+  vs the buggy test set). The self-play RL loop was correct all along — NO plateau, ever.
+- Old supervised net (trained ON buggy targets): non-doubles 0.999, doubles **0.122**, overall 0.75.
+  It faithfully learned the garbage doubles targets → its "0.9987 gold standard" was an illusion
+  (self-consistent with its own bad targets). The self-play net is BETTER on doubles (0.99 vs 0.12).
+
+Regenerated the 300k train set (v2, seed 42) and retraining supervised on it (sessions/race-
+supervised-v2) to confirm supervised now reaches ~0.99 on both dice types with correct targets.
+
+**Net takeaways:**
+- Exact bearoff tables (k7, n18) are TRUSTWORTHY.
+- The self-play RL loop WORKS end-to-end on races (corr 0.99). The whole multi-session "self-play
+  caps at ~0.74 / method-bound plateau" narrative was a doubles TARGET-COMPUTATION bug, not an
+  algorithmic ceiling. Re-examine the contact path for the same one-action-at-a-time doubles pattern.
+- Any script doing move-enumeration + table lookup must evaluate at TURN BOUNDARIES (recurse through
+  doubles), never one action + sign flip. `verify_race_supervised.jl`/`verify_race_mcts.jl`/
+  `diagnose_mc_target_variance.jl` still carry the naive move_eq for their move-regret metric — only
+  valid on non-doubles; fix or restrict before trusting their doubles regret numbers.
+
 ---
 _Superseded investigation note (kept for context):_
 **Finding B (open, foundational) — optimal-rollout mean ≠ one-sided-table equity by ~0.29 MAE.**
