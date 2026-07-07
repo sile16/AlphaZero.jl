@@ -192,6 +192,24 @@ test set (v2) and re-measured the UNCHANGED nets against CORRECT targets:
 Regenerated the 300k train set (v2, seed 42) and retraining supervised on it (sessions/race-
 supervised-v2) to confirm supervised now reaches ~0.99 on both dice types with correct targets.
 
+### LOOP CLOSED + report-driven hardening (2026-07-06)
+- Supervised RETRAINED on corrected 300k v2 (sessions/race-supervised-v2, iter 20): **non-doubles
+  corr 0.9986 / doubles 0.9981 / overall 0.9984** (doubles was 0.122 with buggy targets). Move-regret
+  (now doubles-correct) mean 0.0023, 94.5% optimal. Full pipeline confirmed: tables→generator→
+  supervised 0.998 both, self-play 0.99 both.
+- Engineer's report reviewed (same bug class). Fixes applied:
+  - P0 `verify_race_supervised.jl` + `verify_race_mcts.jl`: move-regret now uses
+    `bearoff_turn_value_equity` (combined table) — doubles-correct.
+  - P0 `validate_rollout_vs_k7.jl`: `move_eq` clearly marked as the INTENTIONAL naive reproducer.
+  - P1 generator doc header corrected (no longer claims the "child = opponent, flip" assumption).
+  - P1 `generate_contact_bootstrap.jl` + P2 `src/eval_backends.jl`: these use the SAFER pattern
+    (flip only when current_player actually changed) but rely on the backend valuing MID-TURN states;
+    documented the invariant + TODO parity test. (Also flags the second failure mode: forced-pass /
+    blocked opponent returning control to the mover.)
+  - Added `test/test_turn_aware_bearoff.jl` (CI-safe, mock table): guards the game-mechanics invariant
+    (doubles ⇒ mid-turn, current_player unchanged) and that turn-aware eval differs from the naive
+    one-ply flip on mid-turn states. 256 assertions, green.
+
 **Net takeaways:**
 - Exact bearoff tables (k7, n18) are TRUSTWORTHY.
 - The self-play RL loop WORKS end-to-end on races (corr 0.99). The whole multi-session "self-play

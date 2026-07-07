@@ -20,7 +20,7 @@ using AlphaZero
 using AlphaZero: GI, MCTS, Network, FluxLib, MctsParams, ConstSchedule, BatchedMCTS, GameLoop
 using AlphaZero.BackgammonInference
 import BackgammonNet
-using BackgammonNet.BearoffOneSided: OneSidedTable, compute_equity, lookup
+using BackgammonNet: CombinedBearoff, load_combined_bearoff, bearoff_turn_value_equity
 using Serialization, Statistics, Printf, Random
 import Flux
 
@@ -37,8 +37,9 @@ const WIDTH  = parse(Int, something(parse_arg(ARGS, "width"), "128"))
 const BLOCKS = parse(Int, something(parse_arg(ARGS, "blocks"), "3"))
 const NSUB   = parse(Int, something(parse_arg(ARGS, "n"), "2000"))
 const ITERS  = parse(Int, something(parse_arg(ARGS, "iters"), "100"))
-const TABLE_DIR = something(parse_arg(ARGS, "table-dir"),
+const ONESIDED_DIR = something(parse_arg(ARGS, "table-dir"),
     joinpath(homedir(), "github", "BackgammonNet.jl", "data", "bearoff", "bearoff_n18"))
+const K7_DIR = joinpath(homedir(), "github", "BackgammonNet.jl", "data", "bearoff", "bearoff_k7_twosided")
 
 ENV["BACKGAMMON_OBS_TYPE"] = something(parse_arg(ARGS, "obs-type"), "min_plus_flat")
 include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
@@ -48,22 +49,20 @@ const _state_dim = GI.state_dim(gspec)[1]
 const ORACLE_CFG = BackgammonInference.OracleConfig(
     _state_dim, NUM_ACTIONS, gspec; vectorize_state! = vectorize_state_into!)
 
-# Exact mover-relative equity of playing action `a` from decision node `g`.
-function move_equity(t::OneSidedTable, g, a, scratch)
+# Exact mover-relative value of playing first-action `a` from decision node `g`.
+# Doubles-correct: recurses through the rest of the turn via bearoff_turn_value_equity.
+function move_equity(t::CombinedBearoff, g, a, scratch)
     BackgammonNet.copy_state!(scratch, g)
     BackgammonNet.apply_action!(scratch, a)
-    if BackgammonNet.game_terminated(scratch)
-        return g.current_player == 0 ? Float64(scratch.reward) : -Float64(scratch.reward)
-    else
-        return -Float64(compute_equity(lookup(t, scratch)))
-    end
+    v, _ = bearoff_turn_value_equity(t, scratch, Int(g.current_player))
+    return v
 end
 
 function main()
     d = deserialize(TEST)
     n = min(NSUB, length(d.states))
     println("Test positions: $n (of $(length(d.states)))   MCTS iters: $ITERS")
-    table = OneSidedTable(TABLE_DIR)
+    table = load_combined_bearoff(; k7_dir=K7_DIR, onesided_dir=ONESIDED_DIR)
     scratch = BackgammonNet.clone(d.states[1])
 
     net = FluxLib.FCResNetMultiHead(gspec, FluxLib.FCResNetMultiHeadHP(width=WIDTH, num_blocks=BLOCKS))
