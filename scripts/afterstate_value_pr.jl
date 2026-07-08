@@ -71,6 +71,11 @@ function parse_args_av()
         "--two-ply";      action=:store_true
         "--two-ply-topk"; arg_type=Int; default=8
         "--two-ply-positions"; arg_type=Int; default=0   # 0 = all
+        "--three-ply";    action=:store_true
+        "--three-ply-topk-root"; arg_type=Int; default=8   # root candidates deep-scored
+        "--three-ply-topk-deep"; arg_type=Int; default=4   # opponent-reply filter (top-k by 0-ply-B)
+        "--three-ply-deepk";     arg_type=Int; default=0   # deepest my-reply filter by 0-ply-A proxy (0=all, sound)
+        "--three-ply-positions"; arg_type=Int; default=200 # subset size for 3-ply
     end
     return ArgParse.parse_args(s)
 end
@@ -471,6 +476,156 @@ function twoply_pass(positions::Vector{BenchPosition}, contact_net, race_net,
     return dT, n
 end
 
+# ── 3-ply expectimax with gnubg-style MOVE FILTERS, SOUND (roll-averaged) leaves ──
+# Perspective (SAME as 2-ply): V(state) = mover-at-state cubeless equity.
+# For a PRE-ROLL node S (mover M to move), define M's equity with depth-d lookahead:
+#   moverEq(S,d) = E_r[ max over M's replies m of value(afterstate(S+r,m), d-1) ]
+#   value(after,d) = after terminal ? +TERMINAL_WIN (M just won)
+#                                   : -moverEq(after,d)          [after: opponent to move]
+#   moverEq(S,0) = E_r[ V(S+r) ]   (0-ply-B: post-roll, IN-DISTRIBUTION → sound leaf)
+# Root Score(m) = -moverEq(A_m, D-1)   (A_m = opponent to move after my move m).
+# Filters: at intermediate reply nodes expand only the top-k replies (ranked by
+# 0-ply-B; the DEEPEST my-reply level may use a 0-ply-A proxy for speed). Leaves are
+# ALWAYS roll-averaged post-roll evals — no pre-roll node is ever used AS a leaf value.
+
+# 0-ply-B (roll-averaged mover equity) for each afterstate in `afters` (one batch).
+# Terminal entries left as NaN — callers treat terminal replies as immediate wins.
+function zpb_vec(afters::Vector{BackgammonNet.BackgammonGame}, cnet, rnet)
+    na = length(afters)
+    out = fill(NaN, na)
+    leaf = BackgammonNet.BackgammonGame[]; owner = Int[]; w = Float64[]
+    @inbounds for i in 1:na
+        afters[i].terminated && continue
+        base = afters[i]
+        for r in 1:21
+            pr = BackgammonNet.DICE_PROBS[r]; pr == 0f0 && continue
+            g = BackgammonNet.clone(base); BackgammonNet.apply_chance!(g, r)
+            push!(leaf, g); push!(owner, i); push!(w, Float64(pr))
+        end
+    end
+    if !isempty(leaf)
+        vR = fill(NaN, length(leaf))
+        value_equities!(vR, leaf, collect(1:length(leaf)), cnet, rnet)
+        acc = zeros(Float64, na)
+        @inbounds for k in 1:length(leaf); acc[owner[k]] += w[k] * vR[k]; end
+        @inbounds for i in 1:na; afters[i].terminated || (out[i] = acc[i]); end
+    end
+    return out
+end
+
+# depth-1 mover equity at PRE-ROLL S (mover M). Optional deepest filter `deepk>0`:
+# keep only top-`deepk` replies (by 0-ply-A DIRECT proxy — used ONLY for ranking, the
+# VALUE is still the roll-averaged 0-ply-B). deepk<=0 → evaluate all replies (fully sound).
+function mover_equity_1(S::BackgammonNet.BackgammonGame, cnet, rnet; deepk::Int=0)
+    reps_all = Vector{Vector{BackgammonNet.BackgammonGame}}(undef, 21)
+    termwin  = fill(false, 21)
+    @inbounds for r in 1:21
+        pr = BackgammonNet.DICE_PROBS[r]
+        if pr == 0f0; reps_all[r] = BackgammonNet.BackgammonGame[]; continue; end
+        Sp = BackgammonNet.clone(S); BackgammonNet.apply_chance!(Sp, r)
+        reps = enumerate_full_turn_afterstates(Sp)               # opponent-to-move (or terminal)
+        reps_all[r] = reps
+        for rp in reps; if rp.terminated; termwin[r] = true; break; end; end
+    end
+    keep = Vector{Vector{Int}}(undef, 21)
+    if deepk > 0
+        flatA = BackgammonNet.BackgammonGame[]; mapA = Tuple{Int,Int}[]
+        @inbounds for r in 1:21, j in 1:length(reps_all[r])
+            reps_all[r][j].terminated || (push!(flatA, reps_all[r][j]); push!(mapA, (r, j)))
+        end
+        aval = fill(NaN, length(flatA))
+        isempty(flatA) || value_equities!(aval, flatA, collect(1:length(flatA)), cnet, rnet)
+        Adict = Dict{Int,Vector{Tuple{Int,Float64}}}()
+        @inbounds for k in 1:length(flatA); (r, j) = mapA[k]; push!(get!(Adict, r, Tuple{Int,Float64}[]), (j, aval[k])); end
+        @inbounds for r in 1:21
+            if termwin[r]; keep[r] = Int[]; continue; end
+            lst = get(Adict, r, Tuple{Int,Float64}[])
+            sort!(lst; by = x -> x[2])                            # ascending opp equity = best for M
+            keep[r] = [lst[t][1] for t in 1:min(deepk, length(lst))]
+        end
+    else
+        @inbounds for r in 1:21
+            keep[r] = termwin[r] ? Int[] : collect(1:length(reps_all[r]))
+        end
+    end
+    flatB = BackgammonNet.BackgammonGame[]; mapB = Tuple{Int,Int}[]
+    @inbounds for r in 1:21, j in keep[r]; push!(flatB, reps_all[r][j]); push!(mapB, (r, j)); end
+    bval = isempty(flatB) ? Float64[] : zpb_vec(flatB, cnet, rnet)
+    Bdict = Dict{Tuple{Int,Int},Float64}()
+    @inbounds for k in 1:length(flatB); Bdict[mapB[k]] = bval[k]; end
+    total = 0.0
+    @inbounds for r in 1:21
+        pr = BackgammonNet.DICE_PROBS[r]; pr == 0f0 && continue
+        best = termwin[r] ? TERMINAL_WIN : -Inf
+        for j in keep[r]
+            v = -Bdict[(r, j)]; v > best && (best = v)            # M value = -(opp equity)
+        end
+        total += Float64(pr) * best
+    end
+    return total
+end
+
+# depth-2 mover equity at PRE-ROLL S (mover M). For each roll r, filter M's replies to
+# top-`ktop` by 0-ply-B, then recurse via mover_equity_1 (opponent's turn) with deepest
+# filter `kdeep`. Returns M's equity.
+function mover_equity_2(S::BackgammonNet.BackgammonGame, cnet, rnet; ktop::Int, kdeep::Int)
+    total = 0.0
+    @inbounds for r in 1:21
+        pr = BackgammonNet.DICE_PROBS[r]; pr == 0f0 && continue
+        Sp = BackgammonNet.clone(S); BackgammonNet.apply_chance!(Sp, r)
+        reps = enumerate_full_turn_afterstates(Sp)                # opponent-to-move (or terminal)
+        anyterm = false
+        for rp in reps; if rp.terminated; anyterm = true; break; end; end
+        if anyterm; total += Float64(pr) * TERMINAL_WIN; continue; end   # M wins this turn
+        b = zpb_vec(reps, cnet, rnet)                             # opponent's 0-ply-B equity estimate
+        ord = sortperm([isnan(b[j]) ? Inf : b[j] for j in 1:length(reps)])   # ascending = best for M
+        kept = ord[1:min(ktop, length(ord))]
+        best = -Inf
+        for j in kept
+            v = -mover_equity_1(reps[j], cnet, rnet; deepk=kdeep)  # M value = -(opp depth-1 equity)
+            v > best && (best = v)
+        end
+        total += Float64(pr) * best
+    end
+    return total
+end
+
+# 3-ply score for each afterstate: Score(m) = -moverEq(A_m, 2). Only the top-`topk_root`
+# root candidates (by 0-ply-B) are deep-scored; the rest stay -Inf (never selected).
+function score_threeply(afters::Vector{BackgammonNet.BackgammonGame}, base_scoreB::Vector{Float64},
+                        topk_root::Int, ktop::Int, kdeep::Int, cnet, rnet)
+    na = length(afters)
+    out = fill(-Inf, na)
+    order = sortperm(base_scoreB; rev=true)
+    cand = order[1:min(topk_root, na)]
+    for i in cand
+        A_m = afters[i]
+        if A_m.terminated; out[i] = TERMINAL_WIN; continue; end
+        out[i] = -mover_equity_2(A_m, cnet, rnet; ktop=ktop, kdeep=kdeep)
+    end
+    return out
+end
+
+function threeply_pass(positions::Vector{BenchPosition}, contact_net, race_net, num_workers::Int,
+                       topk_root::Int, ktop::Int, kdeep::Int, limit::Int)
+    n = limit > 0 ? min(limit, length(positions)) : length(positions)
+    d3 = Vector{MoveDecision}(undef, n)
+    idx = Threads.Atomic{Int}(0)
+    Threads.@threads for w in 1:num_workers
+        while true
+            i = Threads.atomic_add!(idx, 1) + 1
+            i > n && break
+            bp = positions[i]
+            afters = enumerate_full_turn_afterstates(bp.state)
+            _, sB = score_afterstates(afters, contact_net, race_net)
+            s3 = score_threeply(afters, sB, topk_root, ktop, kdeep, contact_net, race_net)
+            g3 = afters[argmax(s3)]
+            d3[i] = MoveDecision(bp.state, g3.p0, g3.p1, bp.is_contact, bp.player)
+        end
+    end
+    return d3, n
+end
+
 function load_net(path, width, blocks)
     isfile(path) || return nothing
     net = FluxLib.FCResNetMultiHead(gspec, FluxLib.FCResNetMultiHeadHP(width=width, num_blocks=blocks))
@@ -555,12 +710,50 @@ function main()
         println("  done over $ntwo positions ($(round(time()-t2,digits=1))s)"); flush(stdout)
     end
 
+    d3 = nothing; nthree = 0
+    if A["three_ply"]
+        kroot = A["three_ply_topk_root"]; ktop = A["three_ply_topk_deep"]; kdeep = A["three_ply_deepk"]
+        # ── SANITY(3-ply sign): full enumeration on pos#1, best vs worst 3-ply regret ──
+        gb3 = make_gnubg(gnubg_ply)
+        let bp = positions[1]
+            afters = enumerate_full_turn_afterstates(bp.state)
+            _, sBp = score_afterstates(afters, contact_net, race_net)
+            s3p = score_threeply(afters, sBp, length(afters), ktop, kdeep, contact_net, race_net)  # ALL moves
+            gi = argmax(s3p); wi = argmin(s3p)
+            dg = MoveDecision(bp.state, afters[gi].p0, afters[gi].p1, bp.is_contact, bp.player)
+            dw = MoveDecision(bp.state, afters[wi].p0, afters[wi].p1, bp.is_contact, bp.player)
+            tg = native_regret(gb3, dg); tw = native_regret(gb3, dw)
+            @printf("SANITY(3-ply sign) pos#1 (%d moves, full-enum): best-3ply score=%+.3f regret=%.4f | worst-3ply score=%+.3f regret=%.4f\n",
+                    length(afters), s3p[gi], tg[2], s3p[wi], tw[2])
+            println("             (correct sign ⇒ best-3ply regret ≪ worst-3ply regret)")
+        end
+        try BackgammonNet.close(gb3) catch end; flush(stdout)
+
+        println("\n3-ply afterstate (root top-$kroot, reply top-$ktop, deepest-filter=$(kdeep>0 ? "top-$kdeep by 0-ply-A" : "all/sound")) ...")
+        flush(stdout); t3 = time()
+        d3, nthree = threeply_pass(positions, contact_net, race_net, nw, kroot, ktop, kdeep, A["three_ply_positions"])
+        println("  done over $nthree positions ($(round(time()-t3,digits=1))s, $(round((time()-t3)/max(nthree,1),digits=2))s/pos)"); flush(stdout)
+    end
+
     # ── grade everything with gnubg native ──
     gnubg_backends = [make_gnubg(gnubg_ply) for _ in 1:nw]
     println("\nGrading (gnubg ply-$gnubg_ply native)...\n"); flush(stdout)
     grade(d) = summarize(score_moves(gnubg_backends, d, nw)...)
     sA  = grade(dA); sB = grade(dB); sW = grade(dWorstB); sR = grade(dRand)
     sT  = dT === nothing ? nothing : grade(dT[1:ntwo])
+    s3  = d3 === nothing ? nothing : grade(d3[1:nthree])
+
+    # ── MATCHED-SUBSET grading: grade 0/2/3-ply on the SAME first-M positions ──
+    Mmatch = 0
+    if d3 !== nothing;      Mmatch = nthree
+    elseif dT !== nothing;  Mmatch = ntwo
+    end
+    sBm = sTm = s3m = sWm = sRm = nothing
+    if Mmatch > 0
+        sBm = grade(dB[1:Mmatch]); sWm = grade(dWorstB[1:Mmatch]); sRm = grade(dRand[1:Mmatch])
+        sTm = (dT !== nothing && ntwo >= Mmatch) ? grade(dT[1:Mmatch]) : sT
+        s3m = s3
+    end
     for gb in gnubg_backends; try BackgammonNet.close(gb) catch end; end
 
     println("="^90)
@@ -568,13 +761,28 @@ function main()
     println("="^90)
     report("0-ply-A (direct pre-roll)", sA)
     report("0-ply-B (roll-expectation)", sB)
-    sT !== nothing && report("2-ply (top-$(A["two_ply_topk"]))", sT)
+    sT !== nothing && report("2-ply (top-$(A["two_ply_topk"])) [n=$ntwo]", sT)
+    s3 !== nothing && report("3-ply (root$(A["three_ply_topk_root"])/rep$(A["three_ply_topk_deep"])/deep$(A["three_ply_deepk"])) [n=$nthree]", s3)
     println("-"^90)
     report("[sign] WORST-B (argmin)", sW)
     report("[ctrl] RANDOM legal move", sR)
     println("-"^90)
     println("Baselines on this fixed set:  i140 raw-policy=51.7   i140 MCTS-800=32.6   wildbg≈14   gnubg0≈2   floor≈1")
     println("="^90)
+
+    if Mmatch > 0
+        println("\n" * "="^90)
+        println("MATCHED DEPTH-SCALING TABLE — identical first-$Mmatch positions (matched pairs)")
+        println("="^90)
+        report("0-ply-B  [matched n=$Mmatch]", sBm)
+        sTm !== nothing && report("2-ply    [matched n=$Mmatch]", sTm)
+        s3m !== nothing && report("3-ply    [matched n=$Mmatch]", s3m)
+        println("-"^90)
+        report("[sign] WORST-B  [matched]", sWm)
+        report("[ctrl] RANDOM   [matched]", sRm)
+        println("Reference: wildbg≈14  gnubg-0ply≈2  floor≈1")
+        println("="^90)
+    end
 
     # ── verdict ──
     bpr = sB === nothing ? NaN : sB.PR
@@ -591,7 +799,12 @@ function main()
             println("     sibling afterstates. Bottleneck is value sibling-discrimination, not the policy head.")
         end
     end
-    if sT !== nothing
+    if sTm !== nothing || s3m !== nothing
+        println("  DEPTH-SCALING (matched n=$Mmatch):")
+        sBm !== nothing && @printf("    0-ply-B = %.1f\n", sBm.PR)
+        sTm !== nothing && @printf("    2-ply   = %.1f\n", sTm.PR)
+        s3m !== nothing && @printf("    3-ply   = %.1f   (vs wildbg 14, gnubg-0ply 2, floor 1)\n", s3m.PR)
+    elseif sT !== nothing
         @printf("  2-ply afterstate-value PR = %.1f (n=%d)\n", sT.PR, ntwo)
     end
     println("="^90); flush(stdout)
