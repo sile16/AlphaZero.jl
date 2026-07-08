@@ -49,6 +49,9 @@ function parse_args_ft()
         "--val-frac";    arg_type=Float64; default=0.10
         "--patience";    arg_type=Int; default=4
         "--seed";        arg_type=Int; default=1
+        "--ranking-weight"; arg_type=Float64; default=0.0   # 0 = regression only; A/B uses 0.15
+        "--ranking-gap";    arg_type=Float64; default=0.02  # only pairs with wildbg equity gap > this
+        "--ranking-margin-cap"; arg_type=Float64; default=0.2
         "--gpu";         action=:store_true
         "--no-gpu";      action=:store_true
     end
@@ -93,6 +96,23 @@ function loss_fn(net, X, Y)
     return bcelogits(lw, view(Y,1:1,:)) + bcelogits(lgw, view(Y,2:2,:)) +
            bcelogits(lbgw, view(Y,3:3,:)) + bcelogits(lgl, view(Y,4:4,:)) +
            bcelogits(lbgl, view(Y,5:5,:))
+end
+
+# combined loss: regression BCE (all samples) + optional pairwise ranking hinge on
+# head-DERIVED my-equity over sibling pairs (pa=better move, pb=worse move by wildbg
+# label, margin=capped wildbg equity gap). pa/pb index the FIRST nsib columns of Xb.
+function loss_fn_rank(net, Xb, Yb, nsib::Int, pa, pb, marg, rw::Float32)
+    lw, lgw, lbgw, lgl, lbgl = value_logits(net, Xb)
+    reg = bcelogits(lw, view(Yb,1:1,:)) + bcelogits(lgw, view(Yb,2:2,:)) +
+          bcelogits(lbgw, view(Yb,3:3,:)) + bcelogits(lgl, view(Yb,4:4,:)) +
+          bcelogits(lbgl, view(Yb,5:5,:))
+    (rw == 0f0 || isempty(marg)) && return reg
+    pw = Flux.sigmoid.(vec(lw)); pgw = Flux.sigmoid.(vec(lgw)); pbgw = Flux.sigmoid.(vec(lbgw))
+    pgl = Flux.sigmoid.(vec(lgl)); pbgl = Flux.sigmoid.(vec(lbgl))
+    opp = (2f0 .* pw .- 1f0) .+ (pgw .- pgl) .+ (pbgw .- pbgl)   # opponent equity per sample
+    myeq = (.-opp)[1:nsib]                                       # my equity (sibling block)
+    rank = Statistics.mean(max.(0f0, marg .- (myeq[pa] .- myeq[pb])))
+    return reg + rw * rank
 end
 
 # probabilities (5 x N) for a batch of states, batched on device
@@ -232,17 +252,63 @@ function main()
     open_eq_old = net_equity_one(net, open_state)
     @printf("OPENING pre-roll equity: i140=%+.4f  (wildbg teacher≈+0.11)\n", open_eq_old); flush(stdout)
 
+    # ── ranking setup (Task 2 A/B): decision→sibling map + per-sibling wildbg my-equity ──
+    rw = Float32(A["ranking_weight"]); rgap = Float32(A["ranking_gap"]); rcap = Float32(A["ranking_margin_cap"])
+    wb_myeq = Float32[-eqjoint5(Ys[1,i],Ys[2,i],Ys[3,i],Ys[4,i],Ys[5,i]) for i in 1:Ns]
+    dec2sibs = Dict{Int32,Vector{Int}}()
+    if rw > 0f0
+        for i in train_sib; push!(get!(dec2sibs, sib_dec[i], Int[]), i); end
+        println("RANKING loss ENABLED: weight=$rw gap>$rgap margin-cap=$rcap  (grouped sampler, $(length(dec2sibs)) train decisions)")
+    else
+        println("RANKING loss DISABLED (regression only)")
+    end
+    flush(stdout)
+
     # ── training ──
     opt = Flux.setup(Flux.Adam(A["lr"]), net)
     bs = A["batch_size"]; rf = A["retention_frac"]
     n_ret_per = max(1, round(Int, bs*rf)); n_sib_per = bs - n_ret_per
     best_loss = Inf; best_state = deepcopy(Flux.cpu(net)); best_epoch = 0; since_improve = 0
+    train_decs = collect(keys(dec2sibs))
 
     for epoch in 1:A["epochs"]
         te = time()
+        running = 0.0; nb = 0
+        if rw > 0f0
+            # decision-grouped sampler: accumulate whole groups to ~n_sib_per siblings
+            shuffle!(train_decs)
+            gi = 1; ndec = length(train_decs)
+            while gi <= ndec
+                sidx = Int[]; group_bounds = Tuple{Int,Int}[]   # (start,stop) within sidx per group
+                while gi <= ndec && length(sidx) < n_sib_per
+                    g = dec2sibs[train_decs[gi]]; gi += 1
+                    length(g) < 2 && (continue)
+                    st = length(sidx) + 1
+                    append!(sidx, g)
+                    push!(group_bounds, (st, length(sidx)))
+                end
+                isempty(sidx) && continue
+                # build pairs (better,worse) with wildbg gap>rgap, margin=min(gap,cap), batch-local positions
+                pa = Int[]; pb = Int[]; marg = Float32[]
+                for (st, sp) in group_bounds
+                    for x in st:sp, y in (x+1):sp
+                        ex = wb_myeq[sidx[x]]; ey = wb_myeq[sidx[y]]
+                        d = ex - ey
+                        if d > rgap; push!(pa,x); push!(pb,y); push!(marg, min(d, rcap))
+                        elseif -d > rgap; push!(pa,y); push!(pb,x); push!(marg, min(-d, rcap)); end
+                    end
+                end
+                ridx = rand(1:Nr, n_ret_per)
+                Xb = hcat(Xs_d[:, sidx], Xr_d[:, ridx])
+                Yb = hcat(Ys_d[:, sidx], Yr_d[:, ridx])
+                nsib = length(sidx)
+                pa_d = _to_dev(pa); pb_d = _to_dev(pb); marg_d = _to_dev(marg)
+                l, gs = Flux.withgradient(m -> loss_fn_rank(m, Xb, Yb, nsib, pa_d, pb_d, marg_d, rw), net)
+                Flux.update!(opt, net, gs[1]); running += l; nb += 1
+            end
+        else
         perm = shuffle(train_sib)
         nb = cld(length(perm), n_sib_per)
-        running = 0.0
         for b in 1:nb
             lo = (b-1)*n_sib_per+1; hi = min(b*n_sib_per, length(perm))
             sidx = perm[lo:hi]
@@ -252,6 +318,7 @@ function main()
             l, gs = Flux.withgradient(m -> loss_fn(m, Xb, Yb), net)
             Flux.update!(opt, net, gs[1])
             running += l
+        end
         end
         # val proxy + val BCE
         prox = ranking_proxy(net, Xval_d, Yval, val_groups)
