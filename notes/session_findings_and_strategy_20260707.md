@@ -135,3 +135,42 @@ higher/gumbel search could raise the measured strength without any retraining. W
   value), `generate_race_table_supervised.jl` (exact-table, doubles-correct).
 - Verifiers: `AlphaZero/scripts/verify_race_supervised.jl`, `verify_race_mcts.jl`,
   `validate_contact_doubles_policy.jl`, `validate_rollout_vs_k7.jl`, `eval_vs_wildbg.jl`.
+
+---
+
+## 8. CORRECTED FINAL VERDICT (late 2026-07-07) — the honest strength picture
+
+The §3 win%-based claims ("beat wildbg", "~gnubg-0ply parity") turned out to be INFLATED. Rigorous
+per-decision metrics on a COMMON benchmark corrected them. This is the trustworthy conclusion:
+
+**Our contact net is genuinely WEAK.** True-scale PR (gnubg-ply1 native reference, common 1500-position
+benchmark, floor ~1 PR): **gnubg-0ply ~1.9 PR (near-perfect) | wildbg-large ~13 PR (intermediate) |
+i140 (ours) ~30 PR (weak)**. Raw net (mcts-1, no search) wins only **6.7%** vs wildbg — a blowout loss.
+
+**"Beating wildbg" was two artifacts, not net strength:** (1) a HARNESS BUG — `best_move` threw on rare
+doubles-match failures, and the eval's ExternalAgent then played an arbitrary bad move FOR the opponent,
+inflating win% ~2-4 pts (fixed: `best_move` now falls back to rank-by-own-eval argmax; committed
+`fad1b95`, tests green, validated 0 throws / ~18500 decisions). (2) ASYMMETRIC SEARCH — i140 ran
+mcts-800 lookahead vs wildbg's shallow best-move, letting a weak net reach ~even. Corrected true
+head-to-heads: **i140 vs wildbg 52%, vs gnubg-0ply 33.3%.**
+
+**Two structural lessons (hold across the cubeful redesign):**
+- **Win% vs a weak/handicapped opponent is a mirage; per-decision PR is the truth.** Only PR caught this.
+- **Deep search lifts win% but NOT per-decision quality** (~48@800 ≈ ~54@1600 self-play PR) — the net's
+  policy/value is the cap. The path to world-class is a fundamentally STRONGER NETWORK, not more search.
+
+**Trustworthy metric/eval suite (use these for the cubeful net):**
+- `scripts/benchmark_pr.jl` — cross-comparable checker PR on a FIXED common position set (the RIGHT way
+  to track net versions; self-play PR is NOT cross-comparable).
+- `scripts/analyze_pr_native.jl` — true-scale checker PR (~0 floor via gnubg native move-list + match-
+  by-board, sidesteps the gnubg player-0 action-id bug).
+- `BackgammonNet/scripts/analyze_cube_pr.jl` — cube-ER (doubling + take) via gnubg arDouble, floor 0.
+- `scripts/calibrate_pr_ladder.jl` — external engines' own PR (the calibration ladder above).
+- `scripts/eval_vs_gnubg.jl` / `eval_vs_wildbg.jl` — head-to-heads (now trustworthy post `fad1b95`;
+  gnubg ply>=2 deadlocks — use ply-0/1 or single-worker small batches).
+
+**Cubeful redesign (user-driven, validated game-side):** 4 MCTS node types (checker 676=26x26 micro-
+action, chance 21, double 2, take 2) + per-non-chance value heads; game rules VALIDATED (unit 231328,
+full-game integration, cube-decision reference — see `test_cubeful_integration.jl`,
+`validate_cube_reference.jl`). AZ-side MCTS/heads/training is the next build. PR-track the new net on
+`benchmark_pr.jl` (common set) — NOT win%.
