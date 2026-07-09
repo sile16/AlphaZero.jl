@@ -66,8 +66,8 @@ end
         vectorize_state! = BGD.vectorize_state_into!)
 
     @testset "deterministic wrapper delegates stable BackgammonNet APIs" begin
-        @test num_actions == BackgammonNet.MAX_ACTIONS
-        @test BGD.NUM_ACTIONS == BackgammonNet.MAX_ACTIONS
+        @test num_actions == BackgammonNet.CHECKER_ACTIONS
+        @test BGD.NUM_ACTIONS == BackgammonNet.CHECKER_ACTIONS
 
         @test GI.parse_action(gspec, "Bar | 5") == BackgammonNet.encode_action(BackgammonNet.BAR_LOC, 5)
         @test GI.parse_action(gspec, "Pass | Pass") ==

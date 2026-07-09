@@ -67,8 +67,10 @@ const OBS_TYPE_MAP = Dict(
 const OBS_TYPE_STR = get(ENV, "BACKGAMMON_OBS_TYPE", "min_plus_flat")
 const OBSERVATION_TYPE = get(OBS_TYPE_MAP, OBS_TYPE_STR, :minimal_flat)
 
-# Unified action space: 1:676 checker actions, 677:680 cube actions.
-const NUM_ACTIONS = BackgammonNet.MAX_ACTIONS
+# Checker policy head width (engine IDs 1:676). Cube actions 677:680 are not part of
+# this training head — use split cube heads / cube_enabled=false for ML.
+# Engine still accepts MAX_ACTIONS via BackgammonNet.apply_action! for cubeful eval.
+const NUM_ACTIONS = BackgammonNet.CHECKER_ACTIONS
 
 # Get observation size from BackgammonNet
 # Handle hybrid observations (named tuples) by computing flattened size

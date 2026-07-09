@@ -185,20 +185,11 @@ since external agents don't produce MCTS policies.
 function select_action(agent::ExternalAgent, ::Nothing, env)
     # Access the underlying BackgammonGame from the GI env
     game = env.game
-    # Use BackgammonNet's agent_move protocol
+    # Use BackgammonNet's agent_move protocol.
+    # Fail-fast: do NOT catch and play first(legal) — that hid doubles/bridge bugs and
+    # inflated head-to-head win rates. Let the error surface so it can be fixed.
     bg_agent = _make_backend_agent(agent.backend)
-    action = try
-        _agent_move(bg_agent, game)
-    catch e
-        # Robustness: some engine bridges (e.g. wildbg) can fail to match their chosen full-turn
-        # move to a legal action sequence on rare doubles positions ("returned no move for
-        # doubles ..."). Rather than abort a whole eval, fall back to a legal action for that one
-        # decision (rare → negligible bias) and warn.
-        legal = GI.available_actions(env)
-        isempty(legal) && rethrow(e)
-        @warn "ExternalAgent move failed; using a legal fallback move (msg: $(sprint(showerror, e)))" maxlog=3
-        first(legal)
-    end
+    action = _agent_move(bg_agent, game)
     return (action, Float32[], Int[])
 end
 

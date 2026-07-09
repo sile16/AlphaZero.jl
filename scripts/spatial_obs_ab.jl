@@ -10,8 +10,8 @@ epochs/LR/loss, differing ONLY in (observation, architecture):
   FLAT arm (control):  obs = :min_plus_flat (350),  arch = FC pre-act ResNet (MLP)
   CONV arm (test):     obs = :full (76x1x26),        arch = AlphaGo-Zero conv ResNet
 
-Both nets: shared trunk -> policy head (softmax/logits over 680 actions) + single tanh
-value head. Policy loss = soft cross-entropy vs the teacher's soft 680-dim target.
+Both nets: shared trunk -> policy head (softmax/logits over CHECKER_ACTIONS=676) + single tanh
+value head. Policy loss = soft cross-entropy vs the teacher's soft 676-dim checker target.
 Value loss = MSE vs equity/3. Identical for both arms.
 
 Then measure RAW-policy contact PR of BOTH on the SAME fixed benchmark position set
