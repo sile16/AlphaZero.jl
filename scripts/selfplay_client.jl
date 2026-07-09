@@ -27,14 +27,14 @@ runs MCTS self-play locally, and uploads samples.
 Uses a shared CPU inference backend with platform-adaptive selection.
 Self-play infrastructure extracted from train_distributed.jl.
 
-Usage:
+Usage — connect directly to the server by hostname on the LAN:
     julia --threads 30 --project scripts/selfplay_client.jl \\
-        --server http://localhost:9090 \\
+        --server http://jarvis:9090 \\
         --api-key alphazero-dev-key \\
         --num-workers 22
 
-Note: Use SSH tunnel for remote servers:
-    ssh -f -N -L 9090:localhost:9090 jarvis
+The server binds 0.0.0.0 (src/distributed/server.jl) and the hosts are on the same
+LAN, so pass the server's hostname directly. (Tunneling is only needed from off-LAN.)
 """
 
 using ArgParse
