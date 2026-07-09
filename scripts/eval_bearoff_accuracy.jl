@@ -56,8 +56,8 @@ function parse_args()
         "--bootstrap-file"
             arg_type = String
             default = get(ENV, "BACKGAMMONNET_BOOTSTRAP_FILE",
-                          backgammonnet_bootstrap_file("bootstrap_5000g_bgblitz1ply.jls"))
-            help = "Raw bootstrap with BackgammonGame states (fallback source)"
+                          backgammonnet_bootstrap_file("bootstrap_5000g_gnubg0ply.jls"))
+            help = "Raw bootstrap with BackgammonGame states (fallback source; gnubg-labeled)"
         "--start-positions-file"
             arg_type = String
             default = backgammonnet_eval_data_file("race_eval_2000.jls")
