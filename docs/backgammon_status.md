@@ -137,13 +137,30 @@ manifest remain authoritative.
 
 ## Current validation snapshot
 
-> **SUPERSEDED (2026-07-22).** The snapshot below pins BackgammonNet `0.7.0` at
-> commit `65eb189…`, which is now ~156 commits behind BackgammonNet HEAD. The API
-> consumption migration (see the 2026-07-22 section above) targets the current
-> BackgammonNet code; the AlphaZero test suite is green except the deferred v4
-> artifact integration test. A fresh preflight against the **frozen verified
-> release** (commit + contract fingerprint) is still required — see the P1 TODO —
-> before this snapshot can be re-stated as current.
+### 2026-07-22 — Jarvis compatibility (post-migration, BackgammonNet HEAD, NOT frozen)
+
+After the API consumption migration, the full AlphaZero test suite is green (0
+failures; the v4 artifact integration test is intentionally skipped) and the
+no-training Jarvis server preflight passed all **11 checks**:
+
+- Julia `1.12.6`; AlphaZero clean.
+- BackgammonNet `0.7.0` at commit
+  `18e171875b0f166ecbd1841e11362cc45837658d`, clean checkout.
+- ML contract fingerprint
+  `8c3cc18431da9f58718025fc65f7f0c8c3a2988e9e66624eb6bca3486339a84c`;
+  config fingerprint `f2de25b8…`.
+- state dimension **366** (was 352 — observation encoding changed in the
+  BackgammonNet update), checker actions 676, chance outcomes 21.
+
+This is a compatibility check against **current BackgammonNet HEAD, which is NOT
+the frozen verified release**. It establishes plumbing/invariants only — no
+artifact quality or model strength. Re-pin the frozen release commit +
+fingerprint and re-run preflight on both machines once the release lands (P1
+TODO). **Neo preflight still pending.** The prior snapshot below is historical.
+
+> **SUPERSEDED (2026-07-16 snapshot).** Pins BackgammonNet `0.7.0` at commit
+> `65eb189…` with state dim 352 and fingerprint `a6e6cf10…` — both changed in the
+> 2026-07-22 migration (see above). Kept for history only.
 
 On Jarvis, the AlphaZero working tree passed 3,377 assertions on 2026-07-16.
 The no-training server preflight passed all 11 checks with:
