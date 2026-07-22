@@ -113,9 +113,7 @@ using AlphaZero: ConstSchedule
 using AlphaZero: GameLoop
 import Flux
 import BackgammonNet
-using BackgammonNet: BearoffK7, BearoffOneSidedCompact, CombinedBearoff
-using BackgammonNet: bearoff_best_move_value, bearoff_covers, bearoff_equity, bearoff_lookup
-using BackgammonNet: bearoff_turn_value_equity, bearoff_value_to_nn_scale
+using BackgammonNet: bearoff_equity, bearoff_value_to_nn_scale
 import JSON3
 const CPU_INFERENCE_BACKEND = AlphaZero.BackgammonInference.resolve_cpu_backend(ARGS["inference_backend"])
 # Fail-fast: the :flux CPU oracle reads the MUTABLE network object that the
@@ -140,6 +138,8 @@ flush(stdout)
 include(joinpath(@__DIR__, "..", "src", "distributed", "buffer.jl"))
 include(joinpath(@__DIR__, "..", "src", "distributed", "protocol.jl"))
 include(joinpath(@__DIR__, "..", "src", "distributed", "client.jl"))
+include(joinpath(@__DIR__, "..", "src", "distributed", "bearoff_tables.jl"))
+using .BearoffTables
 
 # Connect to server and get config
 # Default client_name MUST be unique per process: the server derives each
@@ -233,7 +233,7 @@ elseif MCTS_BUDGET_MODE == :turn_progressive
         error("turn_progressive mode requires positive turn simulation/ramp settings")
 end
 
-# Bear-off config (always enabled — mandatory for backgammon training)
+# Bear-off config is owned by the server and must be identical across the fleet.
 const BEAROFF_HARD_TARGETS = Bool(config["bearoff_hard_targets"])
 const BEAROFF_TRUNCATION = Bool(config["bearoff_truncation"])
 
@@ -297,65 +297,23 @@ if USE_GPU
 end
 
 #####
-##### Bear-off table (mandatory — loaded locally, too large to serve over HTTP)
+##### Bear-off tables (server-selected, locally verified, too large for HTTP)
 #####
 
-# F1/F3: bearoff is a CLUSTER-WIDE decision made by the server (config["use_bearoff"],
-# derived from its --no-bearoff). When ON, EVERY client must have the LOCAL k=7 table:
-# a client without it would silently produce DIFFERENT training targets (game-outcome
-# fallback) than table-equipped clients. We fail-fast rather than allow that
-# divergence — there is NO remote-table fallback.
-# No default — a server that doesn't send use_bearoff is a protocol mismatch and must
-# fail immediately rather than silently assuming a bearoff mode.
-const USE_BEAROFF = Bool(config["use_bearoff"])
+const BEAROFF_TABLE_SELECTION = BearoffTables.parse_table_selection(
+    String(config["bearoff_tables"]))
+const BEAROFF_TABLES = BearoffTables.load_runtime_tables(
+    BEAROFF_TABLE_SELECTION; expected_identity=config["bearoff_table_identity"])
+println("Bearoff tables: $BEAROFF_TABLE_SELECTION (local release identity matches server)")
+BEAROFF_TABLES.n15 !== nothing && println(
+    "  n15 semantics: coherent E(R,R) runtime approximation; never an exact training target")
+flush(stdout)
 
-const BEAROFF_TABLE = let
-    if !USE_BEAROFF
-        println("Bearoff DISABLED by server (use_bearoff=false) — no bearoff eval or exact targets.")
-        flush(stdout)
-        nothing
-    else
-        table_dir = BackgammonNet.default_bearoff_k7_dir()
-        has_k7 = isdir(table_dir) && isfile(joinpath(table_dir, "bearoff_k7_c14.bin"))
-        !has_k7 && error(
-            "Bearoff is ENABLED cluster-wide (server use_bearoff=true) but NO local k=7 table " *
-            "was found at $table_dir.\n" *
-            "  Fail-fast: a client without the table would produce different training targets than " *
-            "table-equipped clients.\n  Fix: place bearoff_k7_twosided/ under " *
-            "$(BackgammonNet.default_bearoff_root()) on every machine, set " *
-            "BACKGAMMONNET_BEAROFF_K7_DIR, or run the server with --no-bearoff " *
-            "to disable bearoff for the whole cluster.")
-        println("Loading k=7 bear-off table from $table_dir ...")
-        k7 = BearoffK7.BearoffTable(table_dir)
-        println("  c14: $(round(length(k7.c14_data)/1e9, digits=1)) GB")
-        println("  c15: $(round(length(k7.c15_data)/1e9, digits=1)) GB")
-        # Optional n15 one-sided race bundle — extends EXACT race coverage beyond the
-        # k7 (<=7 from off) deep-bearoff frontier. Present → COMBINED (k7 → n15 tier,
-        # exact race frontier for the contact curriculum); absent → k7-only (deep
-        # bearoff exact; races outside k7 handled by the NN).
-        n15_dir = BackgammonNet.default_bearoff_n15_dir()
-        if isdir(n15_dir) && isfile(joinpath(n15_dir, "header.txt"))
-            n15 = BearoffOneSidedCompact.CompactBundle(n15_dir)
-            println("Loaded n15 race bundle from $n15_dir → COMBINED bearoff (k7 → n15 exact race frontier)")
-            flush(stdout)
-            CombinedBearoff(k7, n15)
-        else
-            println("No n15 race bundle found — k7-only bearoff (races outside k7 handled by NN)")
-            flush(stdout)
-            k7
-        end
-    end
-end
-
-# Fail-fast: bearoff TRUNCATION and hard targets read the LOCAL table's exact value
-# (first_bearoff_bo.value). A remote-only config leaves BEAROFF_TABLE=nothing, which
-# would make truncation dereference `nothing.value` and crash the worker. We never
-# silently run truncation without exact local values — require the table or turn
-# truncation off.
-if BEAROFF_TRUNCATION && BEAROFF_TABLE === nothing
-    error("Bearoff truncation is enabled but no LOCAL bearoff table is loaded " *
-          "(BEAROFF_TABLE is nothing — remote bearoff cannot supply truncation/hard-target " *
-          "values). Install a local k=7 table or disable bearoff truncation.")
+# Truncation and hard targets are exact-k7-only. Runtime n15 leaves may influence
+# search only and can never flow into serialized target heads or values.
+if (BEAROFF_TRUNCATION || BEAROFF_HARD_TARGETS) && BEAROFF_TABLES.k7 === nothing
+    error("Bearoff truncation and hard targets require the configured exact k7 table; " *
+          "n15 is a runtime approximation and may not emit training targets")
 end
 
 """
@@ -371,11 +329,8 @@ Maps to the NN's 5-head joint convention:
 - `[P(win), P(win∧gammon+), P(win∧bg), P(lose∧gammon+), P(lose∧bg)]`
 """
 function bearoff_table_equity(game::BackgammonNet.BackgammonGame)
-    BEAROFF_TABLE === nothing && return nothing
-    # Domain self-guard (generic: k7 deep-bearoff OR combined n=18 race ≤18pt).
-    # bearoff_lookup returns an OUT-OF-DOMAIN value if the position is uncovered.
-    bearoff_covers(BEAROFF_TABLE, game.p0, game.p1) || return nothing
-    r = bearoff_lookup(BEAROFF_TABLE, game)
+    r = BearoffTables.exact_k7_lookup(BEAROFF_TABLES, game)
+    r === nothing && return nothing
     eq = Float32[r.pW, r.pWG, 0.0f0, r.pLG, 0.0f0]
     value = bearoff_equity(r)
     return (value=value, equity=eq)
@@ -393,17 +348,14 @@ Returns `(value, equity)` where `value` is white-relative scalar equity and
 `equity` is the 5-element joint cumulative vector, or `nothing` if not a
 bear-off position.
 """
-function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
-    if table === nothing
-        return nothing
-    end
-    if !bearoff_covers(table, game.p0, game.p1)
+function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame)
+    if !BearoffTables.exact_k7_covers(BEAROFF_TABLES, game)
         return nothing
     end
     if BackgammonNet.is_chance_node(game)
         # Pre-dice: table value is exact. lookup() returns mover-relative;
         # convert to white-relative for consistency with the function's contract.
-        r = bearoff_lookup(table, game)
+        r = BearoffTables.exact_k7_lookup(BEAROFF_TABLES, game)
         mover_val = bearoff_equity(r)
         mover_eq = Float32[r.pW, r.pWG, 0.0f0, r.pLG, 0.0f0]
         if game.current_player == 0
@@ -431,7 +383,8 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
     for action in actions
         BackgammonNet.copy_state!(bg_copy, game)
         BackgammonNet.apply_action!(bg_copy, action)
-        mover_val, mover_eq = bearoff_turn_value_equity(table, bg_copy, mover)
+        mover_val, mover_eq = BackgammonNet.bearoff_turn_value_equity(
+            BEAROFF_TABLES.k7, bg_copy, mover)
         if mover_val > best_mover_value
             best_mover_value = mover_val
             best_mover_equity = mover_eq
@@ -460,36 +413,40 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
 end
 
 """
-Create bear-off evaluator for MCTS (k=7).
+Create the configured bear-off evaluator for MCTS.
 
-At chance nodes (pre-dice): returns the pre-dice table value directly (exact).
-At decision nodes (post-dice): enumerates all legal moves, looks up each resulting
-position in the bear-off table, and returns the best value (exact post-dice Q-value).
+The caller checks k7 first and then n15, invoking each concrete table directly.
+k7 values are exact money-optimal values. n15 values are coherent E(R,R)
+approximations used only as runtime search leaves; they never become hard or
+truncation targets. Decision nodes enumerate legal moves and recurse through any
+remaining doubles action before reaching a table boundary.
 
 Returns white-relative equity NORMALIZED to [-1,1] (points/3) so tree values are
 on the same scale as NN value output (equity/3), or nothing if not a bear-off position.
 """
-function make_bearoff_evaluator(table)
+function make_bearoff_evaluator(tables)
     # Single normalization point: raw bear-off points [-reward_scale, reward_scale]
     # → MCTS/NN value scale [-1,1]. Tied to GI.reward_scale so it can't drift.
     rs = Float64(GI.reward_scale(gspec))
     return function(game_env)
         # No local table → skip bearoff eval entirely (NN handles it).
         # Remote HTTP is far too slow for per-MCTS-iteration lookups.
-        table === nothing && return nothing
-
         bg = game_env.game
-        # Generic domain gate: k7 deep-bearoff OR (combined) n=18 race ≤18 pips.
-        # Uncovered positions (contact, >18pt races) return nothing → NN handles them.
-        if !bearoff_covers(table, bg.p0, bg.p1)
+        # The caller owns dispatch: check and invoke each concrete configured
+        # table explicitly. There is deliberately no combined/fallback table API.
+        table_kind = if BearoffTables.exact_k7_covers(tables, bg)
+            :k7
+        elseif BearoffTables.n15_covers(tables, bg)
+            :n15
+        else
             return nothing
         end
 
         if BackgammonNet.is_chance_node(bg)
-            # Pre-dice: exact table value (mover-relative → white-relative),
-            # normalized to the NN value scale [-1,1] via reward_scale.
-            r = bearoff_lookup(table, bg)
-            mover_equity = bearoff_value_to_nn_scale(bearoff_equity(r), rs)
+            result = table_kind === :k7 ?
+                BackgammonNet.BearoffK7.lookup(tables.k7, bg) :
+                BackgammonNet.BearoffOneSidedCompact.lookup(tables.n15, bg)
+            mover_equity = bearoff_value_to_nn_scale(bearoff_equity(result), rs)
             return bg.current_player == 0 ? mover_equity : -mover_equity
         end
 
@@ -501,7 +458,9 @@ function make_bearoff_evaluator(table)
             return nothing
         end
 
-        best_value = bearoff_best_move_value(table, bg)
+        best_value = table_kind === :k7 ?
+            BackgammonNet.bearoff_best_move_value(tables.k7, bg) :
+            BearoffTables.n15_best_move_value(tables.n15, bg)
         if best_value == -Inf
             return nothing
         end
@@ -513,7 +472,7 @@ function make_bearoff_evaluator(table)
     end
 end
 
-const BEAROFF_EVALUATOR = make_bearoff_evaluator(BEAROFF_TABLE)
+const BEAROFF_EVALUATOR = make_bearoff_evaluator(BEAROFF_TABLES)
 
 #####
 ##### Custom starting positions (loaded from NFS file if configured)
@@ -721,7 +680,7 @@ Per sample:
 
 Target precedence is intentionally:
 1. exact bear-off truncation target captured earlier in the game, if present
-2. exact post-dice bear-off value for the current state, if available
+2. exact post-dice k7 value when hard targets are enabled and the state is covered
 3. final game outcome as a hard 0/1 target
 """
 function convert_trace_to_samples(gspec, states, policies, trace_actions, rewards, is_chance, final_reward, outcome; rng=nothing,
@@ -783,12 +742,13 @@ function convert_trace_to_samples(gspec, states, policies, trace_actions, reward
         end
 
         is_bearoff_pos = false
-        if bearoff_equity === nothing && state isa BackgammonNet.BackgammonGame &&
-                BEAROFF_TABLE !== nothing && bearoff_covers(BEAROFF_TABLE, state.p0, state.p1)
+        if BEAROFF_HARD_TARGETS && bearoff_equity === nothing &&
+                state isa BackgammonNet.BackgammonGame &&
+                BearoffTables.exact_k7_covers(BEAROFF_TABLES, state)
             # Use post-dice move enumeration for exact Q(board, dice) values
             # and the matching five-head joint target for this specific
             # state. Override both together so `value` and `equity` stay aligned.
-            bo = bearoff_post_dice_equity(state, BEAROFF_TABLE)
+            bo = bearoff_post_dice_equity(state)
             if bo !== nothing
                 z = wp ? bo.value : -bo.value
                 eq = copy(bo.equity)
@@ -949,7 +909,8 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         while !GI.game_terminated(env)
             if GI.is_chance_node(env)
                 bg = env.game
-                if BEAROFF_TABLE !== nothing && bearoff_covers(BEAROFF_TABLE, bg.p0, bg.p1)
+                if (BEAROFF_HARD_TARGETS || BEAROFF_TRUNCATION) &&
+                        BearoffTables.exact_k7_covers(BEAROFF_TABLES, bg)
                     if first_bearoff_bo === nothing
                         first_bearoff_bo = bearoff_table_equity(bg)
                         first_bearoff_wp = (bg.current_player == 0)
@@ -1080,7 +1041,8 @@ function worker_play_games_gpu(worker_id::Int, games_claimed::Threads.Atomic{Int
         first_bearoff_bo = Ref{Any}(nothing)
         first_bearoff_wp = Ref{Bool}(true)
         function bearoff_lookup_with_capture(game)
-            if BEAROFF_TABLE === nothing || !bearoff_covers(BEAROFF_TABLE, game.p0, game.p1)
+            if !(BEAROFF_HARD_TARGETS || BEAROFF_TRUNCATION) ||
+                    !BearoffTables.exact_k7_covers(BEAROFF_TABLES, game)
                 return nothing
             end
             bo = bearoff_table_equity(game)
@@ -1154,7 +1116,10 @@ if USE_GPU
                     # Reset counter for next game
                     Threads.atomic_xchg!(games_claimed_inf, 0)
                 catch e
+                    # Keep the worker alive (transient), but print the full backtrace
+                    # so a real engine/contract bug is diagnosable, not just its message.
                     println("GPU worker $wid error: $e")
+                    Base.showerror(stdout, e, catch_backtrace()); println(); flush(stdout)
                     sleep(1)
                 end
             end
@@ -1759,8 +1724,15 @@ function process_eval_chunk!(chunk_data::Dict)
     # round-trip / cor() aggregate — which is what was 400'ing the contact eval.
     let m = min(length(val_nn), length(val_opp), length(val_is_contact))
         keep = [i for i in 1:m if isfinite(val_nn[i]) && isfinite(val_opp[i])]
-        if length(keep) != length(val_nn) || length(keep) != length(val_opp)
-            println("[EVAL] dropped $(max(length(val_nn),length(val_opp)) - length(keep)) non-finite/unpaired value samples before submit")
+        n_total = max(length(val_nn), length(val_opp))
+        n_dropped = n_total - length(keep)
+        if n_dropped > 0
+            # Surface the DROP RATE, not just a count. A non-finite value from the
+            # opponent engine (e.g. wildbg NaN on a contact position) is an
+            # engine-integrity signal — a spike here should be visible, not folded
+            # into normal robustness. @warn so it stands out in the logs.
+            frac = n_total > 0 ? n_dropped / n_total : 0.0
+            @warn "[EVAL] dropped non-finite/unpaired value samples before submit" n_dropped n_total drop_frac=round(frac, digits=4)
         end
         val_nn = val_nn[keep]
         val_opp = val_opp[keep]

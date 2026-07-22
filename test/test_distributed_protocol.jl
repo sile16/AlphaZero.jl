@@ -1,6 +1,10 @@
 using Test
 using AlphaZero
 
+if !isdefined(Main, :BackgammonDeterministic)
+    include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "main.jl"))
+end
+
 module DistributedProtocolTest
 using AlphaZero
 using SHA
@@ -9,7 +13,7 @@ include("../src/distributed/protocol.jl")
 end
 
 @testset "Distributed Protocol" begin
-    gspec = AlphaZero.Examples.games["tictactoe"]
+    gspec = Main.BackgammonDeterministic.GameSpec()
     nn = AlphaZero.FluxLib.SimpleNet(
         gspec,
         AlphaZero.FluxLib.SimpleNetHP(width=16, depth_common=2))

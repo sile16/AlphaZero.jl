@@ -3,7 +3,7 @@
 verify_race_mcts.jl — does MCTS on top of the race net LOWER move-regret vs the raw policy?
 
 For a subsample of exact-table-labeled race positions, compares two move choices against
-the EXACT combined k7→n15 race table:
+the exact k7 race table used to produce the artifact:
   - raw  : argmax of the net's policy head
   - mcts : the move selected by the production BatchedMCTS search (NN evaluator only —
            no exact-table leaf, so this isolates the SEARCH contribution)
@@ -20,7 +20,7 @@ using AlphaZero
 using AlphaZero: GI, MCTS, Network, FluxLib, MctsParams, ConstSchedule, BatchedMCTS, GameLoop
 using AlphaZero.BackgammonInference
 import BackgammonNet
-using BackgammonNet: CombinedBearoff, load_combined_bearoff, bearoff_turn_value_equity
+using BackgammonNet: BearoffK7, bearoff_turn_value_equity
 using Serialization, Statistics, Printf, Random
 import Flux
 
@@ -37,9 +37,8 @@ const WIDTH  = parse(Int, something(parse_arg(ARGS, "width"), "128"))
 const BLOCKS = parse(Int, something(parse_arg(ARGS, "blocks"), "3"))
 const NSUB   = parse(Int, something(parse_arg(ARGS, "n"), "2000"))
 const ITERS  = parse(Int, something(parse_arg(ARGS, "iters"), "100"))
-const N15_DIR = something(parse_arg(ARGS, "table-dir"),
-    BackgammonNet.default_bearoff_n15_dir())
-const K7_DIR = BackgammonNet.default_bearoff_k7_dir()
+const K7_DIR = something(parse_arg(ARGS, "table-dir"),
+    BackgammonNet.default_bearoff_k7_dir())
 
 ENV["BACKGAMMON_OBS_TYPE"] = something(parse_arg(ARGS, "obs-type"), "min_plus_flat")
 include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
@@ -51,7 +50,7 @@ const ORACLE_CFG = BackgammonInference.OracleConfig(
 
 # Exact mover-relative value of playing first-action `a` from decision node `g`.
 # Doubles-correct: recurses through the rest of the turn via bearoff_turn_value_equity.
-function move_equity(t::CombinedBearoff, g, a, scratch)
+function move_equity(t::BearoffK7.BearoffTable, g, a, scratch)
     BackgammonNet.copy_state!(scratch, g)
     BackgammonNet.apply_action!(scratch, a)
     v, _ = bearoff_turn_value_equity(t, scratch, Int(g.current_player))
@@ -62,7 +61,7 @@ function main()
     d = deserialize(TEST)
     n = min(NSUB, length(d.states))
     println("Test positions: $n (of $(length(d.states)))   MCTS iters: $ITERS")
-    table = load_combined_bearoff(; k7_dir=K7_DIR, n15_dir=N15_DIR)
+    table = BearoffK7.BearoffTable(K7_DIR)
     scratch = BackgammonNet.clone(d.states[1])
 
     net = FluxLib.FCResNetMultiHead(gspec, FluxLib.FCResNetMultiHeadHP(width=WIDTH, num_blocks=BLOCKS))

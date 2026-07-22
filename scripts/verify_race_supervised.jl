@@ -15,7 +15,7 @@ Usage:
 using AlphaZero
 using AlphaZero: GI, Network, FluxLib
 import BackgammonNet
-using BackgammonNet: CombinedBearoff, load_combined_bearoff, bearoff_turn_value_equity
+using BackgammonNet: BearoffK7, bearoff_turn_value_equity
 using Serialization, Statistics, Printf
 import Flux
 
@@ -32,9 +32,8 @@ const WIDTH = parse(Int, something(parse_arg(ARGS, "width"), "128"))
 const BLOCKS = parse(Int, something(parse_arg(ARGS, "blocks"), "3"))
 const BATCH = parse(Int, something(parse_arg(ARGS, "batch"), "4096"))
 
-const N15_DIR = something(parse_arg(ARGS, "table-dir"),
-    BackgammonNet.default_bearoff_n15_dir())
-const K7_DIR = BackgammonNet.default_bearoff_k7_dir()
+const K7_DIR = something(parse_arg(ARGS, "table-dir"),
+    BackgammonNet.default_bearoff_k7_dir())
 
 ENV["BACKGAMMON_OBS_TYPE"] = something(parse_arg(ARGS, "obs-type"), "min_plus_flat")
 include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
@@ -48,7 +47,7 @@ const ORACLE_CFG = AlphaZero.BackgammonInference.OracleConfig(
 # Uses bearoff_turn_value_equity, which recurses through the rest of the turn (doubles-correct)
 # and only flips at true turn boundaries — the naive one-action + sign flip is WRONG for doubles
 # and forced-pass positions.
-function move_equity(t::CombinedBearoff, g, a, scratch)
+function move_equity(t::BearoffK7.BearoffTable, g, a, scratch)
     BackgammonNet.copy_state!(scratch, g)
     BackgammonNet.apply_action!(scratch, a)
     v, _ = bearoff_turn_value_equity(t, scratch, Int(g.current_player))
@@ -61,9 +60,9 @@ function main()
     n = length(d.states)
     println("  $n positions, obs=$(d.states[1].obs_tier)_$(d.states[1].obs_format), state_dim=$_state_dim")
 
-    table = (isdir(N15_DIR) && isdir(K7_DIR)) ? (print("Loading combined table for move-regret... ");
-        t = load_combined_bearoff(; k7_dir=K7_DIR, n15_dir=N15_DIR); println("done."); t) : nothing
-    table === nothing && println("  (tables not found — skipping move-regret)")
+    table = isdir(K7_DIR) ? (print("Loading exact k7 table for move-regret... ");
+        t = BearoffK7.BearoffTable(K7_DIR); println("done."); t) : nothing
+    table === nothing && println("  (k7 table not found — skipping move-regret)")
     scratch = BackgammonNet.clone(d.states[1])
     regret = Float64[]
 

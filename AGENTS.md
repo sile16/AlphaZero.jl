@@ -31,11 +31,12 @@ Expected table subdirectories:
 - `bearoff_k7_twosided`
 - `bearoff_n15_bundle_v3`
 
-Bearoff coverage is a two-tier `CombinedBearoff`: the exact money-optimal k7
-two-sided table (both sides' rearmost ≤ 7 from off) plus the n15 one-sided race
-bundle (`BearoffOneSidedCompact.CompactBundle`) that extends the exact race
-frontier beyond k7. The superseded n18 one-sided table and
-`default_bearoff_onesided_dir()` were removed from BackgammonNet.
+Bearoff tables are selected explicitly by the training server with
+`--bearoff-tables=none|k7|n15|k7+n15`. Every client validates and loads exactly
+that set; local file presence never enables a table. The exact money-optimal k7
+two-sided table is the only source permitted for hard/truncation targets. The
+n15 one-sided race bundle is a coherent E(R,R) runtime approximation for MCTS
+leaves and is never described or consumed as an exact training teacher.
 
 Use the BackgammonNet helpers instead of hardcoded paths:
 
@@ -43,10 +44,9 @@ Use the BackgammonNet helpers instead of hardcoded paths:
 - `BackgammonNet.default_bearoff_k7_dir()`
 - `BackgammonNet.default_bearoff_n15_dir()`
 
-Build the combined table with `BackgammonNet.load_combined_bearoff(; k7_dir,
-n15_dir)` when both tiers are required, or `CombinedBearoff(k7,
-BearoffOneSidedCompact.CompactBundle(n15_dir))` when the n15 tier is optional and
-k7-only is an acceptable fallback (the self-play client uses the latter).
+Upstream code must check each concrete configured table's coverage and invoke
+that table's lookup directly. Do not recreate an implicit combined/fallback
+table. k7 takes precedence when both configured tables cover a position.
 
 Environment overrides are reserved for unusual deployments:
 

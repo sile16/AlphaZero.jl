@@ -1,6 +1,4 @@
 using AlphaZero
-using AlphaZero.Examples: games, experiments
-using AlphaZero.Scripts: dummy_run, test_game
 
 using Base.Filesystem: rm
 using Test
@@ -8,17 +6,16 @@ using Test
 const CI = get(ENV, "CI", nothing) == "true"
 const FULL = !CI
 
-@testset "Testing Games" begin
-  test_game(games["tictactoe"])
-  @test true
-end
-
 @testset "Backgammon Inference Regressions" begin
   include("test_backgammon_inference_regressions.jl")
 end
 
 @testset "Backgammon Training Artifact Integration" begin
   include("test_backgammon_training_artifact.jl")
+end
+
+@testset "Backgammon Runtime Contracts" begin
+  include("test_backgammon_runtime_contracts.jl")
 end
 
 @testset "Multihead Regressions" begin

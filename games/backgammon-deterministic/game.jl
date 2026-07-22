@@ -530,31 +530,3 @@ end
 function GI.heuristic_value(g::GameEnv)
   return Float64(BackgammonNet.heuristic_value(g.game))
 end
-
-#####
-##### Random Baseline Player
-#####
-
-import AlphaZero: AbstractPlayer, think, reset!
-
-struct RandomPlayer <: AbstractPlayer end
-
-function think(p::RandomPlayer, game)
-  genv = game
-  mask = GI.actions_mask(genv)
-  valid_actions = findall(mask)
-
-  if isempty(valid_actions)
-    return collect(1:NUM_ACTIONS), zeros(NUM_ACTIONS)
-  end
-
-  π = zeros(NUM_ACTIONS)
-  prob = 1.0 / length(valid_actions)
-  for a in valid_actions
-    π[a] = prob
-  end
-
-  return collect(1:NUM_ACTIONS), π
-end
-
-reset!(::RandomPlayer) = nothing

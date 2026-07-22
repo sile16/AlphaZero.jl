@@ -136,9 +136,11 @@ function create_player(agent::MctsAgent; rng::Random.AbstractRNG=Random.Xoshiro(
             sim_budget_fn=agent.sim_budget_fn,
             rng=rng)
     end
-    # Exotic chance modes (stratified, progressive) need classic MctsPlayer
-    MctsPlayer = getfield(parentmodule(@__MODULE__), :MctsPlayer)
-    return MctsPlayer(agent.gspec, agent.oracle, agent.mcts_params; rng=rng)
+    # The classic single-threaded MCTS player was removed with the upstream
+    # framework. Only the batched chance modes are supported; fail loud rather
+    # than silently degrade.
+    error("Unsupported chance_mode=$(cm): only :passthrough, :full, and " *
+          ":exact_expectation are supported (classic MctsPlayer was removed).")
 end
 
 """
@@ -153,12 +155,7 @@ end
 """Reset an MCTS player's tree between games."""
 function _reset_player!(player)
     player === nothing && return
-    if player isa BatchedMCTS.BatchedMctsPlayer
-        BatchedMCTS.reset_player!(player)
-    else
-        reset_player! = getfield(parentmodule(@__MODULE__), :reset_player!)
-        reset_player!(player)
-    end
+    BatchedMCTS.reset_player!(player)
 end
 
 """
@@ -167,12 +164,7 @@ end
 Run MCTS and return the selected action, policy distribution, and legal actions.
 """
 function select_action(agent::MctsAgent, player, env)
-    actions, policy = if player isa BatchedMCTS.BatchedMctsPlayer
-        BatchedMCTS.think(player, env)
-    else
-        think = getfield(parentmodule(@__MODULE__), :think)
-        think(player, env)
-    end
+    actions, policy = BatchedMCTS.think(player, env)
     return (actions, Float32.(policy), actions)
 end
 
@@ -206,15 +198,17 @@ function _agent_move(bg_agent, game)
 end
 
 function _is_contact_position(state)
-    try
-        BackgammonNet = _get_backgammonnet()
-        if state isa BackgammonNet.BackgammonGame
-            return BackgammonNet.is_contact_position(state)
-        end
-    catch
-        # BackgammonNet not available — default to contact
+    # Resolve BackgammonNet without masking errors: if it genuinely isn't loaded
+    # (a non-backgammon context has no contact concept) default to contact, but
+    # once we have a BackgammonGame, let a real is_contact_position error surface
+    # (fail-fast — do not hide engine/contract bugs behind a silent "assume contact").
+    mod = Base.get_extension(parentmodule(@__MODULE__), :BackgammonNet)
+    mod === nothing && (mod = isdefined(Main, :BackgammonNet) ? Main.BackgammonNet : nothing)
+    mod === nothing && return true
+    if state isa mod.BackgammonGame
+        return mod.is_contact_position(state)
     end
-    return true  # Default: assume contact
+    return true
 end
 
 function _get_backgammonnet()

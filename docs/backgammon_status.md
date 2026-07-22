@@ -14,11 +14,16 @@ frozen verified-release pin and preflight remain open TODOs below.
 
 Consumed changes (all landed, full test suite green except the deferred item):
 
-- **Bearoff tiers.** The removed n18 one-sided table and
-  `default_bearoff_onesided_dir()` were replaced by the k7 → n15 `CombinedBearoff`
-  tier (`BearoffOneSidedCompact.CompactBundle`, `default_bearoff_n15_dir()`,
-  `load_combined_bearoff`). Updated in `selfplay_client.jl`,
-  `verify_race_supervised.jl`, `verify_race_mcts.jl`, and AGENTS.md.
+- **Bearoff table ownership.** The server explicitly selects
+  `none`, `k7`, `n15`, or `k7+n15` and publishes a pinned release identity that
+  every client verifies. The client checks k7 and n15 coverage separately and
+  calls the selected concrete table directly; local optional-table discovery
+  and combined fallback dispatch were removed. Only exact k7 may emit hard or
+  truncation targets. Coherent E(R,R) n15 values are runtime MCTS leaves only.
+- **Bootstrap family routing.** Race-only bootstrap accepts only
+  `race_exact_k7` and `race_natural_exact_k7`. Dual-mode ingestion removes the
+  complete `race_candidate_indices` set from full-game gnubg artifacts, so
+  gnubg-labeled race rows cannot enter the race network.
 - **Cubeless money `:auto`.** `search_value(g, heads; mode=:auto)` is now cubeless
   for money play even with the cube enabled. The 676-head wrapper keeps the cube
   disabled, so the oracle value is the cubeless money equity; the inference

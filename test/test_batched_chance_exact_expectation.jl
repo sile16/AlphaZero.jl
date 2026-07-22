@@ -144,7 +144,7 @@ end
 const _SIMS_CE = 20000
 const _TOL_CE = 0.12    # raw points; see Rung-3 header derivation (finite-sim bias)
 
-@testset "A: chance-root value == prob-weighted expectation == :full" begin
+@testset "A: chance-root value == prob-weighted expectation" begin
     for (name, gc) in _positions_ce()
         @test BackgammonNet.is_chance_node(gc)
         empty!(_MEMO_CE)
@@ -173,14 +173,9 @@ const _TOL_CE = 0.12    # raw points; see Rung-3 header derivation (finite-sim b
             @test abs(manual - uniform) > 1e-3                    # weighting matters
         end
 
-        # Recursive :full reference.
-        envf = MCTS.Env(GSPEC_CE, _uniform_oracle_ce; gamma = 1.0, cpuct = 2.0,
-                        noise_ϵ = 0.0, noise_α = 0.0, chance_mode = :full)
-        MCTS.explore!(envf, BGD_CE.GameEnv(BackgammonNet.clone(gc), MersenneTwister(1)), _SIMS_CE)
-        full_raw = _settled_chance_raw(envf.chance_tree[BackgammonNet.clone(gc)])
-        @test abs(full_raw - manual) < _TOL_CE
-
-        # Batched :exact_expectation at batch_size = 1 and larger.
+        # Batched :exact_expectation at batch_size = 1 and larger, validated
+        # against the analytic probability-weighted expectation `manual` (the
+        # independent exact reference).
         for bs in (1, 16, 32)
             params = MctsParams(num_iters_per_turn = _SIMS_CE, cpuct = 2.0, gamma = 1.0,
                 temperature = ConstSchedule(0.0), dirichlet_noise_ϵ = 0.0,
@@ -195,12 +190,11 @@ const _TOL_CE = 0.12    # raw points; see Rung-3 header derivation (finite-sim b
             @test all(o.N > 0 for o in cinfo.outcomes)   # every outcome was visited
             bat_raw = _settled_chance_raw(cinfo)
             if abs(bat_raw - manual) >= _TOL_CE
-                @error "chance-root value off" position=name bs=bs batched=bat_raw manual=manual full=full_raw
+                @error "chance-root value off" position=name bs=bs batched=bat_raw manual=manual
             end
             @test abs(bat_raw - manual) < _TOL_CE
-            @test abs(bat_raw - full_raw) < _TOL_CE
         end
-        @info "A $name" manual=round(manual, digits=4) full=round(full_raw, digits=4)
+        @info "A $name" manual=round(manual, digits=4)
     end
 end
 

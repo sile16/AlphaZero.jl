@@ -50,12 +50,6 @@ module AlphaZero
   using .BatchedMCTS
   export BatchedMCTS
 
-  # Utilities to batch oracle calls (legacy, used by simulations.jl)
-  include("batchifier.jl")
-  using .Batchifier
-  include("async_batchifier.jl")
-  using .AsyncBatchifier
-
   # A generic network interface
   include("networks/network.jl")
   using .Network
@@ -96,23 +90,6 @@ module AlphaZero
   export Trace
   export total_reward
 
-  # Players and games
-  include("play.jl")
-  export AbstractPlayer, think, select_move, reset_player!, player_temperature
-  export MctsPlayer, TurnProgressiveMctsPlayer
-  export RandomPlayer
-  export NetworkPlayer
-  export PlayerWithTemperature
-  export EpsilonGreedyPlayer
-  export TwoPlayers
-  export Human, interactive!
-  export play_game
-
-  # Utilities for distributed games simulation (legacy, used by training.jl/session.jl)
-  include("simulations.jl")
-  export Simulator, simulate, simulate_distributed
-  export record_trace
-
   # Memory buffer to hold samples generated during self-play
   include("memory.jl")
   export MemoryBuffer, get_experience
@@ -120,31 +97,9 @@ module AlphaZero
   export EquityTargets, equity_targets_from_outcome
   export equity_vector, equity_vector_from_outcome, flip_equity_perspective
 
-  # MuZero-style reanalysis for improved sample efficiency
-  include("reanalyze.jl")
-  export ReanalyzeConfig, ReanalyzeStats
-  export get_reanalyze_metrics
-  export sample_for_reanalysis, sample_for_smart_reanalysis, count_stale_samples
-
   # Utilities to train the neural network based on collected samples
   include("learning.jl")
   export split_equity_targets
-
-  # Legacy training algorithm (used by session.jl/benchmark.jl)
-  include("training.jl")
-  export Env, train!, initial_report
-  export Handlers
-  export AlphaZeroPlayer
-
-  # A minmax player to be used as a baseline
-  include("minmax.jl")
-  using .MinMax
-  export MinMax
-
-  # Utilities to write benchmarks (legacy, used by experiments.jl/plots.jl)
-  include("benchmark.jl")
-  using .Benchmark
-  export Benchmark
 
   # We provide a library of standard network, both in Knet and Flux.
   # Which backend is used to implement this library is determined during precompilation
@@ -179,50 +134,5 @@ module AlphaZero
   include("inference/backgammon_oracles.jl")
   using .BackgammonInference
   export BackgammonInference
-
-  # A structure that contains the information necessary to replicate a training session
-  include("experiments.jl")
-  using .Experiments
-  export Experiments
-  export Experiment
-
-  # The default user interface is included here for convenience but it could be
-  # replaced or separated from the main AlphaZero.jl package (which would also
-  # enable dropping some dependencies such as Crayons or JSON3).
-  include("ui/ui.jl")
-  using .UserInterface
-  const UI = UserInterface
-  export UserInterface, UI
-  export Session, resume!, save
-  export explore
-
-  # Bridge with CommonRLInterface.jl
-  include("common_rl_intf.jl")
-  export CommonRLInterfaceWrapper
-
-  # A small library of standard examples
-  include("examples.jl")
-  export Examples
-
-  # Scripts
-  include("scripts/scripts.jl")
-  export Scripts
-
-  function __init__()
-    # OpenSpiel.jl Wrapper
-    @require OpenSpiel="ceb70bd2-fe3f-44f0-b81f-41608acaf2f2" begin
-      include("openspiel.jl")
-      export OpenSpielWrapper
-      include("openspiel_example.jl")
-      @info "AlphaZero.jl's OpenSpielWrapper loaded."
-    end
-
-    # Optional Plots.jl integration for training visualization
-    @require Plots="91a5bcdd-55d7-5caf-9e0b-520d859cae80" begin
-      @info "Plots.jl detected, visualization support available."
-      # The actual plotting functions are in UserInterface and check isdefined(:Plots)
-    end
-  end
-
 
 end

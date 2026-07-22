@@ -187,7 +187,7 @@ function parse_args()
             arg_type = Float64
             default = 0.3
 
-        # Bear-off (always enabled — clients load table locally)
+        # Exact-k7 target behavior (requires a k7-bearing table selection below)
         "--bearoff-hard-targets"
             action = :store_true
         "--bearoff-truncation"
@@ -238,10 +238,11 @@ function parse_args()
             arg_type = String
             default = "high"
 
-        # Bearoff table (fail-fast: required unless --no-bearoff)
-        "--no-bearoff"
-            help = "Explicitly run WITHOUT the exact bearoff table — disables bearoff fixed-eval, promotion gate, and exact bearoff targets. WITHOUT this flag the server REQUIRES a local k=7 table and FAILS FAST if none is found, rather than silently running as if bearoff were active (which would corrupt result interpretation)."
-            action = :store_true
+        # Bearoff tables (server-owned and fleet-pinned)
+        "--bearoff-tables"
+            help = "Explicit runtime table selection: none, k7, n15, or k7+n15. k7 is the only exact training-target source; n15 is an approximate coherent E(R,R) MCTS leaf source."
+            arg_type = String
+            default = "k7"
 
         # Fixed bearoff eval
         "--bearoff-eval-interval"
@@ -301,6 +302,8 @@ end
 const ARGS = parse_args()
 ARGS["eval_backend_quality"] in ("min", "low", "high", "max") ||
     error("--eval-backend-quality must be min, low, high, or max")
+ARGS["bearoff_tables"] in ("none", "k7", "n15", "k7+n15") ||
+    error("--bearoff-tables must be one of: none, k7, n15, k7+n15")
 ARGS["mcts_budget_mode"] in ("constant", "progressive", "turn_progressive") ||
     error("Unsupported --mcts-budget-mode=" * string(ARGS["mcts_budget_mode"]))
 if ARGS["mcts_budget_mode"] == "progressive"
@@ -379,9 +382,13 @@ include(joinpath(@__DIR__, "..", "src", "distributed", "numerical_safety.jl"))
 include(joinpath(@__DIR__, "..", "src", "distributed", "checkpoint_manager.jl"))
 include(joinpath(@__DIR__, "..", "src", "distributed", "preflight.jl"))
 include(joinpath(@__DIR__, "..", "src", "distributed", "eval_manifest.jl"))
+include(joinpath(@__DIR__, "..", "src", "distributed", "bearoff_tables.jl"))
+include(joinpath(@__DIR__, "..", "src", "distributed", "bootstrap_contract.jl"))
 using .CheckpointManager
 using .Preflight
 using .EvalManifest
+using .BearoffTables
+using .BootstrapContract
 include(joinpath(@__DIR__, "..", "src", "distributed", "server.jl"))
 include(joinpath(@__DIR__, "..", "src", "distributed", "promotion_gate.jl"))
 
@@ -484,26 +491,14 @@ if EVAL_ENABLED
         fingerprint=_eval_position_fingerprint)
 end
 
-function find_bearoff_dir_server()
-    dir = BackgammonNet.default_bearoff_k7_dir()
-    isdir(dir) && isfile(joinpath(dir, "bearoff_k7_c14.bin")) && return dir
-    error("Bearoff k7 directory not found at $dir. Set BACKGAMMONNET_BEAROFF_K7_DIR " *
-          "or place the table under $(BackgammonNet.default_bearoff_root()).")
-end
-
-# Fail-fast: the bearoff table is REQUIRED unless --no-bearoff is explicitly set.
-# find_bearoff_dir_server() errors if no local table is found — we never silently
-# fall back, so results are never misread as bearoff-anchored when they are not.
-const BEAROFF_DIR = if ARGS["no_bearoff"]
-    @warn "════════════════════════════════════════════════════════════════════\n" *
-          "  --no-bearoff SET: running WITHOUT the exact bearoff table.\n" *
-          "  Bearoff fixed-eval, promotion gate, and exact bearoff targets are\n" *
-          "  DISABLED. Do NOT interpret results as bearoff-anchored.\n" *
-          "════════════════════════════════════════════════════════════════════"
-    ""
-else
-    find_bearoff_dir_server()  # errors (fail-fast) if no local k=7 table is present
-end
+const BEAROFF_TABLE_SELECTION = BearoffTables.parse_table_selection(ARGS["bearoff_tables"])
+const BEAROFF_TABLE_IDENTITY = BearoffTables.validate_table_release(BEAROFF_TABLE_SELECTION)
+const BEAROFF_HAS_K7 = BEAROFF_TABLE_SELECTION in ("k7", "k7+n15")
+const BEAROFF_DIR = BEAROFF_HAS_K7 ? BackgammonNet.default_bearoff_k7_dir() : ""
+(ARGS["bearoff_hard_targets"] || ARGS["bearoff_truncation"]) && !BEAROFF_HAS_K7 && error(
+    "--bearoff-hard-targets and --bearoff-truncation require --bearoff-tables=k7 or k7+n15; " *
+    "n15 is not an exact training teacher")
+println("Bearoff tables: $BEAROFF_TABLE_SELECTION (server-pinned fleet contract)")
 const BEAROFF_FIXED_EVAL_ENABLED =
     ARGS["training_mode"] == "race" &&
     BEAROFF_EVAL_INTERVAL > 0 &&
@@ -744,13 +739,13 @@ function bearoff_policy_stats(state, policy_oracle, exact)
     )
 end
 
-function mcts_bearoff_action(state, player, seed::Int)
+function mcts_bearoff_action(state, agent, player, seed::Int)
     env = GameEnv(BackgammonNet.clone(state), MersenneTwister(seed))
     try
-        actions, policy = think(player, env)
+        actions, policy, _ = GameLoop.select_action(agent, player, env)
         return actions[argmax(policy)]
     finally
-        reset_player!(player)
+        player isa BatchedMCTS.BatchedMctsPlayer && BatchedMCTS.reset_player!(player)
     end
 end
 
@@ -772,7 +767,8 @@ function run_bearoff_eval!(network_to_eval, iter::Int)
         temperature=ConstSchedule(0.0),
         dirichlet_noise_ϵ=0.0,
         dirichlet_noise_α=1.0)
-    player = MctsPlayer(gspec, policy_oracle, mcts_params)
+    eval_agent = GameLoop.MctsAgent(policy_oracle, batch_oracle, mcts_params, 64, gspec)
+    player = GameLoop.create_player(eval_agent)
 
     n_raw = min(BEAROFF_EVAL_POSITIONS, length(positions))
     raw_positions = @view positions[1:n_raw]
@@ -840,7 +836,7 @@ function run_bearoff_eval!(network_to_eval, iter::Int)
         mcts_regret = Float64[]
         for (idx, state) in enumerate(mcts_positions)
             exact = exact_bearoff_action_values(state, table)
-            move = mcts_bearoff_action(state, player, ARGS["seed"] + iter * 10000 + idx)
+            move = mcts_bearoff_action(state, eval_agent, player, ARGS["seed"] + iter * 10000 + idx)
             regret = exact.best_value - exact.action_values[move]
             push!(mcts_regret, regret)
             push!(mcts_wrong, !(move in exact.optimal_actions))
@@ -969,6 +965,8 @@ if !isempty(ARGS["bootstrap_file"])
         println("\nLoading canonical bootstrap artifact from: $bootstrap_path")
         flush(stdout)
         artifact = BackgammonNet.load_training_artifact(bootstrap_path)
+        checker_indices = BootstrapContract.bootstrap_checker_indices(
+            artifact, ARGS["training_mode"])
         if !isempty(artifact.cube_states)
             @warn "Skipping $(length(artifact.cube_states)) cube-policy samples: " *
                   "the current AlphaZero network has only the 676-way checker head"
@@ -977,7 +975,8 @@ if !isempty(ARGS["bootstrap_file"])
         OBSERVATION_FORMAT === :flat || error(
             "canonical bootstrap ingestion requires BACKGAMMON_OBS_TYPE=*_flat; " *
             "got $(OBSERVATION_TYPE)")
-        n_bootstrap = length(artifact.states)
+        n_artifact = length(artifact.states)
+        n_bootstrap = length(checker_indices)
         max_load = ARGS["bootstrap_max_samples"] > 0 ?
             min(ARGS["bootstrap_max_samples"], BUFFER_CAPACITY) :
             min(n_bootstrap, BUFFER_CAPACITY)
@@ -987,10 +986,11 @@ if !isempty(ARGS["bootstrap_file"])
         for start_idx in 1:chunk_size:max_load
             end_idx = min(start_idx + chunk_size - 1, max_load)
             n = end_idx - start_idx + 1
+            source_indices = @view checker_indices[start_idx:end_idx]
             batch = BackgammonNet.TrainingBatch(
                 n; kind=BackgammonNet.ACTION_TYPE_CHECKERS,
                 tier=OBSERVATION_TIER, format=:flat)
-            BackgammonNet.fill_training_batch!(batch, artifact, start_idx:end_idx)
+            BackgammonNet.fill_training_batch!(batch, artifact, source_indices)
 
             states = @view batch.observations[:, 1:n]
             policies = @view batch.policies[:, 1:n]
@@ -1001,7 +1001,7 @@ if !isempty(ARGS["bootstrap_file"])
             is_contact = Vector{Bool}(undef, n)
             is_bearoff = Vector{Bool}(undef, n)
             for j in 1:n
-                game = artifact.states[start_idx + j - 1]
+                game = artifact.states[source_indices[j]]
                 is_chance[j] = BackgammonNet.is_chance_node(game)
                 is_contact[j] = BackgammonNet.is_contact_position(game)
                 is_bearoff[j] = BearoffK7.is_bearoff_position(game.p0, game.p1)
@@ -1015,7 +1015,8 @@ if !isempty(ARGS["bootstrap_file"])
         artifact = nothing
         GC.gc()
         t_load = time() - t0
-        println("  Loaded $loaded / $n_bootstrap bootstrap samples in $(round(t_load, digits=1))s")
+        println("  Loaded $loaded / $n_bootstrap eligible bootstrap samples " *
+                "($n_artifact artifact checker rows) in $(round(t_load, digits=1))s")
         println("  Buffer size: $(buf_length(replay_buffer))")
         let parts = partition_indices(replay_buffer)
             println("  Partition: contact=$(length(parts.contact)) race=$(length(parts.race))")
@@ -1487,13 +1488,12 @@ const SERVER_CONFIG = Dict{String, Any}(
     "temp_iter_decay" => ARGS["temp_iter_decay"],
     "temp_iter_final" => ARGS["temp_iter_final"],
     "total_iterations" => ARGS["total_iterations"],
-    # F3: propagate the server's bearoff state so --no-bearoff is CLUSTER-WIDE.
-    # When bearoff is on, clients must have the local table (they fail-fast otherwise);
-    # when off, clients run without it. Never let table presence silently diverge
-    # training targets across clients.
-    "use_bearoff" => !isempty(BEAROFF_DIR),
-    "bearoff_hard_targets" => !isempty(BEAROFF_DIR) && ARGS["bearoff_hard_targets"],
-    "bearoff_truncation" => !isempty(BEAROFF_DIR) && ARGS["bearoff_truncation"],
+    # The server owns the exact table set and release identity for the whole fleet.
+    # Clients load exactly this set and reject any local identity mismatch.
+    "bearoff_tables" => BEAROFF_TABLE_SELECTION,
+    "bearoff_table_identity" => BEAROFF_TABLE_IDENTITY,
+    "bearoff_hard_targets" => ARGS["bearoff_hard_targets"],
+    "bearoff_truncation" => ARGS["bearoff_truncation"],
     "bootstrap_only" => ARGS["bootstrap_only"],
     "training_mode" => ARGS["training_mode"],
     "start_positions_file" => basename(ARGS["start_positions_file"]),
