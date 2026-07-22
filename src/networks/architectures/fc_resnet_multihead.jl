@@ -48,17 +48,21 @@ E = (2*p_win - 1) + (p_wg - p_lg) + (p_wbg - p_lbg)
 
 Returns a value in approximately [-3, +3] range.
 """
-function compute_equity(e::EquityOutput)
-  return (2f0 * e.p_win - 1f0) +
-         (e.p_gammon_win - e.p_gammon_loss) +
-         (e.p_bg_win - e.p_bg_loss)
-end
+compute_equity(e::EquityOutput) = compute_equity(
+  e.p_win, e.p_gammon_win, e.p_bg_win, e.p_gammon_loss, e.p_bg_loss)
 
 """
     compute_equity(p_win, p_gammon_win, p_bg_win, p_gammon_loss, p_bg_loss)
 
-Compute equity from individual probability values (for batched computation).
-Uses joint formula: `(2*pw - 1) + (wg - lg) + (wbg - lbg)`
+Vectorized joint money-equity kernel: `(2*pw - 1) + (wg - lg) + (wbg - lbg)`.
+
+This is the batched/autodiff-friendly mirror of
+`BackgammonNet.compute_equity_joint`, which is the canonical single-position
+implementation but is scalar-only (its `2*pw - 1` form does not broadcast, so it
+cannot flow through Flux batched arrays). We keep this one local vectorized copy
+for the differentiable forward pass; it is locked to `compute_equity_joint` by an
+equivalence test (see `test/test_multihead.jl`). Do not add a second copy of the
+formula — reuse this method.
 """
 function compute_equity(p_win, p_gammon_win, p_bg_win, p_gammon_loss, p_bg_loss)
   return (2f0 .* p_win .- 1f0) .+
@@ -217,8 +221,12 @@ function Network.forward(nn::FCResNetMultiHead, state)
   p_gl = Flux.sigmoid.(nn.vhead_gl(v_trunk))
   p_bgl = Flux.sigmoid.(nn.vhead_bgl(v_trunk))
 
-  # Compute combined equity for MCTS compatibility
-  # Scale from [-3, 3] range to [-1, 1] for tanh-like behavior
+  # Compute combined equity for MCTS compatibility, then normalize the 5-head
+  # money equity from its intrinsic [-3, 3] range (max = win+gammon+backgammon =
+  # 1+1+1) to [-1, 1]. The 3 is the money-equity range of the joint-head formula,
+  # NOT a game reward scale — the fast-inference kernel (src/inference/fast_weights.jl)
+  # divides by the same constant and the two are locked together by
+  # test/test_fast_inference.jl.
   equity = compute_equity(p_win, p_gw, p_bgw, p_gl, p_bgl)
   v = equity ./ 3f0  # Normalize to [-1, 1]
 

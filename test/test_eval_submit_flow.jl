@@ -166,6 +166,12 @@ end
         expected_corr = cor(nn, opp)
         @test stats.value_corr ≈ expected_corr
         @test stats.value_corr > 0
+        @test stats.contact_value_n == 3
+        @test stats.race_value_n == 3
+        @test stats.contact_value_mse ≈ 0.01
+        @test stats.race_value_mse ≈ 0.01
+        @test stats.contact_value_corr ≈ cor(nn[[1, 2, 5]], opp[[1, 2, 5]])
+        @test stats.race_value_corr ≈ cor(nn[[3, 4, 6]], opp[[3, 4, 6]])
     end
 
     @testset "Edge: empty value data" begin
@@ -182,6 +188,8 @@ end
         stats = finalize_eval(job)
         @test stats.value_mse == 0.0
         @test stats.value_corr == 0.0
+        @test stats.contact_value_n == 0
+        @test stats.race_value_n == 0
         @test stats.num_games == 4
     end
 
@@ -200,6 +208,8 @@ end
         # Only 1 value sample — below the 2-sample threshold
         @test stats.value_mse == 0.0
         @test stats.value_corr == 0.0
+        @test stats.contact_value_n == 1
+        @test stats.race_value_n == 0
     end
 
     @testset "Edge: single chunk job" begin

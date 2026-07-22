@@ -389,6 +389,10 @@ function fast_forward_normalized_heads!(fw::FastWeights, fb::FastBuffers,
         fb.heads[4, j] = p_lg
         fb.heads[5, j] = p_lbg
         # Joint equity formula: (2pw-1) + (wg-lg) + (wbg-lbg), normalized to [-1,1]
+        # by reward_scale (== 3). This is the scalar inline of
+        # BackgammonNet.compute_equity_joint kept for the hot per-position kernel;
+        # it is locked to that canonical function + FluxLib.compute_equity by the
+        # oracle-parity and equivalence tests. Keep the three in sync.
         V_equity[j] = ((2.0f0 * p_win - 1.0f0) + (p_wg - p_lg) + (p_wbg - p_lbg)) / 3.0f0
     end
 

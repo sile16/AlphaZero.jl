@@ -56,8 +56,8 @@ const _P1_IDX_CE = (1, 2, 3, 4, 5, 6, 7)
 
 """Pre-dice CHANCE-node game (dice unrolled) with player `cp` on roll."""
 _chance_game_ce(p0, p1, cp) =
-    BackgammonGame(p0, p1, SVector{2, Int8}(0, 0), Int8(0), Int8(cp), false, 0.0f0;
-                   obs_type = :minimal_flat)
+    BGD_CE.backgammon_game(p0, p1, SVector{2, Int8}(0, 0), Int8(0), Int8(cp), false, 0.0f0;
+                           observation_type = :minimal_flat)
 
 # ── Uniform-prior, V=0 oracle (interior frontier truncation only) ────────────
 function _uniform_oracle_ce(state)

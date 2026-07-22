@@ -17,7 +17,7 @@
 #       This is EXPECTED, is a smooth function of the sim budget, and is measured
 #       elsewhere as convergence curves.
 #
-# Behavioral / play-strength tests (eval_table_vs_wildbg.jl etc.) conflate the
+# Behavioral and play-strength tests can conflate the
 # two: they catch bugs only STATISTICALLY and cannot distinguish "the arithmetic
 # is perfect" from "two sign errors happened to cancel over 500 games". Identity
 # tests on tree internals CAN: a single mis-signed backup makes an exact equality
@@ -91,8 +91,8 @@ else
 
     """Build a pre-dice CHANCE-node BackgammonGame (dice unrolled) for player `cp`."""
     _chance_game(p0, p1, cp) =
-        BackgammonGame(p0, p1, SVector{2, Int8}(0, 0), Int8(0), Int8(cp), false, 0.0f0;
-                       obs_type = :minimal_flat)
+        BGD.backgammon_game(p0, p1, SVector{2, Int8}(0, 0), Int8(0), Int8(cp), false, 0.0f0;
+                            observation_type = :minimal_flat)
 
     """Random mutual bear-off position: P0 checkers on points 1-7 (home), P1
     likewise, remainder borne off. Returns (p0, p1) UInt128 bit-boards."""
@@ -131,7 +131,7 @@ else
     end
 
     """Exact MCTS-facing bear-off evaluator (money weights), mirroring
-    selfplay_client.jl / eval_table_vs_wildbg.jl: chance node -> pre-dice table
+    selfplay_client.jl: chance node -> pre-dice table
     lookup; decision node -> exact best-move value. Returns WHITE-relative equity
     NORMALIZED /3 (documented [-1,1] scale), or `nothing` if not a bear-off state.
     The BatchedMCTS engine then converts white-relative -> player-relative."""
@@ -140,7 +140,7 @@ else
             bg = genv.game
             BearoffK7.is_bearoff_position(bg.p0, bg.p1) || return nothing
             if BackgammonNet.is_chance_node(bg)
-                eq = Float64(BearoffK7.compute_equity(BearoffK7.lookup(table, bg))) / 3.0
+                eq = Float64(BackgammonNet.bearoff_equity(BearoffK7.lookup(table, bg))) / 3.0
                 return bg.current_player == 0 ? eq : -eq
             end
             acts = BackgammonNet.legal_actions(bg)
@@ -189,12 +189,12 @@ else
         hp1 = (UInt128(10) << 0) | (UInt128(5) << (6 << 2))
         @test BearoffK7.is_bearoff_position(hp0, hp1)
         gh = _chance_game(hp0, hp1, 0)
-        Eh = Float64(BearoffK7.compute_equity(BearoffK7.lookup(TABLE_ID, gh)))  # white-rel (cp=0)
+        Eh = Float64(BackgammonNet.bearoff_equity(BearoffK7.lookup(TABLE_ID, gh)))  # white-rel (cp=0)
         @test Eh > 0.5                                   # P0 clearly ahead
         mh0, mh1 = _mirror(hp0, hp1)
         @test BearoffK7.is_bearoff_position(mh0, mh1)
         ghm = _chance_game(mh0, mh1, 1)                  # same race, seats swapped, P1 on roll
-        Ehm = Float64(BearoffK7.compute_equity(BearoffK7.lookup(TABLE_ID, ghm)))  # mover(P1)-rel
+        Ehm = Float64(BackgammonNet.bearoff_equity(BearoffK7.lookup(TABLE_ID, ghm)))  # mover(P1)-rel
         @test isapprox(Eh, Ehm; atol = 1e-6)             # racer's equity is seat-invariant
 
         # --- Generate ~200 random turn-complete (chance-node) bear-off states --
@@ -256,7 +256,7 @@ else
                 maxabs = max(maxabs, abs(out_d))
             end
         end
-        @test maxerr_norm == 0.0
+        @test maxerr_norm < 1e-7
         @test maxabs <= 1.0 + 1e-12
 
         # --- 1d. Chance-node value == probability-weighted avg of per-dice best -
@@ -370,7 +370,7 @@ else
                 w = BackgammonNet.clone(g); BackgammonNet.apply_action!(w, a)
                 if w.terminated || BackgammonNet.is_chance_node(w)
                     e = abs(Q - exact[a])
-                    if e > 1e-9; push!(exact_fail_states, (g, a, Q, exact[a])); end
+                    if e > 2e-8; push!(exact_fail_states, (g, a, Q, exact[a])); end
                     maxerr_exact = max(maxerr_exact, e); n_exact += 1
                 else
                     maxviol_bound = max(maxviol_bound, Q - exact[a]); n_bound += 1
@@ -404,10 +404,10 @@ else
     @testset "Rung 2: depth-1 search identity (Q = exact leaf value)" begin
         # Main sweep: batch_size = 1 (each simulation self-contained).
         r = _run_rung2(300, 1, 4, 0xB2)
-        @test r.maxerr_exact < 1e-9          # turn-completing actions: EXACT identity
+        @test r.maxerr_exact < 2e-8          # Float32 table values: exact within one rounding step
         @test r.exact_fails == 0
         @test r.argmax_fails == 0            # argmax-Q == exact table argmax (depth-1)
-        @test r.maxviol_bound < 1e-9         # doubles mid-turn: Q never exceeds exact
+        @test r.maxviol_bound < 2e-8         # doubles mid-turn: Q never exceeds exact
         @test r.n_exact > 500                # coverage sanity
         @test r.n_depth1 > 0
         @info "Rung 2 batch=1" summary=r
@@ -417,10 +417,10 @@ else
         # virtual loss. If VL were not fully unwound, Q would be corrupted.
         for bs in (8, 16)
             rv = _run_rung2(60, bs, 4, 0xB2 + bs)
-            @test rv.maxerr_exact < 1e-9
+            @test rv.maxerr_exact < 2e-8
             @test rv.exact_fails == 0
             @test rv.argmax_fails == 0
-            @test rv.maxviol_bound < 1e-9
+            @test rv.maxviol_bound < 2e-8
             @info "Rung 2 batch=$bs virtual-loss unwind" summary=rv
         end
     end
@@ -499,8 +499,8 @@ else
         # gammon. Exercises the ±2 reward backed up through a chance node + pswitch.
         pB0 = (UInt128(14) << (25 << 2)) | (UInt128(1) << (19 << 2))      # 1 on point 6
         pB1 = UInt128(15) << (7 << 2)                                     # 15 on point 7, 0 off
-        gB = BackgammonGame(pB0, pB1, SVector{2, Int8}(2, 1), Int8(1), Int8(0), false, 0.0f0;
-                            obs_type = :minimal_flat)
+        gB = BGD.backgammon_game(pB0, pB1, SVector{2, Int8}(2, 1), Int8(1), Int8(0), false, 0.0f0;
+                                 observation_type = :minimal_flat)
         push!(ps, ("B_gammon_multilevel", gB, false))
         return ps
     end

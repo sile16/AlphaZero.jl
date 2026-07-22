@@ -3,7 +3,7 @@
 verify_race_mcts.jl — does MCTS on top of the race net LOWER move-regret vs the raw policy?
 
 For a subsample of exact-table-labeled race positions, compares two move choices against
-the EXACT n18 table:
+the EXACT combined k7→n15 race table:
   - raw  : argmax of the net's policy head
   - mcts : the move selected by the production BatchedMCTS search (NN evaluator only —
            no exact-table leaf, so this isolates the SEARCH contribution)
@@ -37,9 +37,9 @@ const WIDTH  = parse(Int, something(parse_arg(ARGS, "width"), "128"))
 const BLOCKS = parse(Int, something(parse_arg(ARGS, "blocks"), "3"))
 const NSUB   = parse(Int, something(parse_arg(ARGS, "n"), "2000"))
 const ITERS  = parse(Int, something(parse_arg(ARGS, "iters"), "100"))
-const ONESIDED_DIR = something(parse_arg(ARGS, "table-dir"),
-    joinpath(homedir(), "github", "BackgammonNet.jl", "data", "bearoff", "bearoff_n18"))
-const K7_DIR = joinpath(homedir(), "github", "BackgammonNet.jl", "data", "bearoff", "bearoff_k7_twosided")
+const N15_DIR = something(parse_arg(ARGS, "table-dir"),
+    BackgammonNet.default_bearoff_n15_dir())
+const K7_DIR = BackgammonNet.default_bearoff_k7_dir()
 
 ENV["BACKGAMMON_OBS_TYPE"] = something(parse_arg(ARGS, "obs-type"), "min_plus_flat")
 include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
@@ -62,7 +62,7 @@ function main()
     d = deserialize(TEST)
     n = min(NSUB, length(d.states))
     println("Test positions: $n (of $(length(d.states)))   MCTS iters: $ITERS")
-    table = load_combined_bearoff(; k7_dir=K7_DIR, onesided_dir=ONESIDED_DIR)
+    table = load_combined_bearoff(; k7_dir=K7_DIR, n15_dir=N15_DIR)
     scratch = BackgammonNet.clone(d.states[1])
 
     net = FluxLib.FCResNetMultiHead(gspec, FluxLib.FCResNetMultiHeadHP(width=WIDTH, num_blocks=BLOCKS))

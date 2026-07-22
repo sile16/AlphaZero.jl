@@ -105,6 +105,15 @@ Return the game state.
 """
 function current_state end
 
+"""
+    state_key(::AbstractGameSpec, state)
+
+Return an immutable, comparable key for MCTS/transposition-table storage.
+The default uses the state itself. Games backed by mutable identity-keyed
+states should return a structural snapshot instead.
+"""
+state_key(::AbstractGameSpec, state) = state
+
 # TODO: maybe MCTS should make the copy itself. The performance cost should not be great
 # and it would probably avoid people a lot of pain.
 
@@ -398,8 +407,8 @@ function read_state end
 
 Return the state type associated to a game.
 
-State objects must be persistent or appear as such as they are stored into
-the MCTS tree without copying. They also have to be comparable and hashable.
+State objects must be persistent or appear as such. Their [`state_key`](@ref)
+values must be comparable and hashable.
 """
 function state_type(game_spec::AbstractGameSpec)
   return typeof(current_state(init(game_spec)))

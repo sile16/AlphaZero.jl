@@ -1,5 +1,10 @@
 # SOTA AlphaZero-Style Backgammon Report, 2026
 
+> This is an architecture research reference, not an experiment log. Any GNUBG,
+> WildBG, BGBlitz, PR, equity, or play-strength number cited here is external or
+> historical context and is not a validated AlphaZero result. Current project
+> status lives in [`backgammon_status.md`](backgammon_status.md).
+
 **Topic:** MCTS structure, stochastic/chance nodes, temperature scaling, dice handling, MuZero vs AlphaZero, observation design, neural-network design, training procedure, and reduced-hardware guidance for building a strong AlphaZero-style backgammon engine.
 
 **Main conclusion:** the best practical architecture for backgammon in 2026 is not vanilla AlphaZero and not deterministic MuZero. It is an **Explicit-Chance Gumbel AlphaZero** system:

@@ -72,17 +72,61 @@ end
         @test GI.parse_action(gspec, "Bar | 5") == BackgammonNet.encode_action(BackgammonNet.BAR_LOC, 5)
         @test GI.parse_action(gspec, "Pass | Pass") ==
               BackgammonNet.encode_action(BackgammonNet.PASS_LOC, BackgammonNet.PASS_LOC)
-        @test GI.parse_action(gspec, "No Double") == BackgammonNet.ACTION_CUBE_NO_DOUBLE
-        @test GI.parse_action(gspec, "Double") == BackgammonNet.ACTION_CUBE_DOUBLE
-        @test GI.parse_action(gspec, "Take") == BackgammonNet.ACTION_CUBE_TAKE
-        @test GI.parse_action(gspec, "Drop") == BackgammonNet.ACTION_CUBE_PASS
+        @test GI.parse_action(gspec, "No Double") === nothing
+        @test GI.parse_action(gspec, "Double") === nothing
+        @test GI.parse_action(gspec, "Take") === nothing
+        @test GI.parse_action(gspec, "Drop") === nothing
 
         env = GI.init(gspec)
         @test env.game.cube_enabled == BGD.CUBE_ENABLED
         @test env.game.jacoby_enabled == BGD.JACOBY_ENABLED
+        @test env.game.tavla == BGD.TAVLA_ENABLED
+        @test env.game.phase != BackgammonNet.PHASE_OPENING_ROLL
+        @test !env.game.doubles_only
         @test GI.heuristic_value(env) ≈ Float64(BackgammonNet.heuristic_value(env.game)) atol=1e-12
 
-        disabled_game = BackgammonNet.initial_state(cube_enabled=false, jacoby_enabled=false, obs_type=:minimal_flat)
+        first_roll_env = BGD.GameEnv(
+            BackgammonNet.initial_state(first_player=0, obs_tier=:minimal, obs_format=:flat),
+            MersenneTwister(500),
+        )
+        @test first_roll_env.game.phase == BackgammonNet.PHASE_CHANCE
+        @test length(GI.chance_outcomes(first_roll_env)) == 21
+        @test sum(last, GI.chance_outcomes(first_roll_env)) ≈ 1.0
+        @test GI.num_chance_outcomes(gspec) == 21
+        GI.apply_chance!(first_roll_env, 21) # 6-6 is legal on the ML opening roll
+        @test first_roll_env.game.phase == BackgammonNet.PHASE_CHECKER_PLAY
+        @test Tuple(first_roll_env.game.dice) == (6, 6)
+
+        @test_throws ArgumentError BGD.GameEnv(
+            BackgammonNet.initial_state(obs_tier=:minimal, obs_format=:flat),
+            MersenneTwister(501),
+        )
+        @test_throws ArgumentError BGD.GameEnv(
+            BackgammonNet.initial_state(first_player=0, doubles_only=true,
+                                        obs_tier=:minimal, obs_format=:flat),
+            MersenneTwister(502),
+        )
+
+        seeded_rng_a = Random.Xoshiro(0xabc123)
+        seeded_rng_b = Random.Xoshiro(0xabc123)
+        seeded_env_a = BGD.init_with_rng(gspec, seeded_rng_a)
+        seeded_env_b = BGD.init_with_rng(gspec, seeded_rng_b)
+        @test seeded_env_a.rng === seeded_rng_a
+        @test seeded_env_b.rng === seeded_rng_b
+        @test BackgammonNet.game_state_fingerprint(seeded_env_a.game) ==
+              BackgammonNet.game_state_fingerprint(seeded_env_b.game)
+        @test seeded_env_a.game.current_player == seeded_env_b.game.current_player
+        @test seeded_env_a.game.dice == seeded_env_b.game.dice
+        @test rand(seeded_rng_a, UInt64) == rand(seeded_rng_b, UInt64)
+
+        ml_contract = BGD.backgammon_ml_contract(gspec)
+        @test ml_contract["state_dim"] == BGD.OBS_SIZE
+        @test ml_contract["num_actions"] == BackgammonNet.CHECKER_ACTIONS
+        @test ml_contract["chance_outcomes"] == 21
+        @test ml_contract["opening_rule"] == "uniform_first_player_fresh_21_v1"
+
+        disabled_game = BackgammonNet.initial_state(first_player=0, cube_enabled=false,
+            jacoby_enabled=false, obs_tier=:minimal, obs_format=:flat)
         BackgammonNet.sample_chance!(disabled_game, MersenneTwister(501))
         ctx = BackgammonNet.context_observation(disabled_game)
         @test ctx[5:7] == Float32[0, 0, 0]  # cube ownership all-zero means cube disabled
@@ -93,22 +137,22 @@ end
         cube_env.game.cube_owner = Int8(-1)
         cube_env.game.phase = BackgammonNet.PHASE_CUBE_DECISION
         @test BackgammonNet.may_double(cube_env.game)
-        @test GI.available_actions(cube_env) == [BackgammonNet.ACTION_CUBE_NO_DOUBLE, BackgammonNet.ACTION_CUBE_DOUBLE]
+        @test isempty(GI.available_actions(cube_env))
         cube_mask = GI.actions_mask(cube_env)
-        @test length(cube_mask) == BackgammonNet.MAX_ACTIONS
-        @test findall(cube_mask) == [BackgammonNet.ACTION_CUBE_NO_DOUBLE, BackgammonNet.ACTION_CUBE_DOUBLE]
+        @test length(cube_mask) == BackgammonNet.CHECKER_ACTIONS
+        @test !any(cube_mask)
 
         response_env = GI.init(gspec)
         response_env.game.cube_enabled = true
         response_env.game.phase = BackgammonNet.PHASE_CUBE_RESPONSE
-        @test GI.available_actions(response_env) == [BackgammonNet.ACTION_CUBE_TAKE, BackgammonNet.ACTION_CUBE_PASS]
+        @test isempty(GI.available_actions(response_env))
 
         env.game.terminated = true
         env.game.reward = 2.0f0
         env.game.current_player = Int8(0)
-        @test GI.heuristic_value(env) == 2.0
+        @test GI.heuristic_value(env) == 1.0
         env.game.current_player = Int8(1)
-        @test GI.heuristic_value(env) == -2.0
+        @test GI.heuristic_value(env) == -1.0
     end
 
     @testset "current_state returns owning clone" begin
@@ -181,7 +225,9 @@ end
             @test direct_mask == env_mask
             @test direct_actions == findall(direct_mask)
             @test hash(state) == hash_before
-            @test state == state_before
+            @test BackgammonNet.fingerprints_equal(
+                BackgammonNet.game_state_fingerprint(state),
+                BackgammonNet.game_state_fingerprint(state_before))
             @test GI.vectorize_state(gspec, state) == vec_before
             @test state._actions_cached == actions_cached_before
             @test state._actions_buffer === actions_buffer_id
@@ -272,7 +318,13 @@ end
         end
     end
 
-    @testset "shared backgammon oracles use cubeful search value" begin
+    @testset "shared backgammon oracles use cubeless money search value" begin
+        # BackgammonNet contract: for money play (p0_away = p1_away = 0),
+        # search_value(mode=:auto) is cubeless EVEN when the cube is enabled
+        # (see BackgammonNet equity.jl: "Money-play :auto is intentionally
+        # cubeless even when the cube is enabled"). The 676-head wrapper keeps
+        # the cube disabled, so the per-position oracle value is the cubeless
+        # money equity whether or not the cube flag happens to be set.
         heads = (0.62f0, 0.18f0, 0.04f0, 0.11f0, 0.03f0)
         contact_net = force_constant_heads!(
             FluxLib.FCResNetMultiHead(gspec, FluxLib.FCResNetMultiHeadHP(width=32, num_blocks=1)),
@@ -286,12 +338,15 @@ end
 
         raw_value = BackgammonNet.compute_equity_joint(heads) / 3.0f0
         expected = BackgammonNet.search_value(state, heads; mode=:auto)
-        @test !isapprox(expected, raw_value; atol=1f-3)
+        # Cube enabled but money play → cubeless money equity (no cube adjustment).
+        @test isapprox(expected, raw_value; atol=1f-6)
 
         disabled_state = BackgammonNet.clone(state)
         disabled_state.cube_enabled = false
         expected_disabled = BackgammonNet.search_value(disabled_state, heads; mode=:auto)
         @test isapprox(expected_disabled, raw_value; atol=1f-6)
+        # Cube-enabled and cube-disabled money positions agree under the contract.
+        @test isapprox(expected, expected_disabled; atol=1f-6)
 
         for backend in (:fast, :flux)
             _, batch_oracle = AlphaZero.BackgammonInference.make_cpu_oracles(

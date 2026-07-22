@@ -32,9 +32,9 @@ const WIDTH = parse(Int, something(parse_arg(ARGS, "width"), "128"))
 const BLOCKS = parse(Int, something(parse_arg(ARGS, "blocks"), "3"))
 const BATCH = parse(Int, something(parse_arg(ARGS, "batch"), "4096"))
 
-const ONESIDED_DIR = something(parse_arg(ARGS, "table-dir"),
-    joinpath(homedir(), "github", "BackgammonNet.jl", "data", "bearoff", "bearoff_n18"))
-const K7_DIR = joinpath(homedir(), "github", "BackgammonNet.jl", "data", "bearoff", "bearoff_k7_twosided")
+const N15_DIR = something(parse_arg(ARGS, "table-dir"),
+    BackgammonNet.default_bearoff_n15_dir())
+const K7_DIR = BackgammonNet.default_bearoff_k7_dir()
 
 ENV["BACKGAMMON_OBS_TYPE"] = something(parse_arg(ARGS, "obs-type"), "min_plus_flat")
 include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
@@ -59,10 +59,10 @@ function main()
     println("Loading test set: $TEST")
     d = deserialize(TEST)
     n = length(d.states)
-    println("  $n positions, obs=$(d.states[1].obs_type), state_dim=$_state_dim")
+    println("  $n positions, obs=$(d.states[1].obs_tier)_$(d.states[1].obs_format), state_dim=$_state_dim")
 
-    table = (isdir(ONESIDED_DIR) && isdir(K7_DIR)) ? (print("Loading combined table for move-regret... ");
-        t = load_combined_bearoff(; k7_dir=K7_DIR, onesided_dir=ONESIDED_DIR); println("done."); t) : nothing
+    table = (isdir(N15_DIR) && isdir(K7_DIR)) ? (print("Loading combined table for move-regret... ");
+        t = load_combined_bearoff(; k7_dir=K7_DIR, n15_dir=N15_DIR); println("done."); t) : nothing
     table === nothing && println("  (tables not found — skipping move-regret)")
     scratch = BackgammonNet.clone(d.states[1])
     regret = Float64[]

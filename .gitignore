@@ -15,9 +15,9 @@ logs
 results
 wandb
 *.log
-archive
-
-TODO.md
+LocalPreferences.toml
+data_quality_report.json
+data_quality_report.md
 
 # Local-only data and tool caches
 .CondaPkg/

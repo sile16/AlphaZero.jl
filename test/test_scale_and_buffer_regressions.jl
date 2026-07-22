@@ -12,6 +12,7 @@
 using Test
 using Random
 using StaticArrays
+using Serialization
 
 using AlphaZero
 using AlphaZero: GI, MCTS, BatchedMCTS
@@ -38,9 +39,9 @@ const BGD_SB = Main.BackgammonDeterministic
     # (raw reward 2.0). Normalized Q at the root must be 2/3.
     p0 = (UInt128(14) << (25 * 4)) | (UInt128(1) << (24 * 4))
     p1 = (UInt128(5) << (1 * 4)) | (UInt128(5) << (2 * 4)) | (UInt128(5) << (3 * 4))
-    bg = BackgammonNet.BackgammonGame(
+    bg = BGD_SB.backgammon_game(
         p0, p1, SVector{2, Int8}(0, 0), Int8(0), Int8(0), false, 0.0f0;
-        obs_type=:minimal_flat)
+        observation_type=:minimal_flat)
     # Resolve the chance node deterministically (any dice bear off from pt 24)
     BackgammonNet.apply_chance!(bg, BackgammonNet.chance_outcomes(bg)[1][1])
 
@@ -58,6 +59,20 @@ const BGD_SB = Main.BackgammonDeterministic
                     cpuct=2.0, noise_ϵ=0.0, chance_mode=:passthrough)
     benv = BatchedMCTS.BatchedEnv(mcts, 8)
     BatchedMCTS.batched_explore!(benv, env, 64)
+
+    metrics = BatchedMCTS.search_metrics(benv)
+    @test metrics.simulations == 64
+    @test metrics.tree_hits > 0
+    @test metrics.tree_misses > 0
+    # This one-checker position is fully resolved by forced/terminal traversal,
+    # so it intentionally needs no NN evaluation.
+    @test metrics.nn_evaluations == 0
+    @test metrics.oracle_calls == 0
+    @test metrics.search_ns > 0
+    @test metrics.max_depth > 0
+    taken = BatchedMCTS.take_search_metrics!(benv)
+    @test taken.simulations == 64
+    @test BatchedMCTS.search_metrics(benv).simulations == 0
 
     root_state = GI.current_state(env)
     @test haskey(mcts.tree, root_state)
@@ -143,7 +158,7 @@ end
     is_chance = fill(false, n)
     is_bearoff = fill(false, n)
     per_add_batch!(buf, states, policies, values, equities, has_eq,
-                   is_chance, is_contact, is_bearoff)
+                   is_chance, is_contact, is_bearoff; source_iteration=12)
 
     parts = partition_indices(buf)
     @test length(parts.contact) == count(is_contact)
@@ -157,6 +172,7 @@ end
     contact_batch = extract_batch(buf, parts.contact)
     @test all(contact_batch.values .== 1.0f0)
     @test all(contact_batch.is_contact)
+    @test all(contact_batch.source_iterations .== Int32(12))
 end
 
 @testset "Buffer: preserves chance-node flags" begin
@@ -199,7 +215,7 @@ end
     per_anneal_beta!(buf)
 
     old_generations = copy(buf.generation)
-    reset!(buf)
+    reset_buffer!(buf)
 
     @test buf.size == 0
     @test buf.write_pos == 1
@@ -213,6 +229,7 @@ end
     @test all(.!buf.is_chance)
     @test all(.!buf.is_contact)
     @test all(.!buf.is_bearoff)
+    @test all(buf.source_iterations .== Int32(-1))
     @test all(buf.priorities .== 1.0f0)
     @test all(buf.generation .== old_generations .+ UInt32(1))
     @test partition_indices(buf) == (contact=Int[], race=Int[], all=Int[])
@@ -237,6 +254,39 @@ end
     @test batch.is_contact == Bool[true, false]
     @test batch.is_bearoff == Bool[false, true]
     @test buf.priorities[1:2] == Float32[2.5, 2.5]
+    @test batch.source_iterations == fill(Int32(-1), 2)
+end
+
+@testset "Buffer: source iteration validation and checkpoint schema" begin
+    sd, na, cap = 4, 6, 8
+    buf = PERBuffer(cap, sd, na)
+    n = 2
+    batch = (rand(Float32, sd, n), rand(Float32, na, n), rand(Float32, n),
+             rand(Float32, 5, n), fill(true, n), fill(false, n),
+             fill(true, n), fill(false, n))
+    @test_throws ArgumentError per_add_batch!(buf, batch...; source_iteration=-2)
+    @test buf.size == 0
+    per_add_batch!(buf, batch...; source_iteration=23)
+
+    mktempdir() do dir
+        current_path = joinpath(dir, "current.bin")
+        save_buffer(buf, current_path)
+        restored = PERBuffer(cap, sd, na)
+        load_buffer!(restored, current_path)
+        @test restored.source_iterations[1:n] == fill(Int32(23), n)
+
+        invalid_data = Serialization.deserialize(current_path)
+        delete!(invalid_data, "source_iterations")
+        invalid_path = joinpath(dir, "missing-provenance.bin")
+        Serialization.serialize(invalid_path, invalid_data)
+        @test_throws ArgumentError load_buffer!(PERBuffer(cap, sd, na), invalid_path)
+
+        invalid_data = Serialization.deserialize(current_path)
+        invalid_data["schema_version"] = 0
+        invalid_path = joinpath(dir, "old-schema.bin")
+        Serialization.serialize(invalid_path, invalid_data)
+        @test_throws ArgumentError load_buffer!(PERBuffer(cap, sd, na), invalid_path)
+    end
 end
 
 @testset "Buffer: clear_for_selfplay! establishes the reset invariant" begin
@@ -249,7 +299,7 @@ end
     per_add_batch!(buf, s, p, vals, e, h, ch, c, b; initial_priority=3.0f0)
     gens = copy(buf.generation)
 
-    clear_for_selfplay!(buf)   # semantic alias for reset! — same invariant
+    clear_for_selfplay!(buf)
 
     @test buf.size == 0
     @test buf.write_pos == 1

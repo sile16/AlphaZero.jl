@@ -8,13 +8,14 @@
 #
 # Configuration:
 # - short_game=true: Faster games with pieces closer to bearing off
-# - doubles_only=true: Only doubles dice rolls (simpler game)
-# - OBSERVATION_TYPE: baseline :min_plus_flat (350). Also :minimal_flat (344), :full_flat (376),
-#   :biased_flat (436), :minimal (44×1×26), :full (76×1×26)
+# - every ML dice node has the standard 21 outcomes, including the first roll
+# - BACKGAMMON_TAVLA_ENABLED=true: Tavla scoring (backgammons pay as gammons)
+# - OBSERVATION_TYPE: baseline :min_plus_flat (352). Also :minimal_flat (346), :full_flat (378),
+#   :biased_flat (438), :minimal (46×1×26), :full (78×1×26)
 # NOTE: OBS_TYPE_STR is a const read from ENV at PRECOMPILE time (baked). Changing
 #   BACKGAMMON_OBS_TYPE at runtime has no effect without a recompile — change the default below.
 #
-# BackgammonNet v0.6.4+ required
+# BackgammonNet v0.7.0+ required
 
 import AlphaZero.GI
 using StaticArrays
@@ -25,7 +26,6 @@ using BackgammonNet
 
 # Configuration constants
 const SHORT_GAME = true  # Shorter games for faster learning (intentionally different starting position)
-const DOUBLES_ONLY = false  # Full 21 dice outcomes for proper stochastic testing
 
 _env_bool(name::String, default::Bool) = begin
   v = lowercase(strip(get(ENV, name, default ? "true" : "false")))
@@ -36,17 +36,23 @@ end
 
 const CUBE_ENABLED = _env_bool("BACKGAMMON_CUBE_ENABLED", false)
 const JACOBY_ENABLED = _env_bool("BACKGAMMON_JACOBY_ENABLED", CUBE_ENABLED)
+const TAVLA_ENABLED = _env_bool("BACKGAMMON_TAVLA_ENABLED", false)
+const STRICT_STATE_CHECKS = _env_bool("BACKGAMMON_STRICT_STATE_CHECKS", false)
+CUBE_ENABLED && error(
+  "BACKGAMMON_CUBE_ENABLED=true is unsupported by the current 676-action " *
+  "checker-policy network; add split cube-policy heads before enabling it")
 
-# Observation type: Symbol-based configuration (v0.3.2+)
+# AlphaZero uses one configuration name and translates it to BackgammonNet's
+# separate observation tier and format arguments.
 # Can be overridden via environment variable BACKGAMMON_OBS_TYPE
 # Available types (flat = MLP input, conv = tensor, hybrid = named tuple):
-#   :minimal_flat (344)       - Flat vector for MLP (RECOMMENDED)
+#   :minimal_flat (346)       - Flat vector for MLP (RECOMMENDED)
 #   :min_plus_flat            - Flat vector with additional features
 #   :full_flat                - Flat vector with all features
 #   :biased_flat              - Flat vector with heuristic features
-#   :minimal (44×1×26)        - Tensor for conv networks
+#   :minimal (46×1×26)        - Tensor for conv networks
 #   :min_plus                 - Tensor with additional features
-#   :full (62×1×26)           - Tensor with all features
+#   :full (78×1×26)           - Tensor with all features
 #   :minimal_hybrid           - Named tuple (board=12×26, globals) for hybrid nets
 #   :min_plus_hybrid          - Named tuple with additional globals
 #   :full_hybrid              - Named tuple with all globals
@@ -65,7 +71,24 @@ const OBS_TYPE_MAP = Dict(
     "biased_hybrid" => :biased_hybrid,
 )
 const OBS_TYPE_STR = get(ENV, "BACKGAMMON_OBS_TYPE", "min_plus_flat")
-const OBSERVATION_TYPE = get(OBS_TYPE_MAP, OBS_TYPE_STR, :minimal_flat)
+const OBSERVATION_TYPE = get(OBS_TYPE_MAP, OBS_TYPE_STR) do
+    error("Unsupported BACKGAMMON_OBS_TYPE=$OBS_TYPE_STR; expected one of " *
+          join(sort!(collect(keys(OBS_TYPE_MAP))), ", "))
+end
+
+function _observation_parts(obs_type::Symbol)
+  name = String(obs_type)
+  if endswith(name, "_flat")
+    return Symbol(chop(name; tail=5)), :flat
+  elseif endswith(name, "_hybrid")
+    return Symbol(chop(name; tail=7)), :hybrid
+  elseif obs_type in (:minimal, :min_plus, :full, :biased)
+    return obs_type, :spatial
+  end
+  throw(ArgumentError("unsupported backgammon observation type: $obs_type"))
+end
+
+const OBSERVATION_TIER, OBSERVATION_FORMAT = _observation_parts(OBSERVATION_TYPE)
 
 # Checker policy head width (engine IDs 1:676). Cube actions 677:680 are not part of
 # this training head — use split cube heads / cube_enabled=false for ML.
@@ -74,10 +97,10 @@ const NUM_ACTIONS = BackgammonNet.CHECKER_ACTIONS
 
 # Get observation size from BackgammonNet
 # Handle hybrid observations (named tuples) by computing flattened size
-function _compute_obs_size(obs_type)
-  dims = BackgammonNet.obs_dims(obs_type)
+function _compute_obs_size(tier, format)
+  dims = BackgammonNet.obs_dims(tier, format)
   if dims isa NamedTuple
-    # Hybrid: (board = (12, 26), globals = 50) -> 12*26 + 50 = 362
+    # Hybrid: flatten the board planes followed by the selected tier's globals.
     return prod(dims.board) + (dims.globals isa Tuple ? prod(dims.globals) : dims.globals)
   elseif dims isa Tuple
     return prod(dims)
@@ -85,7 +108,7 @@ function _compute_obs_size(obs_type)
     return dims
   end
 end
-const OBS_SIZE = _compute_obs_size(OBSERVATION_TYPE)
+const OBS_SIZE = _compute_obs_size(OBSERVATION_TIER, OBSERVATION_FORMAT)
 
 const Player = Bool
 const WHITE = true   # Player 0
@@ -93,6 +116,57 @@ const BLACK = false  # Player 1
 const LEGAL_ACTIONS_SCRATCHES = [BackgammonNet.LegalActionsScratch() for _ in 1:Threads.maxthreadid()]
 
 legal_actions_scratch() = LEGAL_ACTIONS_SCRATCHES[Threads.threadid()]
+
+"""
+    backgammon_game(p0, p1, dice, remaining_actions, current_player,
+                    terminated, reward; observation_type=:minimal_flat)
+
+Build a BackgammonNet 0.7 game for AlphaZero fixtures and imported starting
+positions. This isolates the dependency's intentionally non-stable concrete
+state layout behind public construction plus field assignment.
+"""
+function backgammon_game(p0::UInt128, p1::UInt128, dice,
+                         remaining_actions::Integer, current_player::Integer,
+                         terminated::Bool, reward::Real;
+                         observation_type::Symbol=:minimal_flat)
+  tier, format = _observation_parts(observation_type)
+  game = BackgammonNet.initial_state(;
+    first_player=current_player,
+    doubles_only=false,
+    obs_tier=tier,
+    obs_format=format,
+    cube_enabled=false,
+    jacoby_enabled=false,
+  )
+  game.p0 = p0
+  game.p1 = p1
+  game.dice = typeof(game.dice)(dice)
+  game.remaining_actions = Int8(remaining_actions)
+  game.current_player = Int8(current_player)
+  game.terminated = terminated
+  game.reward = Float32(reward)
+  game.phase = iszero(game.dice[1]) && iszero(game.dice[2]) ?
+      BackgammonNet.PHASE_CHANCE : BackgammonNet.PHASE_CHECKER_PLAY
+  game.result_multiplier = terminated ? _terminal_result_multiplier(game) : Int8(0)
+  return game
+end
+
+function _terminal_result_multiplier(game)
+  p0_off = BackgammonNet.get_count(game.p0, 25)
+  p1_off = BackgammonNet.get_count(game.p1, 0)
+  if p0_off == 15
+    p1_off > 0 && return Int8(1)
+    on_bar = BackgammonNet.get_count(game.p1, 27) > 0
+    in_home = any(i -> BackgammonNet.get_count(game.p1, i) > 0, 19:24)
+    return Int8(on_bar || in_home ? 3 : 2)
+  elseif p1_off == 15
+    p0_off > 0 && return Int8(1)
+    on_bar = BackgammonNet.get_count(game.p0, 26) > 0
+    in_home = any(i -> BackgammonNet.get_count(game.p0, i) > 0, 1:6)
+    return Int8(on_bar || in_home ? 3 : 2)
+  end
+  return Int8(1) # declined double
+end
 
 #####
 ##### Game Specification
@@ -107,12 +181,13 @@ function GI.actions(::GameSpec)
   return collect(1:NUM_ACTIONS)
 end
 
-# 21 dice outcomes (6 doubles + 15 non-doubles)
+# AlphaZero's ML environment chooses the initial mover during setup. Every dice
+# node visible to search, including the first playable roll, therefore uses the
+# same standard 21-outcome distribution.
 GI.num_chance_outcomes(::GameSpec) = 21
 
 function GI.vectorize_state(::GameSpec, game::BackgammonNet.BackgammonGame)
-  # Use observe() which dispatches based on game.obs_type
-  obs = BackgammonNet.observe(game)
+  obs = BackgammonNet.observe(game, OBSERVATION_TIER, OBSERVATION_FORMAT)
   # Handle hybrid observations (named tuples with board and globals)
   if obs isa NamedTuple
     return vcat(vec(obs.board), vec(obs.globals))
@@ -122,21 +197,11 @@ function GI.vectorize_state(::GameSpec, game::BackgammonNet.BackgammonGame)
 end
 
 # In-place version: writes observation directly into buffer (zero intermediate allocation).
-# Uses BackgammonNet v0.6.0 public observe_*_flat! API.
+# Uses BackgammonNet v0.7 public tier/format observation API.
 function vectorize_state_into!(buf::AbstractVector{Float32}, ::GameSpec, game::BackgammonNet.BackgammonGame)
-  ot = game.obs_type
-  if ot === :minimal_flat
-    BackgammonNet.observe_minimal_flat!(buf, game)
-  elseif ot === :min_plus_flat
-    BackgammonNet.observe_min_plus_flat!(buf, game)
-  elseif ot === :full_flat
-    BackgammonNet.observe_full_flat!(buf, game)
-  elseif ot === :biased_flat
-    BackgammonNet.observe_biased_flat!(buf, game)
-  else
-    # Fallback: allocate and copy
-    buf .= vec(GI.vectorize_state(GameSpec(), game))
-  end
+  OBSERVATION_FORMAT === :flat ||
+    throw(ArgumentError("vectorize_state_into! requires a flat observation format"))
+  BackgammonNet.observe!(buf, game, Val(OBSERVATION_TIER), Val(:flat))
   return buf
 end
 
@@ -146,7 +211,36 @@ end
 
 mutable struct GameEnv <: GI.AbstractGameEnv
   game::BackgammonNet.BackgammonGame
-  rng::MersenneTwister
+  rng::Union{MersenneTwister,Random.Xoshiro}
+
+  function GameEnv(game::BackgammonNet.BackgammonGame,
+                   rng::Union{MersenneTwister,Random.Xoshiro})
+    game.phase == BackgammonNet.PHASE_OPENING_ROLL && throw(ArgumentError(
+      "AlphaZero ML states must resolve first-player selection during setup"))
+    game.doubles_only && throw(ArgumentError(
+      "AlphaZero ML states require the standard 21-outcome dice distribution"))
+    return new(game, rng)
+  end
+end
+
+"""Fail closed on any state that is not reachable by legal play.
+
+The strict check is intentionally opt-in because MCTS mutates many cloned
+states. It uses BackgammonNet's public exact-checker-count validator, which
+catches the corruption left by decrementing an empty bitboard nibble even
+though `sanity_check_bitboard` alone cannot identify that underflow.
+"""
+function strict_validate_state!(game::BackgammonNet.BackgammonGame,
+                                context::AbstractString;
+                                force::Bool=STRICT_STATE_CHECKS)
+  force || return nothing
+  try
+    BackgammonNet.validate_reachable_state(game)
+  catch err
+    error("Strict Backgammon state validation failed after $context: " *
+          sprint(showerror, err))
+  end
+  return nothing
 end
 
 GI.spec(::GameEnv) = GameSpec()
@@ -161,7 +255,7 @@ end
 
 # Zero-allocation clone: copies game state fields into pre-allocated dst,
 # reusing dst's internal buffers. Used by batched MCTS game pool.
-# Uses BackgammonNet v0.6.0 copy_state! API (handles all fields, invalidates cache).
+# Uses BackgammonNet v0.7 copy_state! API (handles all fields, invalidates cache).
 function GI.clone_into!(dst::GameEnv, src::GameEnv)
   BackgammonNet.copy_state!(dst.game, src.game)
   dst.rng = src.rng
@@ -180,6 +274,10 @@ function GI.current_state(g::GameEnv)
 end
 
 function GI.set_state!(g::GameEnv, state::BackgammonNet.BackgammonGame)
+  state.phase == BackgammonNet.PHASE_OPENING_ROLL && throw(ArgumentError(
+    "AlphaZero ML states must resolve first-player selection during setup"))
+  state.doubles_only && throw(ArgumentError(
+    "AlphaZero ML states require the standard 21-outcome dice distribution"))
   # Clone the state into our game
   cloned = BackgammonNet.clone(state)
   g.game = cloned
@@ -190,21 +288,28 @@ GI.white_playing(g::GameEnv) = g.game.current_player == 0
 # Direct state access for white_playing - avoids creating GameEnv which may have side effects
 # This is used by push_trace! in memory.jl to determine value perspective
 GI.white_playing(::GameSpec, state::BackgammonNet.BackgammonGame) = state.current_player == 0
+GI.state_key(::GameSpec, state::BackgammonNet.BackgammonGame) =
+  BackgammonNet.game_state_fingerprint(state)
 
-function GI.init(::GameSpec)
+function init_with_rng(::GameSpec, rng::Union{MersenneTwister,Random.Xoshiro})
+  first_player = rand(rng, 0:1)
   game = BackgammonNet.initial_state(;
+    first_player=first_player,
     short_game=SHORT_GAME,
-    doubles_only=DOUBLES_ONLY,
+    doubles_only=false,
     cube_enabled=CUBE_ENABLED,
     jacoby_enabled=JACOBY_ENABLED,
-    obs_type=OBSERVATION_TYPE
+    tavla=TAVLA_ENABLED,
+    obs_tier=OBSERVATION_TIER,
+    obs_format=OBSERVATION_FORMAT
   )
-  rng = MersenneTwister()
   genv = GameEnv(game, rng)
-  # Auto-roll initial dice to get to first decision point
+  # The mover was selected above, so this is a fresh standard 21-outcome roll.
   BackgammonNet.sample_chance!(game, rng)
   return genv
 end
+
+GI.init(gspec::GameSpec) = init_with_rng(gspec, MersenneTwister())
 
 function GI.game_terminated(g::GameEnv)
   return BackgammonNet.game_terminated(g.game)
@@ -240,6 +345,28 @@ end
 # still represent outcome probabilities, while cube stakes are carried by reward.
 GI.reward_scale(::GameSpec) = 3.0
 
+"""Machine-readable AlphaZero/BackgammonNet ML contract for cluster handshakes."""
+function backgammon_ml_contract(::GameSpec)
+  return Dict{String,Any}(
+    "game" => "backgammon-deterministic",
+    "state_dim" => OBS_SIZE,
+    "num_actions" => NUM_ACTIONS,
+    "observation_tier" => String(OBSERVATION_TIER),
+    "observation_format" => String(OBSERVATION_FORMAT),
+    "observation_encoding" => BackgammonNet.OBSERVATION_ENCODING_VERSION,
+    "value_head_contract" => BackgammonNet.VALUE_HEAD_CONTRACT,
+    "value_head_order" => String.(collect(BackgammonNet.VALUE_HEAD_ORDER)),
+    "chance_outcomes" => 21,
+    "opening_rule" => "uniform_first_player_fresh_21_v1",
+    "reward_scale" => GI.reward_scale(GameSpec()),
+    "short_game" => SHORT_GAME,
+    "cube_enabled" => CUBE_ENABLED,
+    "jacoby_enabled" => JACOBY_ENABLED,
+    "tavla_enabled" => TAVLA_ENABLED,
+    "backgammonnet_version" => string(Base.pkgversion(BackgammonNet)),
+  )
+end
+
 #####
 ##### Chance Node Interface (stochastic — dice exposed)
 #####
@@ -248,15 +375,12 @@ function GI.is_chance_node(g::GameEnv)
   return BackgammonNet.is_chance_node(g.game)
 end
 
-# Cache chance outcomes to avoid per-call allocation (21 outcomes are always the same)
-# BackgammonNet.DICE_OUTCOMES and DICE_PROBS are module constants
-const _CACHED_OUTCOMES = Tuple{Int, Float64}[
-  (i, Float64(BackgammonNet.DICE_PROBS[i])) for i in 1:21
-]
-
 function GI.chance_outcomes(g::GameEnv)
-  return _CACHED_OUTCOMES
+  return ML_CHANCE_OUTCOMES
 end
+
+const ML_CHANCE_OUTCOMES = SVector{21,Tuple{Int,Float64}}(
+  ntuple(i -> (i, BackgammonNet.DICE_PROBS[i]), 21))
 
 const PASS_ACTION = BackgammonNet.encode_action(BackgammonNet.PASS_LOC, BackgammonNet.PASS_LOC)
 
@@ -266,6 +390,7 @@ function _handle_forced_pass!(g::GameEnv)
     legal = BackgammonNet.legal_actions(g.game)
     if length(legal) == 1 && legal[1] == PASS_ACTION
       BackgammonNet.apply_action!(g.game, PASS_ACTION)
+      strict_validate_state!(g.game, "forced pass")
     else
       break
     end
@@ -274,6 +399,7 @@ end
 
 function GI.apply_chance!(g::GameEnv, outcome)
   BackgammonNet.apply_chance!(g.game, outcome)
+  strict_validate_state!(g.game, "chance outcome $outcome")
   # NOTE: Do NOT call _handle_forced_pass! here. Forced passes must be visible
   # to MCTS as single-option decision nodes so that pswitch (player perspective
   # tracking) correctly handles each player switch individually. If forced passes
@@ -345,6 +471,7 @@ function GI.play!(g::GameEnv, action)
   # Apply action only (no auto-dice-roll). Leaves game at chance node or decision node.
   # NOTE: Do NOT call _handle_forced_pass! here. See apply_chance! comment.
   BackgammonNet.apply_action!(g.game, action)
+  strict_validate_state!(g.game, "checker action $action")
 end
 
 #####
@@ -354,8 +481,8 @@ end
 function GI.render(g::GameEnv)
   game = g.game
   println("=" ^ 50)
-  println("Backgammon STOCHASTIC (short_game=$SHORT_GAME, doubles=$DOUBLES_ONLY)")
-  println("Observation type: $(game.obs_type) ($(OBS_SIZE) features)")
+  println("Backgammon STOCHASTIC (short_game=$SHORT_GAME, tavla=$TAVLA_ENABLED, dice_outcomes=21)")
+  println("Observation type: $(game.obs_tier)_$(game.obs_format) ($(OBS_SIZE) features)")
   println("Cube: enabled=$(game.cube_enabled), value=$(game.cube_value), owner=$(game.cube_owner)")
   println("-" ^ 50)
 

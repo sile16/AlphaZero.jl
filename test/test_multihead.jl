@@ -181,7 +181,7 @@ end
       (board & ~(UInt128(0xF) << (idx << 2))) | (UInt128(val) << (idx << 2))
 
     function terminal_game(; white_won::Bool, gammon::Bool, backgammon::Bool, cube_value::Int=1)
-      g = BackgammonNet.initial_state(; obs_type=:minimal_flat)
+      g = BackgammonNet.initial_state(; first_player=0, obs_tier=:minimal, obs_format=:flat)
       g.p0 = UInt128(0)
       g.p1 = UInt128(0)
       if white_won
@@ -205,6 +205,7 @@ end
       end
       g.cube_value = Int16(cube_value)
       g.terminated = true
+      g.result_multiplier = Int8(backgammon ? 3 : (gammon ? 2 : 1))
       return g
     end
 

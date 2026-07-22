@@ -4,9 +4,9 @@
 # (`remaining_actions = 2`). After the first action, the state is still the SAME
 # player's decision node. The old evaluators scored every post-move state as
 # "opponent pre-dice, negate" — flipping the sign for the first half of every
-# doubles turn, so argmax picked the WORST move. Caught by
-# scripts/eval_table_vs_wildbg.jl: the exact table policy measurably LOST to
-# wildbg (-0.022 ± 0.010 paired) before the fix.
+# doubles turn, so argmax could pick the wrong move. Historical strength
+# measurements from before the fix are quarantined; this deterministic test is
+# the current regression authority.
 #
 # The turn-aware BackgammonNet helpers recurse through mid-turn states. The
 # recursion and terminal handling are exercised here WITHOUT the 88GB table
@@ -22,6 +22,11 @@ using BackgammonNet: BackgammonGame
 using BackgammonNet: bearoff_best_move_value, bearoff_turn_value, bearoff_turn_value_equity
 using BackgammonNet: bearoff_value_to_nn_scale
 
+if !isdefined(Main, :BackgammonDeterministic)
+    include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "main.jl"))
+end
+const BGD_BR = Main.BackgammonDeterministic
+
     @testset "Doubles mid-turn recursion (no table needed)" begin
         # White (P0): 11 off, 4 checkers on point 24. Black (P1): 15 in home,
         # 0 off — any white win is a GAMMON (+2).
@@ -29,8 +34,8 @@ using BackgammonNet: bearoff_value_to_nn_scale
         p1 = (UInt128(5) << (1 * 4)) | (UInt128(5) << (2 * 4)) | (UInt128(5) << (3 * 4))
 
         # Doubles 3-3, remaining_actions = 2: white's turn takes TWO actions.
-        g = BackgammonGame(p0, p1, SVector{2, Int8}(3, 3), Int8(2), Int8(0), false, 0.0f0;
-                           obs_type=:minimal_flat)
+        g = BGD_BR.backgammon_game(p0, p1, SVector{2, Int8}(3, 3), Int8(2), Int8(0), false, 0.0f0;
+                                    observation_type=:minimal_flat)
         @test !BackgammonNet.is_chance_node(g)
 
         # Apply the first action -> mid-turn state: SAME player, remaining = 1.
@@ -53,25 +58,27 @@ using BackgammonNet: bearoff_value_to_nn_scale
         # Same through the equity variant: gammon vector [1,1,0,0,0].
         v2, eq = bearoff_turn_value_equity(nothing, mid, 0)
         @test v2 == 2.0
-        @test eq == Float32[1, 1, 0, 0, 0]
+        # BackgammonNet returns the 5-head equity as an NTuple (not a Vector).
+        @test eq == (1f0, 1f0, 0f0, 0f0, 0f0)
 
         # Terminal equity is mover-relative in both directions. The negative
         # case is rare in normal post-move scoring, but callers of the shared
         # helper should not get a win vector when the requested mover lost.
         p0_loss = (UInt128(5) << (19 * 4)) | (UInt128(5) << (20 * 4)) | (UInt128(5) << (21 * 4))
         p1_win = UInt128(15) << 0
-        lost = BackgammonGame(p0_loss, p1_win, SVector{2, Int8}(0, 0), Int8(0), Int8(0), true, -2.0f0;
-                              obs_type=:minimal_flat)
+        lost = BGD_BR.backgammon_game(p0_loss, p1_win, SVector{2, Int8}(0, 0), Int8(0), Int8(0), true, -2.0f0;
+                                       observation_type=:minimal_flat)
         v_loss, eq_loss = bearoff_turn_value_equity(nothing, lost, 0)
         @test v_loss == -2.0
-        @test eq_loss == Float32[0, 0, 0, 1, 0]
+        @test eq_loss == (0f0, 0f0, 0f0, 1f0, 0f0)
 
         # Full post-dice move evaluation from the doubles start: every playout
         # bears off all 4 checkers this turn -> exact Q is the gammon win.
         @test bearoff_best_move_value(nothing, g) == 2.0
 
-        # Sign check from black's perspective: white's gammon is -2 for black.
-        @test bearoff_turn_value(nothing, mid, 1) == -2.0
+        # A mid-turn checker state must be evaluated for its actual mover. Asking
+        # for the opponent's frame is not a valid bearoff-table boundary in 0.7.
+        @test_throws ErrorException bearoff_turn_value(nothing, mid, 1)
     end
 
     @testset "Raw-points → NN-scale normalization + Float64 unification" begin
@@ -92,11 +99,12 @@ using BackgammonNet: bearoff_value_to_nn_scale
         # becomes +2/3 on the NN scale — the same number the NN head emits.
         p0_win = UInt128(15) << (25 * 4)
         p1_no_off = (UInt128(5) << (1 * 4)) | (UInt128(5) << (2 * 4)) | (UInt128(5) << (3 * 4))
-        gammon_win = BackgammonGame(p0_win, p1_no_off, SVector{2, Int8}(0, 0),
-                                    Int8(0), Int8(0), true, 2.0f0; obs_type=:minimal_flat)
+        gammon_win = BGD_BR.backgammon_game(p0_win, p1_no_off, SVector{2, Int8}(0, 0),
+                                             Int8(0), Int8(0), true, 2.0f0;
+                                             observation_type=:minimal_flat)
         v_win, eq_win = bearoff_turn_value_equity(nothing, gammon_win, 0)
         @test v_win == 2.0
         @test v_win isa Float64                 # Float32/Float64 unification
-        @test eq_win == Float32[1, 1, 0, 0, 0]
+        @test eq_win == (1f0, 1f0, 0f0, 0f0, 0f0)
         @test bearoff_value_to_nn_scale(v_win, 3.0) ≈ 2 / 3
     end

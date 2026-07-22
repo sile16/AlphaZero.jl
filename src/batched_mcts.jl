@@ -35,9 +35,49 @@ using Distributions: Dirichlet
 import Random
 using ..AlphaZero: GI, Util, MCTS
 
-export BatchedEnv, batched_explore!, BatchedMctsPlayer, think, reset_player!, player_temperature
+export BatchedEnv, SearchMetrics, search_metrics, take_search_metrics!,
+       batched_explore!, BatchedMctsPlayer, think, reset_player!, player_temperature
 
 const EMPTY_INT_VEC = Int[]  # Shared empty vector for terminal/bearoff leaf_actions
+
+"""
+Low-overhead, cumulative search counters for one `BatchedEnv`.
+
+These are deliberately plain integers rather than atomics: each self-play worker owns
+its player. Counters are updated in the existing traversal/evaluation hot paths and
+are only sampled once per completed game, so observability adds no per-simulation
+logging or allocation.
+"""
+mutable struct SearchMetrics
+    simulations::Int64
+    tree_hits::Int64
+    tree_misses::Int64
+    nn_evaluations::Int64
+    oracle_calls::Int64
+    bearoff_hits::Int64
+    bearoff_misses::Int64
+    search_ns::Int64
+    max_depth::Int64
+end
+
+SearchMetrics() = SearchMetrics(0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+function _reset!(m::SearchMetrics)
+    m.simulations = 0
+    m.tree_hits = 0
+    m.tree_misses = 0
+    m.nn_evaluations = 0
+    m.oracle_calls = 0
+    m.bearoff_hits = 0
+    m.bearoff_misses = 0
+    m.search_ns = 0
+    m.max_depth = 0
+    return m
+end
+
+_snapshot(m::SearchMetrics) = SearchMetrics(
+    m.simulations, m.tree_hits, m.tree_misses, m.nn_evaluations,
+    m.oracle_calls, m.bearoff_hits, m.bearoff_misses, m.search_ns, m.max_depth)
 
 #####
 ##### Pending simulation state
@@ -118,6 +158,7 @@ mutable struct BatchedEnv{S, O, R, BO, BOWA, BE, G}
     # 1 / GI.reward_scale(gspec): rewards are multiplied by this so tree Q-values
     # stay on the same [-1,1] scale as NN value outputs (backgammon: 1/3)
     inv_reward_scale::Float64
+    metrics::SearchMetrics
 end
 
 function BatchedEnv(env::MCTS.Env{S, O, R}, batch_size::Int;
@@ -134,7 +175,7 @@ function BatchedEnv(env::MCTS.Env{S, O, R}, batch_size::Int;
                               game_type[], PendingSimulation{S}[], eval_states,
                               eval_actions, eval_indices, eval_route_sim, eval_route_out,
                               bearoff_evaluator,
-                              1.0 / GI.reward_scale(env.gspec))
+                              1.0 / GI.reward_scale(env.gspec), SearchMetrics())
 end
 
 """Pre-allocate sim pool with sizehinted vectors (called once, reused forever)."""
@@ -223,9 +264,11 @@ function resolve_known_outcome_value!(benv::BatchedEnv, sim::PendingSimulation, 
     if benv.bearoff_evaluator !== nothing
         val = benv.bearoff_evaluator(child)
         if val !== nothing
+            benv.metrics.bearoff_hits += 1
             wp = GI.white_playing(child)
             return wp ? Float64(val) : -Float64(val)
         end
+        benv.metrics.bearoff_misses += 1
     end
     cstate = GI.current_state(child)
     cinfo = get(env.tree, cstate, nothing)
@@ -288,6 +331,7 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
             if benv.bearoff_evaluator !== nothing
                 val = benv.bearoff_evaluator(game)
                 if val !== nothing
+                    benv.metrics.bearoff_hits += 1
                     # Bear-off returns white-relative equity; convert to player-relative
                     wp = GI.white_playing(game)
                     player_val = wp ? val : -val
@@ -297,6 +341,7 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
                     sim.terminal_value = player_val
                     return sim
                 end
+                benv.metrics.bearoff_misses += 1
             end
 
             # EVAL-ONLY exact-expectation chance node (first-class chance_tree entries).
@@ -395,6 +440,7 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
         # Single Dict lookup (was: haskey + env.tree[state] = 2 lookups)
         info = get(env.tree, state, nothing)
         if info === nothing
+            benv.metrics.tree_misses += 1
             # Derive leaf actions from the cloned state, not the pooled live
             # env, so the stored node contract matches the oracle input exactly.
             leaf_actions = GI.available_actions(GI.spec(game), state)
@@ -412,6 +458,7 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
                 if benv.bearoff_evaluator !== nothing
                     val = benv.bearoff_evaluator(game)
                     if val !== nothing
+                        benv.metrics.bearoff_hits += 1
                         # Bear-off returns white-relative equity; convert to player-relative
                         # (matching NN oracle convention where Vest is player-relative)
                         wp = GI.white_playing(game)
@@ -428,6 +475,7 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
                         sim.terminal_value = player_val
                         return sim
                     end
+                    benv.metrics.bearoff_misses += 1
                 end
 
                 sim.leaf_state = state
@@ -436,6 +484,8 @@ function traverse_to_leaf!(sim::PendingSimulation{S}, benv::BatchedEnv{S}, game,
                 sim.terminal_value = 0.0
                 return sim
             end
+        else
+            benv.metrics.tree_hits += 1
         end
 
         actions = info.actions
@@ -497,7 +547,9 @@ function batch_evaluate(benv::BatchedEnv, states::Vector, actions_by_state=nothi
     # chunk to batch_size to avoid overflowing the oracle buffer (behaviour identical to
     # calling it batch_size states at a time).
     maxw = benv.batch_size
+    benv.metrics.nn_evaluations += length(states)
     if length(states) > maxw && (benv.batch_oracle_with_actions !== nothing || benv.batch_oracle !== nothing)
+        benv.metrics.oracle_calls += cld(length(states), maxw)
         results = Tuple{Vector{Float32}, Float32}[]
         sizehint!(results, length(states))
         for i in 1:maxw:length(states)
@@ -513,12 +565,15 @@ function batch_evaluate(benv::BatchedEnv, states::Vector, actions_by_state=nothi
     end
 
     if actions_by_state !== nothing && benv.batch_oracle_with_actions !== nothing
+        benv.metrics.oracle_calls += 1
         return benv.batch_oracle_with_actions(states, actions_by_state)
     elseif benv.batch_oracle !== nothing
         # Use batched oracle for GPU evaluation (all states in one call)
+        benv.metrics.oracle_calls += 1
         return benv.batch_oracle(states)
     else
         # Fall back to sequential oracle calls
+        benv.metrics.oracle_calls += length(states)
         return [benv.env.oracle(state) for state in states]
     end
 end
@@ -708,12 +763,21 @@ Each batch:
 """
 function batched_explore!(benv::BatchedEnv, game, nsims)
     env = benv.env
+    simulations_before = env.total_simulations
+    search_started = time_ns()
+
+    try
 
     # Ensure root is in the tree before generating noise (need action count).
     # Without this, if batch_size >= nsims, ALL simulations hit an empty tree,
     # no actions are selected, visit counts stay at 0, and policy() returns NaN.
     state = GI.current_state(game)
     root_info = get(env.tree, state, nothing)
+    if root_info === nothing
+        benv.metrics.tree_misses += 1
+    else
+        benv.metrics.tree_hits += 1
+    end
     if !GI.game_terminated(game) && !GI.is_chance_node(game) && root_info === nothing
         empty!(benv.pending)
         env.total_simulations += 1
@@ -722,6 +786,8 @@ function batched_explore!(benv::BatchedEnv, game, nsims)
             _init_sim_pool!(benv, game)
         end
         traverse_to_leaf!(benv.sim_pool[1], benv, GI.clone(game), Float64[])
+        benv.metrics.max_depth = max(benv.metrics.max_depth,
+                                     length(benv.sim_pool[1].path))
         push!(benv.pending, benv.sim_pool[1])
         batch_evaluate_pending!(benv)
         for s in benv.pending
@@ -772,6 +838,7 @@ function batched_explore!(benv::BatchedEnv, game, nsims)
             end
             sim = benv.sim_pool[sim_idx]
             traverse_to_leaf!(sim, benv, game_clone, η)
+            benv.metrics.max_depth = max(benv.metrics.max_depth, length(sim.path))
             push!(benv.pending, sim)
         end
 
@@ -784,6 +851,10 @@ function batched_explore!(benv::BatchedEnv, game, nsims)
         end
 
         sims_done += current_batch_size
+    end
+    finally
+        benv.metrics.simulations += env.total_simulations - simulations_before
+        benv.metrics.search_ns += time_ns() - search_started
     end
 end
 
@@ -803,6 +874,16 @@ end
 Get the underlying MCTS environment.
 """
 get_env(benv::BatchedEnv) = benv.env
+
+"""Return a copy of the cumulative metrics without resetting them."""
+search_metrics(benv::BatchedEnv) = _snapshot(benv.metrics)
+
+"""Return and reset the metrics accumulated since the previous take."""
+function take_search_metrics!(benv::BatchedEnv)
+    result = _snapshot(benv.metrics)
+    _reset!(benv.metrics)
+    return result
+end
 
 """
 Reset the batched environment for a new game.
@@ -880,5 +961,8 @@ function reset_player!(p::BatchedMctsPlayer)
     reset!(p.benv)
     p.turn_count = 0
 end
+
+search_metrics(p::BatchedMctsPlayer) = search_metrics(p.benv)
+take_search_metrics!(p::BatchedMctsPlayer) = take_search_metrics!(p.benv)
 
 end  # module

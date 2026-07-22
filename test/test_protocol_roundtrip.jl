@@ -19,9 +19,10 @@ function batches_equal(a::SampleBatch, b::SampleBatch)
     a.is_bearoff == b.is_bearoff
 end
 
-DEFAULT_PROTOCOL_ACTIONS = 680
+DEFAULT_PROTOCOL_ACTIONS = 676
+DEFAULT_PROTOCOL_STATE_DIM = 352
 
-function make_batch(n; state_dim=344, num_actions=DEFAULT_PROTOCOL_ACTIONS)
+function make_batch(n; state_dim=DEFAULT_PROTOCOL_STATE_DIM, num_actions=DEFAULT_PROTOCOL_ACTIONS)
     SampleBatch(
         Int32(n),
         rand(Float32, state_dim, n),
@@ -40,7 +41,7 @@ end
     bytes = pack_samples(batch)
     recovered = unpack_samples(bytes)
     @test batches_equal(batch, recovered)
-    @test size(recovered.states) == (344, 10)
+    @test size(recovered.states) == (DEFAULT_PROTOCOL_STATE_DIM, 10)
     @test size(recovered.policies) == (DEFAULT_PROTOCOL_ACTIONS, 10)
     @test size(recovered.equities) == (5, 10)
     @test length(recovered.values) == 10
@@ -94,7 +95,7 @@ end
     recovered = unpack_samples(bytes)
     @test batches_equal(batch, recovered)
     @test recovered.n == Int32(1)
-    @test size(recovered.states) == (344, 1)
+    @test size(recovered.states) == (DEFAULT_PROTOCOL_STATE_DIM, 1)
     @test size(recovered.equities) == (5, 1)
 end
 
@@ -110,7 +111,7 @@ end
     n = 5
     batch = SampleBatch(
         Int32(n),
-        zeros(Float32, 344, n),
+        zeros(Float32, DEFAULT_PROTOCOL_STATE_DIM, n),
         zeros(Float32, DEFAULT_PROTOCOL_ACTIONS, n),
         zeros(Float32, n),
         zeros(Float32, 5, n),
@@ -130,7 +131,7 @@ end
     n = 5
     batch = SampleBatch(
         Int32(n),
-        ones(Float32, 344, n),
+        ones(Float32, DEFAULT_PROTOCOL_STATE_DIM, n),
         ones(Float32, DEFAULT_PROTOCOL_ACTIONS, n),
         ones(Float32, n),
         ones(Float32, 5, n),
@@ -156,7 +157,7 @@ end
 
     batch = SampleBatch(
         Int32(n),
-        rand(Float32, 344, n),
+        rand(Float32, DEFAULT_PROTOCOL_STATE_DIM, n),
         rand(Float32, DEFAULT_PROTOCOL_ACTIONS, n),
         rand(Float32, n),
         eq,
@@ -179,7 +180,7 @@ end
 @testset "samples_to_batch conversion" begin
     samples = [
         (
-            state = rand(Float32, 344),
+            state = rand(Float32, DEFAULT_PROTOCOL_STATE_DIM),
             policy = rand(Float32, DEFAULT_PROTOCOL_ACTIONS),
             value = 0.5f0,
             equity = Float32[0.6, 0.1, 0.0, 0.05, 0.0],
@@ -189,7 +190,7 @@ end
             is_bearoff = false,
         ),
         (
-            state = rand(Float32, 344),
+            state = rand(Float32, DEFAULT_PROTOCOL_STATE_DIM),
             policy = rand(Float32, DEFAULT_PROTOCOL_ACTIONS),
             value = -0.3f0,
             equity = Float32[0.0, 0.0, 0.0, 0.0, 0.0],
@@ -199,7 +200,7 @@ end
             is_bearoff = true,
         ),
         (
-            state = rand(Float32, 344),
+            state = rand(Float32, DEFAULT_PROTOCOL_STATE_DIM),
             policy = rand(Float32, DEFAULT_PROTOCOL_ACTIONS),
             value = 1.0f0,
             equity = Float32[0.9, 0.3, 0.05, 0.0, 0.0],
@@ -212,7 +213,7 @@ end
 
     batch = samples_to_batch(samples)
     @test batch.n == Int32(3)
-    @test size(batch.states) == (344, 3)
+    @test size(batch.states) == (DEFAULT_PROTOCOL_STATE_DIM, 3)
     @test size(batch.policies) == (DEFAULT_PROTOCOL_ACTIONS, 3)
     @test batch.values == Float32[0.5, -0.3, 1.0]
     @test batch.has_equity == Bool[true, false, true]
@@ -251,7 +252,7 @@ end
 @testset "samples_to_batch -> pack -> unpack round-trip" begin
     samples = [
         (
-            state = rand(Float32, 344),
+            state = rand(Float32, DEFAULT_PROTOCOL_STATE_DIM),
             policy = rand(Float32, DEFAULT_PROTOCOL_ACTIONS),
             value = Float32(i / 10),
             equity = rand(Float32, 5),
@@ -273,7 +274,8 @@ end
     bytes = pack_samples(batch)
     d = MsgPack.unpack(bytes)
     # Verify all expected keys are present
-    expected_keys = Set(["n", "states", "state_dim", "policies", "num_actions",
+    expected_keys = Set(["protocol_version", "contract_fingerprint", "batch_id", "source_iteration", "metrics",
+                         "n", "states", "state_dim", "policies", "num_actions",
                          "values", "equities", "has_equity", "is_chance",
                          "is_contact", "is_bearoff"])
     @test Set(keys(d)) == expected_keys
@@ -289,16 +291,73 @@ end
     @test length(d["is_chance"]) == 2
     @test length(d["is_contact"]) == 2
     @test length(d["is_bearoff"]) == 2
+    @test d["metrics"]["games"] == 0
+    @test d["source_iteration"] == -1
 end
 
 @testset "Field name consistency (JSON)" begin
     batch = make_batch(2; state_dim=10, num_actions=5)
     json_str = pack_samples_json(batch)
     d = JSON.parse(json_str)
-    expected_keys = Set(["n", "states", "state_dim", "policies", "num_actions",
+    expected_keys = Set(["protocol_version", "contract_fingerprint", "batch_id", "source_iteration", "metrics",
+                         "n", "states", "state_dim", "policies", "num_actions",
                          "values", "equities", "has_equity", "is_chance",
                          "is_contact", "is_bearoff"])
     @test Set(keys(d)) == expected_keys
+end
+
+@testset "Versioned contract envelope" begin
+    contract = Dict{String,Any}(
+        "state_dim" => DEFAULT_PROTOCOL_STATE_DIM,
+        "num_actions" => DEFAULT_PROTOCOL_ACTIONS,
+        "chance_outcomes" => 21,
+        "value_head_order" => ["p_win", "p_gammon_win", "p_bg_win",
+                               "p_gammon_loss", "p_bg_loss"],
+    )
+    reordered = Dict(reverse(collect(contract)))
+    fingerprint = contract_fingerprint(contract)
+    @test fingerprint == contract_fingerprint(reordered)
+    @test validate_contract!(contract, reordered) == fingerprint
+
+    mismatched = copy(contract)
+    mismatched["num_actions"] = 680
+    @test_throws ArgumentError validate_contract!(contract, mismatched)
+
+    batch = make_batch(2)
+    metrics = SelfPlayMetrics(3, 100, 80, 20, 25, 5, 7, 13, 1_000_000, 9)
+    bytes = pack_samples(batch; contract_fingerprint=fingerprint,
+                         batch_id="neo-1", metrics=metrics, source_iteration=17)
+    envelope = unpack_samples_envelope(bytes)
+    @test envelope.protocol_version == DISTRIBUTED_PROTOCOL_VERSION
+    @test envelope.contract_fingerprint == fingerprint
+    @test envelope.batch_id == "neo-1"
+    @test envelope.metrics == metrics
+    @test envelope.source_iteration == 17
+    @test batches_equal(envelope.batch, batch)
+    @test validate_sample_envelope!(envelope, fingerprint) === envelope
+
+    @test_throws ArgumentError validate_sample_envelope!(
+        SampleEnvelope(DISTRIBUTED_PROTOCOL_VERSION - 1, fingerprint,
+                       "neo-2", batch), fingerprint)
+    @test_throws ArgumentError validate_sample_envelope!(
+        SampleEnvelope(DISTRIBUTED_PROTOCOL_VERSION, "wrong", "neo-3", batch),
+        fingerprint)
+    @test_throws ArgumentError validate_sample_envelope!(
+        SampleEnvelope(DISTRIBUTED_PROTOCOL_VERSION, fingerprint, "", batch),
+        fingerprint)
+    bad_metrics = SelfPlayMetrics(-1, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    @test_throws ArgumentError validate_sample_envelope!(
+        SampleEnvelope(DISTRIBUTED_PROTOCOL_VERSION, fingerprint, "neo-4",
+                       batch, bad_metrics), fingerprint)
+    @test_throws ArgumentError validate_sample_envelope!(
+        SampleEnvelope(DISTRIBUTED_PROTOCOL_VERSION, fingerprint, "neo-5",
+                       batch, SelfPlayMetrics(), -2), fingerprint)
+end
+
+@testset "Malformed wire lengths are rejected" begin
+    d = MsgPack.unpack(pack_samples(make_batch(2)))
+    pop!(d["states"])
+    @test_throws ArgumentError unpack_samples_envelope(MsgPack.pack(d))
 end
 
 @testset "Empty samples error" begin

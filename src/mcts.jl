@@ -133,8 +133,10 @@ mutable struct ChanceNodeInfo
 end
 
 # Constructor for backward compatibility
-function ChanceNodeInfo(outcomes::Vector{ChanceOutcomeStats}, Vest, expanded::Bool)
-  return ChanceNodeInfo(outcomes, collect(1:length(outcomes)), Float32(Vest), expanded, expanded ? length(outcomes) : 0)
+function ChanceNodeInfo(outcomes::AbstractVector{<:ChanceOutcomeStats}, Vest, expanded::Bool)
+  stored_outcomes = collect(ChanceOutcomeStats, outcomes)
+  return ChanceNodeInfo(stored_outcomes, collect(1:length(outcomes)), Float32(Vest),
+                        expanded, expanded ? length(outcomes) : 0)
 end
 
 Ntot(c::ChanceNodeInfo) = sum(o.N for o in c.outcomes)
@@ -143,6 +145,28 @@ is_expanded(c::ChanceNodeInfo) = c.expanded
 #####
 ##### MCTS Environment
 #####
+
+"""Dictionary-like state index that stores game-defined immutable keys."""
+struct StateIndex{State, Key, Value, Spec}
+  data :: Dict{Key, Value}
+  gspec :: Spec
+end
+
+function StateIndex{State, Value}(gspec) where {State, Value}
+  sample_state = GI.current_state(GI.init(gspec))
+  Key = typeof(GI.state_key(gspec, sample_state))
+  return StateIndex{State, Key, Value, typeof(gspec)}(Dict{Key, Value}(), gspec)
+end
+
+@inline _state_index_key(index::StateIndex, state) = GI.state_key(index.gspec, state)
+Base.getindex(index::StateIndex, state) = index.data[_state_index_key(index, state)]
+Base.setindex!(index::StateIndex, value, state) =
+  (index.data[_state_index_key(index, state)] = value)
+Base.haskey(index::StateIndex, state) = haskey(index.data, _state_index_key(index, state))
+Base.get(index::StateIndex, state, default) = get(index.data, _state_index_key(index, state), default)
+Base.length(index::StateIndex) = length(index.data)
+Base.isempty(index::StateIndex) = isempty(index.data)
+Base.empty!(index::StateIndex) = (empty!(index.data); index)
 
 """
     MCTS.Env(game_spec::AbstractGameSpec, oracle; <keyword args>)
@@ -173,11 +197,11 @@ by the neural network in the UCT formula, one uses ``(1-ϵ)p + ϵη`` where ``η
 is drawn once per call to [`MCTS.explore!`](@ref) from a Dirichlet distribution
 of parameter ``α``.
 """
-mutable struct Env{State, Oracle, R}
+mutable struct Env{State, Tree, ChanceTree, Oracle, R, Spec}
   # Store (nonterminal) state statistics assuming the white player is to play
-  tree :: Dict{State, StateInfo}
+  tree :: Tree
   # Store chance node statistics (for stochastic games)
-  chance_tree :: Dict{State, ChanceNodeInfo}
+  chance_tree :: ChanceTree
   # External oracle to evaluate positions
   oracle :: Oracle
   # Random source for search stochasticity (chance sampling and root noise)
@@ -197,7 +221,7 @@ mutable struct Env{State, Oracle, R}
   total_nodes_traversed :: Int64
   total_chance_nodes_expanded :: Int64
   # Game specification
-  gspec :: GI.AbstractGameSpec
+  gspec :: Spec
   # 1 / GI.reward_scale(gspec): rewards are multiplied by this so tree Q-values
   # stay on the same [-1,1] scale as NN value outputs (backgammon: 1/3)
   inv_reward_scale :: Float64
@@ -207,12 +231,12 @@ mutable struct Env{State, Oracle, R}
       chance_mode=:full, progressive_widening_alpha=0.5, prior_virtual_visits=1.0,
       rng::Random.AbstractRNG=Random.Xoshiro(rand(UInt)))
     S = GI.state_type(gspec)
-    tree = Dict{S, StateInfo}()
-    chance_tree = Dict{S, ChanceNodeInfo}()
+    tree = StateIndex{S, StateInfo}(gspec)
+    chance_tree = StateIndex{S, ChanceNodeInfo}(gspec)
     total_simulations = 0
     total_nodes_traversed = 0
     total_chance_nodes_expanded = 0
-    new{S, typeof(oracle), typeof(rng)}(
+    new{S, typeof(tree), typeof(chance_tree), typeof(oracle), typeof(rng), typeof(gspec)}(
       tree, chance_tree, oracle, rng, gamma, cpuct, noise_ϵ, noise_α, prior_temperature,
       chance_mode, progressive_widening_alpha, prior_virtual_visits,
       total_simulations, total_nodes_traversed, total_chance_nodes_expanded, gspec,

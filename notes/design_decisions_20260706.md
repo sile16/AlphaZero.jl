@@ -1,4 +1,12 @@
-# Design Decisions — 2026-07-06 (post-refactor reset)
+# Archived Design Decisions — 2026-07-06
+
+> **Historical record — not current evidence.** GNUBG label and equity issues
+> discovered after this note was written invalidate the assumption that its
+> engine-derived measurements and conclusions are trustworthy. Numerical
+> results, teacher comparisons, PR estimates, and strength conclusions below
+> are hypotheses pending revalidation. See
+> [`docs/backgammon_status.md`](../docs/backgammon_status.md) for the active
+> status and acceptance criteria.
 
 Clean slate. Old experiment logs (EXP2–EXP5, the "~29% ceiling"/"method-bound plateau"
 conclusions) are **discarded** — they may reflect backend/training bugs rather than real signal.

@@ -205,7 +205,7 @@ function parse_args()
 
         # Bootstrap (pre-fill buffer with expert games before self-play)
         "--bootstrap-file"
-            help = "File with pre-converted training samples (NamedTuples on NFS). Loaded into buffer at startup."
+            help = "Validated BackgammonNet backgammon_training_v4 artifact (raw checker action equities). Legacy sample formats are rejected."
             arg_type = String
             default = ""
         "--bootstrap-max-samples"
@@ -233,14 +233,10 @@ function parse_args()
             help = "MCTS iterations for eval games"
             arg_type = Int
             default = 200
-        "--eval-workers"
-            help = "Number of CPU threads for eval (0 = auto: nthreads - 2)"
-            arg_type = Int
-            default = 4
-        "--wildbg-lib"
-            help = "Path to libwildbg shared library"
+        "--eval-backend-quality"
+            help = "BackgammonNet WildBG quality profile used by distributed eval clients"
             arg_type = String
-            default = ""
+            default = "high"
 
         # Bearoff table (fail-fast: required unless --no-bearoff)
         "--no-bearoff"
@@ -281,6 +277,13 @@ function parse_args()
             help = "Resume from checkpoint directory"
             arg_type = String
             default = ""
+        "--preflight"
+            help = "Validate the complete run contract and artifacts, write a report, then exit without serving or training"
+            action = :store_true
+        "--eval-manifest"
+            help = "Optional immutable evaluation manifest JSON; defaults to <eval-positions-file>.manifest.json when present"
+            arg_type = String
+            default = ""
 
         # Weight promotion gate
         "--no-promotion-gate"
@@ -296,6 +299,8 @@ function parse_args()
 end
 
 const ARGS = parse_args()
+ARGS["eval_backend_quality"] in ("min", "low", "high", "max") ||
+    error("--eval-backend-quality must be min, low, high, or max")
 ARGS["mcts_budget_mode"] in ("constant", "progressive", "turn_progressive") ||
     error("Unsupported --mcts-budget-mode=" * string(ARGS["mcts_budget_mode"]))
 if ARGS["mcts_budget_mode"] == "progressive"
@@ -317,6 +322,7 @@ mkpath(joinpath(DATA_DIR, "buffer"))
 
 # Set seed
 Random.seed!(ARGS["seed"])
+const TRAIN_RNG = Ref(MersenneTwister(ARGS["seed"]))
 
 println("=" ^ 60)
 println("AlphaZero Distributed Training Server")
@@ -369,6 +375,13 @@ flush(stdout)
 # Include shared distributed code
 include(joinpath(@__DIR__, "..", "src", "distributed", "buffer.jl"))
 include(joinpath(@__DIR__, "..", "src", "distributed", "protocol.jl"))
+include(joinpath(@__DIR__, "..", "src", "distributed", "numerical_safety.jl"))
+include(joinpath(@__DIR__, "..", "src", "distributed", "checkpoint_manager.jl"))
+include(joinpath(@__DIR__, "..", "src", "distributed", "preflight.jl"))
+include(joinpath(@__DIR__, "..", "src", "distributed", "eval_manifest.jl"))
+using .CheckpointManager
+using .Preflight
+using .EvalManifest
 include(joinpath(@__DIR__, "..", "src", "distributed", "server.jl"))
 include(joinpath(@__DIR__, "..", "src", "distributed", "promotion_gate.jl"))
 
@@ -387,6 +400,8 @@ const gspec = GameSpec()
 # from drifting if the game's reward scale ever changes.
 const REWARD_SCALE = Float32(GI.reward_scale(gspec))
 const NUM_ACTIONS = GI.num_actions(gspec)
+const ML_CONTRACT = backgammon_ml_contract(gspec)
+const CONTRACT_FINGERPRINT = contract_fingerprint(ML_CONTRACT)
 const _state_dim = let env = GI.init(gspec); length(vec(GI.vectorize_state(gspec, GI.current_state(env)))); end
 
 # Network setup
@@ -410,36 +425,20 @@ const LR_MIN = Float32(ARGS["lr_min"])
 const EVAL_INTERVAL = ARGS["eval_interval"]
 const EVAL_GAMES = ARGS["eval_games"]
 const EVAL_MCTS_ITERS = ARGS["eval_mcts_iters"]
-const EVAL_WORKERS = ARGS["eval_workers"]
 const BEAROFF_EVAL_INTERVAL = ARGS["bearoff_eval_interval"]
 const BEAROFF_EVAL_POSITIONS = ARGS["bearoff_eval_positions"]
 const BEAROFF_EVAL_MCTS_POSITIONS = ARGS["bearoff_eval_mcts_positions"]
 const BEAROFF_EVAL_MCTS_ITERS = ARGS["bearoff_eval_mcts_iters"]
 const BEAROFF_EVAL_ROLLOUTS_PER_START = ARGS["bearoff_eval_rollouts_per_start"]
 
-# ── Eval Setup (wildbg on CPU) ─────────────────────────────────────────
+# ── Distributed evaluation setup ────────────────────────────────────────
 using BackgammonNet
 using BackgammonNet: BearoffK7, bearoff_turn_value
 using StaticArrays
 
-function find_wildbg_lib_server()
-    if !isempty(ARGS["wildbg_lib"])
-        return ARGS["wildbg_lib"]
-    end
-    candidates = [
-        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg.so"),
-        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg.dylib"),
-        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg_main.so"),
-        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg_main.dylib"),
-    ]
-    for c in candidates
-        isfile(c) && return c
-    end
-    error("wildbg library not found. Pass --wildbg-lib or build it at one of: $(join(candidates, ", "))")
-end
-
-const WILDBG_LIB = find_wildbg_lib_server()
-const EVAL_ENABLED = EVAL_INTERVAL > 0 && !isempty(WILDBG_LIB) && !isempty(ARGS["eval_positions_file"])
+const EVAL_ENABLED = EVAL_INTERVAL > 0 && !isempty(ARGS["eval_positions_file"])
+EVAL_ENABLED && !isfile(ARGS["eval_positions_file"]) && error(
+    "Evaluation positions file does not exist: $(ARGS["eval_positions_file"])")
 const BEAROFF_START_POSITIONS = if !isempty(ARGS["eval_positions_file"]) && isfile(ARGS["eval_positions_file"])
     Serialization.deserialize(ARGS["eval_positions_file"])
 else
@@ -453,6 +452,36 @@ const EVAL_POSITIONS = if EVAL_ENABLED && isfile(ARGS["eval_positions_file"])
     pos[1:n]
 else
     Tuple[]
+end
+
+const EVAL_MANIFEST_PATH = if !isempty(ARGS["eval_manifest"])
+    ARGS["eval_manifest"]
+elseif !isempty(ARGS["eval_positions_file"])
+    candidate = ARGS["eval_positions_file"] * ".manifest.json"
+    isfile(candidate) ? candidate : ""
+else
+    ""
+end
+
+function _eval_position_game(position)
+    position isa BackgammonNet.BackgammonGame && return position
+    p0, p1, cp = position
+    return backgammon_game(p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp,
+                           false, 0.0f0; observation_type=:minimal_flat)
+end
+
+function _eval_position_fingerprint(position)
+    state = BackgammonNet.game_state_fingerprint(_eval_position_game(position))
+    return bytes2hex(SHA.sha256(codeunits(repr(state))))
+end
+
+if EVAL_ENABLED
+    isempty(EVAL_MANIFEST_PATH) && error(
+        "Evaluation is enabled but no immutable manifest was found. Run " *
+        "scripts/build_eval_manifest.jl --input $(ARGS["eval_positions_file"])")
+    validate_eval_manifest(EVAL_MANIFEST_PATH, ARGS["eval_positions_file"], EVAL_POSITIONS;
+        contract_fingerprint=CONTRACT_FINGERPRINT,
+        fingerprint=_eval_position_fingerprint)
 end
 
 function find_bearoff_dir_server()
@@ -482,22 +511,10 @@ const BEAROFF_FIXED_EVAL_ENABLED =
     !isempty(BEAROFF_START_POSITIONS)
 
 if EVAL_ENABLED
-    # Set up wildbg
-    lib_size = filesize(WILDBG_LIB)
-    nets_variant = lib_size > 10_000_000 ? :large : :small
-    if nets_variant == :large
-        BackgammonNet.wildbg_set_lib_path!(large=WILDBG_LIB)
-    else
-        BackgammonNet.wildbg_set_lib_path!(small=WILDBG_LIB)
-    end
-    println("Eval: $(length(EVAL_POSITIONS)) positions × 2 sides, $(EVAL_MCTS_ITERS) MCTS iters, $(EVAL_WORKERS) workers")
-    println("Eval: wildbg $nets_variant ($(round(lib_size/1e6, digits=1))MB), every $EVAL_INTERVAL iters")
+    println("Eval: $(length(EVAL_POSITIONS)) positions × 2 sides, $(EVAL_MCTS_ITERS) MCTS iters")
+    println("Eval: distributed WildBG quality=$(ARGS["eval_backend_quality"]), every $EVAL_INTERVAL iters")
 else
-    if EVAL_INTERVAL > 0
-        println("Eval: DISABLED (wildbg_lib=$(isempty(WILDBG_LIB) ? "not found" : WILDBG_LIB), eval_positions=$(ARGS["eval_positions_file"]))")
-    else
-        println("Eval: disabled (eval-interval=0)")
-    end
+    println("Eval: disabled (set --eval-interval and --eval-positions-file to enable)")
 end
 
 if BEAROFF_FIXED_EVAL_ENABLED
@@ -572,9 +589,9 @@ end
 
 function start_game_from_tuple_server(position_data::Tuple{UInt128, UInt128, Int8}, seed::Int)
     p0, p1, cp = position_data
-    game = BackgammonNet.BackgammonGame(
+    game = backgammon_game(
         p0, p1, SVector{2, Int8}(0, 0), Int8(0), cp, false, 0.0f0;
-        obs_type=:minimal_flat)
+        observation_type=:minimal_flat)
     return GameEnv(game, MersenneTwister(seed))
 end
 
@@ -837,136 +854,6 @@ function run_bearoff_eval!(network_to_eval, iter::Int)
     return result
 end
 
-function eval_race_game_server(single_oracle, batch_oracle, wildbg_backend,
-                               position_data::Tuple, eval_net;
-                               seed::Int=1, az_is_white::Bool=true,
-                               eval_mcts_iters::Int=EVAL_MCTS_ITERS)
-    eval_mcts_params = MctsParams(
-        num_iters_per_turn=eval_mcts_iters,
-        cpuct=1.5,
-        temperature=ConstSchedule(0.0),
-        dirichlet_noise_ϵ=0.0,
-        dirichlet_noise_α=1.0)
-
-    az = AlphaZero.GameLoop.MctsAgent(single_oracle, batch_oracle, eval_mcts_params, 50, gspec;
-        batch_oracle_with_actions=batch_oracle)
-    wb = AlphaZero.GameLoop.ExternalAgent(wildbg_backend)
-
-    # NN V is normalized equity/3 ∈ [-1,1]; wildbg returns raw points ∈ [-3,3].
-    # Scale NN back to raw points so value MSE/corr compare on the same scale.
-    value_oracle_fn = function(env)
-        result = _eval_forward_network(eval_net, [env.game])
-        return Float64(result[1][2]) * 3.0  # value head output → raw points
-    end
-    wildbg_value_fn = function(env)
-        return Float64(BackgammonNet.evaluate(wildbg_backend, env.game))
-    end
-
-    w, b = az_is_white ? (az, wb) : (wb, az)
-
-    # Initialize game from position tuple
-    p0, p1, cp = position_data
-    g = BackgammonGame(p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
-                       obs_type=:minimal_flat)
-    env = GI.init(gspec)
-    env.game = g
-
-    rng = MersenneTwister(seed)
-    result = AlphaZero.GameLoop.play_game(w, b, env;
-        record_value_comparison=true,
-        value_oracle=value_oracle_fn,
-        opponent_value_fn=wildbg_value_fn,
-        rng=rng)
-
-    # Convert to expected return format (map opponent_val -> wb_val field name)
-    value_samples = result.value_samples
-    az_reward = az_is_white ? result.reward : -result.reward
-
-    return (reward=az_reward, value_samples=value_samples)
-end
-
-"""Run eval vs wildbg on fixed positions using CPU threads.
-Returns (equity, win_pct, value_mse, value_corr) or nothing if eval disabled."""
-function run_eval!(network_to_eval, iter::Int)
-    !EVAL_ENABLED && return nothing
-    isempty(EVAL_POSITIONS) && return nothing
-
-    # Copy network to CPU for eval
-    eval_net = Flux.cpu(network_to_eval)
-
-    batch_oracle(states::Vector) = _eval_forward_network(eval_net, states)
-    single_oracle(s) = batch_oracle([s])[1]
-
-    n_pos = length(EVAL_POSITIONS)
-    n_total = 2 * n_pos  # both sides
-    rewards = Vector{Float64}(undef, n_total)
-    vsamples = Vector{Vector{PositionValueSample}}(undef, n_total)
-
-    # Create per-worker wildbg backends
-    n_workers = min(EVAL_WORKERS, Threads.nthreads() - 1)
-    n_workers = max(1, n_workers)
-
-    wildbg_backends = [begin
-        wb = BackgammonNet.WildbgBackend(nets=nets_variant)
-        BackgammonNet.open!(wb)
-        wb
-    end for _ in 1:n_workers]
-
-    t_start = time()
-    claimed = Threads.Atomic{Int}(0)
-
-    Threads.@threads for tid in 1:n_workers
-        wb = wildbg_backends[tid]
-        while true
-            job = Threads.atomic_add!(claimed, 1) + 1
-            job > n_total && break
-            if job <= n_pos
-                pos_idx = job
-                az_white = true
-            else
-                pos_idx = job - n_pos
-                az_white = false
-            end
-            result = eval_race_game_server(single_oracle, batch_oracle, wb,
-                                           EVAL_POSITIONS[pos_idx], eval_net;
-                                           seed=job + iter * 10000, az_is_white=az_white)
-            rewards[job] = result.reward
-            vsamples[job] = result.value_samples
-        end
-    end
-
-    elapsed = time() - t_start
-
-    for wb in wildbg_backends
-        BackgammonNet.close(wb)
-    end
-
-    # Compute stats
-    avg_equity = mean(rewards)
-    win_pct = 100 * count(r -> r > 0, rewards) / n_total
-    white_equity = mean(rewards[1:n_pos])
-    black_equity = mean(rewards[n_pos+1:end])
-
-    all_vs = PositionValueSample[]
-    for vs in vsamples; append!(all_vs, vs); end
-    value_mse = NaN
-    value_corr = NaN
-    if length(all_vs) >= 3
-        nn = [s.nn_val for s in all_vs]
-        wb = [s.opponent_val for s in all_vs]
-        value_mse = mean((nn .- wb) .^ 2)
-        value_corr = cor(nn, wb)
-    end
-
-    @info "Eval iter $iter: equity=$(round(avg_equity, digits=3)) win%=$(round(win_pct, digits=1)) " *
-          "white=$(round(white_equity, digits=3)) black=$(round(black_equity, digits=3)) " *
-          "value_mse=$(round(value_mse, digits=4)) corr=$(round(value_corr, digits=4)) " *
-          "$(n_total) games in $(round(elapsed, digits=1))s"
-
-    return (equity=avg_equity, win_pct=win_pct, white_equity=white_equity, black_equity=black_equity,
-            value_mse=value_mse, value_corr=value_corr, n_games=n_total, elapsed=elapsed)
-end
-
 # Create networks
 println("\nCreating networks...")
 contact_network = FluxLib.FCResNetMultiHead(
@@ -974,8 +861,8 @@ contact_network = FluxLib.FCResNetMultiHead(
 race_network = FluxLib.FCResNetMultiHead(
     gspec, FluxLib.FCResNetMultiHeadHP(width=RACE_WIDTH, num_blocks=RACE_BLOCKS))
 
-println("Contact model parameters: $(sum(length(p) for p in Flux.params(contact_network)))")
-println("Race model parameters: $(sum(length(p) for p in Flux.params(race_network)))")
+println("Contact model parameters: $(sum(length, Flux.trainables(contact_network)))")
+println("Race model parameters: $(sum(length, Flux.trainables(race_network)))")
 
 # Move to GPU if available
 if USE_GPU
@@ -986,26 +873,42 @@ end
 
 # Resume from checkpoint if specified
 START_ITER = 0
+RESUME_BUNDLE = nothing
 if !isempty(ARGS["resume"])
     resume_dir = ARGS["resume"]
-    contact_path = joinpath(resume_dir, "contact_train_latest.data")
-    race_path = joinpath(resume_dir, "race_train_latest.data")
-    iter_file = joinpath(resume_dir, "iter.txt")
-
-    FluxLib.load_weights(contact_path, contact_network)
-    FluxLib.load_weights(race_path, race_network)
-    START_ITER = parse(Int, strip(read(iter_file, String)))
-    println("Resume: loaded TRAINING-state weights (*_train_latest.data)")
-    println("Resumed from $resume_dir at iteration $START_ITER")
-
-    if GATE_ENABLED
-        gs = load_gate_state(joinpath(resume_dir, "gate_state.json"))
-        GATE_STATE[] = gs
-        println("Promotion gate: resumed state — best $(GATE_METRIC_NAME)=$(isfinite(gs.best_metric) ? round(gs.best_metric, digits=5) : "none"), last_published=$(gs.last_published), evals=$(gs.n_evals), blocked=$(gs.n_blocked)")
+    bundle_roots = (resume_dir, joinpath(resume_dir, "checkpoints"))
+    for root in bundle_roots
+        candidate = latest_valid_checkpoint(root; required_files=[
+            "contact_train.data", "race_train.data", "optimizer_state.jls", "rng_state.jls"])
+        if candidate !== nothing
+            global RESUME_BUNDLE = candidate
+            break
+        end
     end
-
-    # Buffer loading deferred to after replay_buffer is created (see RESUME_BUFFER_DIR below)
-    global RESUME_BUFFER_DIR = joinpath(resume_dir, "..")
+    if RESUME_BUNDLE !== nothing
+        manifest = validate_checkpoint_bundle(RESUME_BUNDLE)
+        metadata = get(manifest, "metadata", Dict{String,Any}())
+        saved_contract = String(get(metadata, "contract_fingerprint", ""))
+        saved_contract == CONTRACT_FINGERPRINT || error(
+            "Resume checkpoint ML contract mismatch: saved=$saved_contract current=$CONTRACT_FINGERPRINT")
+        for (key, current) in (("contact_width", CONTACT_WIDTH),
+                               ("contact_blocks", CONTACT_BLOCKS),
+                               ("race_width", RACE_WIDTH),
+                               ("race_blocks", RACE_BLOCKS))
+            Int(get(metadata, key, current)) == current || error(
+                "Resume checkpoint architecture mismatch for $key")
+        end
+        FluxLib.load_weights(joinpath(RESUME_BUNDLE, "contact_train.data"), contact_network)
+        FluxLib.load_weights(joinpath(RESUME_BUNDLE, "race_train.data"), race_network)
+        START_ITER = Int(manifest["iteration"])
+        if GATE_ENABLED && isfile(joinpath(RESUME_BUNDLE, "gate_state.json"))
+            GATE_STATE[] = load_gate_state(joinpath(RESUME_BUNDLE, "gate_state.json"))
+        end
+        println("Resume: selected newest valid transactional bundle $RESUME_BUNDLE")
+        println("Resumed training weights at iteration $START_ITER")
+    else
+        error("No valid transactional checkpoint bundle found under $resume_dir")
+    end
 end
 
 # Optimizers
@@ -1013,6 +916,14 @@ contact_opt = Flux.AdamW(LEARNING_RATE, (0.9f0, 0.999f0), L2_REG)
 contact_opt_state = Flux.setup(contact_opt, contact_network)
 race_opt = Flux.AdamW(LEARNING_RATE, (0.9f0, 0.999f0), L2_REG)
 race_opt_state = Flux.setup(race_opt, race_network)
+
+if RESUME_BUNDLE !== nothing
+    optimizer_state = Serialization.deserialize(joinpath(RESUME_BUNDLE, "optimizer_state.jls"))
+    contact_opt_state = USE_GPU ? Flux.gpu(optimizer_state["contact"]) : optimizer_state["contact"]
+    race_opt_state = USE_GPU ? Flux.gpu(optimizer_state["race"]) : optimizer_state["race"]
+    TRAIN_RNG[] = Serialization.deserialize(joinpath(RESUME_BUNDLE, "rng_state.jls"))
+    println("Resume: restored AdamW moments and learner RNG state")
+end
 
 """Update learning rate based on schedule. Returns current LR."""
 function update_lr!(opt_state, iter::Int, total_iters::Int)
@@ -1043,125 +954,57 @@ const LEARNING_PARAMS = LearningParams(
     num_checkpoints=1
 )
 
-function _metadata_get(meta, key::Symbol, default=nothing)
-    if meta isa AbstractDict
-        haskey(meta, key) && return meta[key]
-        skey = String(key)
-        haskey(meta, skey) && return meta[skey]
-        return default
-    end
-    return hasproperty(meta, key) ? getproperty(meta, key) : default
-end
-
-function _validate_bootstrap_value_metadata!(bootstrap_samples)
-    if !(bootstrap_samples isa NamedTuple && hasproperty(bootstrap_samples, :metadata))
-        @warn "Bootstrap artifact has no metadata; cannot verify value-head contract before ingest"
-        return nothing
-    end
-
-    meta = bootstrap_samples.metadata
-    contract = _metadata_get(meta, :value_head_contract, nothing)
-    order = _metadata_get(meta, :value_head_order, nothing)
-    order_vec = order === nothing ? nothing : collect(order)
-    contract == AlphaZero.VALUE_HEAD_CONTRACT ||
-        error("Bootstrap value_head_contract mismatch: expected $(AlphaZero.VALUE_HEAD_CONTRACT), got $contract")
-    order_vec == collect(AlphaZero.VALUE_HEAD_ORDER) ||
-        error("Bootstrap value_head_order mismatch: expected $(collect(AlphaZero.VALUE_HEAD_ORDER)), got $order")
-    return nothing
-end
-
-function _check_bootstrap_equity_heads!(eq, label::AbstractString)
-    length(eq) == 5 || error("$label expected 5 value heads, got $(length(eq))")
-    vals = Float64.(eq)
-    BackgammonNet.check_probability_contract(
-        (vals[1], vals[2], vals[3], vals[4], vals[5]);
-        label=label,
-        tol=Float64(AlphaZero.VALUE_HEAD_STRICT_TOL))
-    return nothing
-end
-
 # PER buffer (columnar, pre-allocated)
 replay_buffer = PERBuffer(BUFFER_CAPACITY, _state_dim, NUM_ACTIONS;
                            beta_init=PER_BETA_INIT, annealing_iters=ARGS["total_iterations"])
 
-# Bootstrap: pre-fill buffer with expert games
+# Bootstrap artifacts are accepted only through BackgammonNet's fail-closed
+# backgammon_training_v4 loader. Historical vectors and raw columnar dumps are
+# intentionally unsupported: they cannot prove the current observation, policy,
+# value-head, perspective, or provenance contracts.
 if !isempty(ARGS["bootstrap_file"])
     let bootstrap_path = ARGS["bootstrap_file"],
         t0 = time()
 
-        println("\nLoading bootstrap data from: $bootstrap_path")
+        println("\nLoading canonical bootstrap artifact from: $bootstrap_path")
         flush(stdout)
-        bootstrap_samples = Serialization.deserialize(bootstrap_path)
-        _validate_bootstrap_value_metadata!(bootstrap_samples)
+        artifact = BackgammonNet.load_training_artifact(bootstrap_path)
+        if !isempty(artifact.cube_states)
+            @warn "Skipping $(length(artifact.cube_states)) cube-policy samples: " *
+                  "the current AlphaZero network has only the 676-way checker head"
+        end
 
-        # Supported bootstrap formats:
-        # 1) Vector of per-sample NamedTuples with state/policy/value/equity/flags
-        # 2) Raw columnar NamedTuple with states/policies/values/equity_postroll
-        is_raw_columnar = bootstrap_samples isa NamedTuple && hasproperty(bootstrap_samples, :states)
-        n_bootstrap = is_raw_columnar ? length(bootstrap_samples.states) : length(bootstrap_samples)
+        OBSERVATION_FORMAT === :flat || error(
+            "canonical bootstrap ingestion requires BACKGAMMON_OBS_TYPE=*_flat; " *
+            "got $(OBSERVATION_TYPE)")
+        n_bootstrap = length(artifact.states)
         max_load = ARGS["bootstrap_max_samples"] > 0 ?
-            min(ARGS["bootstrap_max_samples"], BUFFER_CAPACITY) : min(n_bootstrap, BUFFER_CAPACITY)
+            min(ARGS["bootstrap_max_samples"], BUFFER_CAPACITY) :
+            min(n_bootstrap, BUFFER_CAPACITY)
 
         chunk_size = 10000
         loaded = 0
         for start_idx in 1:chunk_size:max_load
             end_idx = min(start_idx + chunk_size - 1, max_load)
             n = end_idx - start_idx + 1
+            batch = BackgammonNet.TrainingBatch(
+                n; kind=BackgammonNet.ACTION_TYPE_CHECKERS,
+                tier=OBSERVATION_TIER, format=:flat)
+            BackgammonNet.fill_training_batch!(batch, artifact, start_idx:end_idx)
 
-            local states, policies, values, equities, has_equity, is_chance, is_contact, is_bearoff
-            if is_raw_columnar
-                state_chunk = bootstrap_samples.states[start_idx:end_idx]
-                policy_chunk = bootstrap_samples.policies[start_idx:end_idx]
-                value_chunk = bootstrap_samples.values[start_idx:end_idx]
-                equity_chunk = hasproperty(bootstrap_samples, :equity_postroll) ?
-                    bootstrap_samples.equity_postroll[start_idx:end_idx] :
-                    bootstrap_samples.equity[start_idx:end_idx]
-
-                states = Matrix{Float32}(undef, _state_dim, n)
-                policies = zeros(Float32, NUM_ACTIONS, n)
-                values = Float32.(value_chunk)
-                equities = Matrix{Float32}(undef, 5, n)
-                has_equity = fill(true, n)
-                is_chance = Vector{Bool}(undef, n)
-                is_contact = Vector{Bool}(undef, n)
-                is_bearoff = Vector{Bool}(undef, n)
-
-                for j in 1:n
-                    game = state_chunk[j]
-                    states[:, j] .= vec(GI.vectorize_state(gspec, game))
-                    raw_policy = policy_chunk[j]
-                    plen = min(length(raw_policy), NUM_ACTIONS)
-                    for a in 1:plen
-                        @inbounds policies[a, j] = Float32(raw_policy[a])
-                    end
-                    eq = equity_chunk[j]
-                    _check_bootstrap_equity_heads!(eq, "bootstrap sample $(start_idx + j - 1)")
-                    @inbounds for k in 1:5
-                        equities[k, j] = Float32(eq[k])
-                    end
-                    is_chance[j] = BackgammonNet.is_chance_node(game)
-                    is_contact[j] = BackgammonNet.is_contact_position(game)
-                    is_bearoff[j] = BearoffK7.is_bearoff_position(game.p0, game.p1)
-                end
-            else
-                chunk = bootstrap_samples[start_idx:end_idx]
-                states = hcat([s.state for s in chunk]...)
-                policies_raw = hcat([s.policy for s in chunk]...)
-                if size(policies_raw, 1) < NUM_ACTIONS
-                    policies = zeros(Float32, NUM_ACTIONS, n)
-                    policies[1:size(policies_raw, 1), :] .= policies_raw
-                else
-                    policies = policies_raw[1:NUM_ACTIONS, :]
-                end
-                values = Float32[s.value for s in chunk]
-                for (j, s) in enumerate(chunk)
-                    s.has_equity && _check_bootstrap_equity_heads!(s.equity, "bootstrap sample $(start_idx + j - 1)")
-                end
-                equities = hcat([s.equity for s in chunk]...)
-                has_equity = Bool[s.has_equity for s in chunk]
-                is_chance = Bool[s.is_chance for s in chunk]
-                is_contact = Bool[s.is_contact for s in chunk]
-                is_bearoff = Bool[s.is_bearoff for s in chunk]
+            states = @view batch.observations[:, 1:n]
+            policies = @view batch.policies[:, 1:n]
+            values = @view batch.value_scalars[1:n]
+            equities = @view batch.value_heads[:, 1:n]
+            has_equity = fill(true, n)
+            is_chance = Vector{Bool}(undef, n)
+            is_contact = Vector{Bool}(undef, n)
+            is_bearoff = Vector{Bool}(undef, n)
+            for j in 1:n
+                game = artifact.states[start_idx + j - 1]
+                is_chance[j] = BackgammonNet.is_chance_node(game)
+                is_contact[j] = BackgammonNet.is_contact_position(game)
+                is_bearoff[j] = BearoffK7.is_bearoff_position(game.p0, game.p1)
             end
 
             per_add_batch!(replay_buffer, states, policies, values,
@@ -1169,12 +1012,11 @@ if !isempty(ARGS["bootstrap_file"])
             loaded += n
         end
 
-        bootstrap_samples = nothing
+        artifact = nothing
         GC.gc()
         t_load = time() - t0
         println("  Loaded $loaded / $n_bootstrap bootstrap samples in $(round(t_load, digits=1))s")
         println("  Buffer size: $(buf_length(replay_buffer))")
-        # Log partition counts so contamination (contact samples in race mode) is visible at load time
         let parts = partition_indices(replay_buffer)
             println("  Partition: contact=$(length(parts.contact)) race=$(length(parts.race))")
             if ARGS["training_mode"] == "race" && !isempty(parts.contact)
@@ -1186,15 +1028,11 @@ if !isempty(ARGS["bootstrap_file"])
 end
 
 # Load buffer checkpoint if resuming (must happen after replay_buffer is created)
-if @isdefined(RESUME_BUFFER_DIR)
-    buf_path = joinpath(RESUME_BUFFER_DIR, "buffer", "buffer_iter_$START_ITER.jls")
-    if isfile(buf_path)
-        load_buffer!(replay_buffer, buf_path)
-        println("Loaded buffer checkpoint from $buf_path")
-    else
-        println("Resume: no buffer checkpoint at $buf_path — starting with EMPTY buffer " *
-                "(warm weights, cold buffer). Intended for weights-only resume (e.g. bootstrap→self-play).")
-    end
+if RESUME_BUNDLE !== nothing && isfile(joinpath(RESUME_BUNDLE, "buffer.jls"))
+    load_buffer!(replay_buffer, joinpath(RESUME_BUNDLE, "buffer.jls"))
+    println("Resume: restored replay buffer from transactional bundle")
+elseif RESUME_BUNDLE !== nothing
+    println("Resume: bundle has no replay buffer — starting warm weights with a cold buffer")
 end
 
 # Training functions (extracted from train_distributed.jl)
@@ -1265,9 +1103,14 @@ function compute_td_errors(nn, batch_data)
 end
 
 function _train_model_on_samples!(buf_indices::Vector{Int}, network, opt_state;
-                                  expect_contact::Union{Nothing, Bool}=nothing)
+                                  expect_contact::Union{Nothing, Bool}=nothing,
+                                  current_iteration::Int=0)
     n = length(buf_indices)
-    n < BATCH_SIZE && return (avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0, num_batches=0)
+    n < BATCH_SIZE && return (
+        avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0,
+        num_batches=0, skipped_batches=0, nonfinite_batches=0,
+        td_error_mean=0.0, td_error_count=0,
+        sample_age_mean=0.0, sample_age_max=0, sample_age_count=0)
 
     if ARGS["training_steps"] > 0
         max_batches = ARGS["training_steps"]
@@ -1280,15 +1123,22 @@ function _train_model_on_samples!(buf_indices::Vector{Int}, network, opt_state;
     total_Lv = 0.0
     total_Linv = 0.0
     n_masked_skipped = 0
+    n_nonfinite = 0
+    total_td_error = 0.0
+    n_td_errors = 0
+    total_sample_age = 0
+    max_sample_age = 0
+    n_sample_ages = 0
 
     for _ in 1:num_batches
         # PER: sample proportional to priorities within this model's partition
         # Uniform: sample randomly from the partition
         if USE_PER
             batch_buf_indices, is_weights = per_sample_partition(
-                replay_buffer, buf_indices, BATCH_SIZE, PER_ALPHA, PER_EPSILON)
+                replay_buffer, buf_indices, BATCH_SIZE, PER_ALPHA, PER_EPSILON;
+                rng=TRAIN_RNG[])
         else
-            sample_idx = rand(1:n, BATCH_SIZE)
+            sample_idx = rand(TRAIN_RNG[], 1:n, BATCH_SIZE)
             batch_buf_indices = buf_indices[sample_idx]
             is_weights = ones(Float32, BATCH_SIZE)
         end
@@ -1329,31 +1179,72 @@ function _train_model_on_samples!(buf_indices::Vector{Int}, network, opt_state;
 
         loss_fn(nn) = losses(nn, LEARNING_PARAMS, Wmean, Hp, batch_data_per)[1]
         loss, grads = Flux.withgradient(loss_fn, network)
+        # Inspect the same pre-update batch components plus every numeric gradient
+        # leaf before mutating either the model or optimizer state. A rejected
+        # batch cannot poison weights, optimizer moments, or PER priorities.
+        L, Lp, Lv, _, Linv = losses(network, LEARNING_PARAMS, Wmean, Hp, batch_data_per)
+        Lf, Lpf, Lvf, Linvf = Float64(L), Float64(Lp), Float64(Lv), Float64(Linv)
+        finite_scalars = isfinite(Float64(loss)) && isfinite(Lf) &&
+            isfinite(Lpf) && isfinite(Lvf) && isfinite(Linvf)
+        if !finite_scalars || !_all_finite_gradient(grads[1])
+            n_nonfinite += 1
+            if n_nonfinite == 1 || n_nonfinite % 100 == 0
+                @warn "Rejected non-finite training batch before optimizer update" expect_contact n_nonfinite
+            end
+            continue
+        end
         Flux.update!(opt_state, network, grads[1])
 
-        L, Lp, Lv, _, Linv = losses(network, LEARNING_PARAMS, Wmean, Hp, batch_data_per)
-        total_loss += Float64(L)
-        total_Lp += Float64(Lp)
-        total_Lv += Float64(Lv)
-        total_Linv += Float64(Linv)
+        total_loss += Lf
+        total_Lp += Lpf
+        total_Lv += Lvf
+        total_Linv += Linvf
+        for source_iteration in col_data.source_iterations
+            if source_iteration >= 0
+                age = max(0, current_iteration - Int(source_iteration))
+                total_sample_age += age
+                max_sample_age = max(max_sample_age, age)
+                n_sample_ages += 1
+            end
+        end
 
         # Update PER priorities with TD-errors
         if USE_PER
             td_errors = compute_td_errors(network, batch_data_per)
+            total_td_error += sum(td_errors)
+            n_td_errors += length(td_errors)
             per_update_priorities!(replay_buffer, batch_buf_indices, td_errors)
         end
     end
 
     # Divide by batches actually trained on (skipped all-masked batches excluded).
-    processed = max(1, num_batches - n_masked_skipped)
+    processed = num_batches - n_masked_skipped - n_nonfinite
+    processed == 0 && return (
+        avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0,
+        num_batches=0, skipped_batches=n_masked_skipped,
+        nonfinite_batches=n_nonfinite, td_error_mean=0.0,
+        td_error_count=n_td_errors, sample_age_mean=0.0,
+        sample_age_max=max_sample_age, sample_age_count=n_sample_ages)
     return (avg_loss=total_loss / processed, avg_Lp=total_Lp / processed,
             avg_Lv=total_Lv / processed, avg_Linv=total_Linv / processed,
-            num_batches=processed)
+            num_batches=processed, skipped_batches=n_masked_skipped,
+            nonfinite_batches=n_nonfinite,
+            td_error_mean=n_td_errors == 0 ? 0.0 : total_td_error / n_td_errors,
+            td_error_count=n_td_errors,
+            sample_age_mean=n_sample_ages == 0 ? 0.0 : total_sample_age / n_sample_ages,
+            sample_age_max=max_sample_age, sample_age_count=n_sample_ages)
 end
 
-function train_on_buffer!()
+function train_on_buffer!(current_iteration::Int)
     n_buf = buf_length(replay_buffer)
-    n_buf < BATCH_SIZE && return (contact=(avg_loss=0.0,), race=(avg_loss=0.0,))
+    if n_buf < BATCH_SIZE
+        empty_result = (
+            avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0,
+            num_batches=0, skipped_batches=0, nonfinite_batches=0,
+            td_error_mean=0.0, td_error_count=0,
+            sample_age_mean=0.0, sample_age_max=0, sample_age_count=0)
+        return (contact=empty_result, race=empty_result)
+    end
 
     if USE_PER
         per_anneal_beta!(replay_buffer)
@@ -1370,14 +1261,21 @@ function train_on_buffer!()
         if n_contact > 0
             @warn "Race-only mode: buffer holds $(n_contact) contact samples — excluded from training" maxlog=10
         end
-        contact_result = (avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0, num_batches=0)
+        contact_result = (
+            avg_loss=0.0, avg_Lp=0.0, avg_Lv=0.0, avg_Linv=0.0,
+            num_batches=0, skipped_batches=0, nonfinite_batches=0,
+            td_error_mean=0.0, td_error_count=0,
+            sample_age_mean=0.0, sample_age_max=0, sample_age_count=0)
         race_result = _train_model_on_samples!(parts.race, race_network, race_opt_state;
-                                               expect_contact=false)
+                                               expect_contact=false,
+                                               current_iteration=current_iteration)
     else
         contact_result = _train_model_on_samples!(parts.contact, contact_network, contact_opt_state;
-                                                  expect_contact=true)
+                                                  expect_contact=true,
+                                                  current_iteration=current_iteration)
         race_result = _train_model_on_samples!(parts.race, race_network, race_opt_state;
-                                               expect_contact=false)
+                                               expect_contact=false,
+                                               current_iteration=current_iteration)
     end
 
     return (contact=contact_result, race=race_result)
@@ -1389,7 +1287,7 @@ function reanalyze_buffer!()
     n == 0 && return 0
 
     num_to_reanalyze = max(1, round(Int, n * REANALYZE_FRACTION))
-    reanalyze_indices = randperm(n)[1:min(num_to_reanalyze, n)]
+    reanalyze_indices = randperm(TRAIN_RNG[], n)[1:min(num_to_reanalyze, n)]
 
     batch_size = min(2048, length(reanalyze_indices))
     total_updated = 0
@@ -1473,6 +1371,9 @@ else
     TBLogger(TB_DIR, tb_overwrite)
 end
 
+include(joinpath(@__DIR__, "..", "src", "distributed", "tensorboard_dashboard.jl"))
+const TB_DASHBOARD_LAYOUT = install_tensorboard_dashboard!(TB_LOGGER)
+
 # Log config
 with_logger(TB_LOGGER) do
     git_commit = try strip(read(`git rev-parse HEAD`, String)) catch; "unknown" end
@@ -1490,7 +1391,7 @@ with_logger(TB_LOGGER) do
     - **GPU**: $(USE_GPU ? "$(CUDA.name(CUDA.device()))" : "CPU only")
     $(join(params_lines, "\n"))
     """
-    @info "config" text=repro_text log_step_increment=0
+    @info "00_run/config" text=repro_text log_step_increment=0
 end
 
 function finalize_eval_job!(job; source::String="training-loop")
@@ -1504,13 +1405,14 @@ function finalize_eval_job!(job; source::String="training-loop")
         # Log to TB at the eval iteration (not the current training iteration).
         TB_LOGGER.global_step = job.iter
         with_logger(TB_LOGGER) do
-            @info "eval/equity" value=result.equity log_step_increment=0
-            @info "eval/win_pct" value=result.win_pct * 100 log_step_increment=0
-            @info "eval/white_equity" value=result.white_equity log_step_increment=0
-            @info "eval/black_equity" value=result.black_equity log_step_increment=0
-            @info "eval/value_mse" value=result.value_mse log_step_increment=0
-            @info "eval/value_corr" value=result.value_corr log_step_increment=0
-            @info "eval/games" value=result.num_games log_step_increment=0
+            @info "05_eval_strength/equity" value=result.equity log_step_increment=0
+            @info "05_eval_strength/win_pct" value=result.win_pct * 100 log_step_increment=0
+            @info "05_eval_strength/white_equity" value=result.white_equity log_step_increment=0
+            @info "05_eval_strength/black_equity" value=result.black_equity log_step_increment=0
+            @info "05_eval_strength/contact_value_mse" value=result.contact_value_mse log_step_increment=0
+            @info "05_eval_strength/contact_value_corr" value=result.contact_value_corr log_step_increment=0
+            @info "05_eval_strength/race_value_mse" value=result.race_value_mse log_step_increment=0
+            @info "05_eval_strength/race_value_corr" value=result.race_value_corr log_step_increment=0
         end
     catch e
         @error "finalize_eval failed; discarding eval job for iter $(job.iter)" source exception=(e, catch_backtrace())
@@ -1554,6 +1456,13 @@ end
 
 # Server config (served to clients via GET /api/config)
 const SERVER_CONFIG = Dict{String, Any}(
+    "protocol_version" => DISTRIBUTED_PROTOCOL_VERSION,
+    "ml_contract" => ML_CONTRACT,
+    "contract_fingerprint" => CONTRACT_FINGERPRINT,
+    "observation_type" => String(OBSERVATION_TYPE),
+    "cube_enabled" => CUBE_ENABLED,
+    "jacoby_enabled" => JACOBY_ENABLED,
+    "tavla_enabled" => TAVLA_ENABLED,
     "mcts_iters" => ARGS["mcts_iters"],
     "mcts_budget_mode" => ARGS["mcts_budget_mode"],
     "progressive_sim_min" => ARGS["progressive_sim_min"],
@@ -1589,18 +1498,229 @@ const SERVER_CONFIG = Dict{String, Any}(
     "training_mode" => ARGS["training_mode"],
     "start_positions_file" => basename(ARGS["start_positions_file"]),
     "eval_positions_file" => basename(ARGS["eval_positions_file"]),
+    "eval_manifest_file" => basename(EVAL_MANIFEST_PATH),
+    "eval_data_dir" => isempty(ARGS["eval_positions_file"]) ? "" : dirname(abspath(ARGS["eval_positions_file"])),
+    "data_dir" => abspath(DATA_DIR),
     "seed" => ARGS["seed"],
     "eval_mcts_iters" => ARGS["eval_mcts_iters"],
+    "eval_backend_quality" => ARGS["eval_backend_quality"],
 )
 
 # Initialize server state
 server_state = ServerState(api_key=ARGS["api_key"], config=SERVER_CONFIG)
 server_state.iteration[] = START_ITER
 
-# Cache initial weights
-update_weight_cache!(server_state, contact_network, race_network;
-                     contact_width=CONTACT_WIDTH, contact_blocks=CONTACT_BLOCKS,
-                     race_width=RACE_WIDTH, race_blocks=RACE_BLOCKS)
+# Cache initial weights. Transactional resume restores the last PUBLISHED blobs,
+# which may intentionally differ from training weights after a promotion block.
+if RESUME_BUNDLE !== nothing &&
+   isfile(joinpath(RESUME_BUNDLE, "contact_published.weights")) &&
+   isfile(joinpath(RESUME_BUNDLE, "race_published.weights"))
+    contact_bytes = read(joinpath(RESUME_BUNDLE, "contact_published.weights"))
+    race_bytes = read(joinpath(RESUME_BUNDLE, "race_published.weights"))
+    deserialize_weights_with_header(contact_bytes)
+    deserialize_weights_with_header(race_bytes)
+    metadata = checkpoint_manifest(RESUME_BUNDLE)["metadata"]
+    server_state.contact_weight_bytes = contact_bytes
+    server_state.race_weight_bytes = race_bytes
+    server_state.contact_version[] = Int(get(metadata, "contact_version", 1))
+    server_state.race_version[] = Int(get(metadata, "race_version", 1))
+    version = max(server_state.contact_version[], server_state.race_version[])
+    server_state.weight_history[version] = (copy(contact_bytes), copy(race_bytes))
+    println("Resume: restored last-good published weights separately from training state")
+else
+    update_weight_cache!(server_state, contact_network, race_network;
+                         contact_width=CONTACT_WIDTH, contact_blocks=CONTACT_BLOCKS,
+                         race_width=RACE_WIDTH, race_blocks=RACE_BLOCKS)
+end
+
+function _git_revision(path::AbstractString)
+    try
+        return strip(read(`git -C $path rev-parse HEAD`, String))
+    catch
+        return "unknown"
+    end
+end
+
+function _git_dirty(path::AbstractString)
+    try
+        return !isempty(strip(read(`git -C $path status --porcelain`, String)))
+    catch
+        return nothing
+    end
+end
+
+function _artifact_identity(path::AbstractString)
+    isempty(path) && return nothing
+    isfile(path) || return Dict("path" => abspath(path), "missing" => true)
+    digest = open(path, "r") do io
+        bytes2hex(SHA.sha256(io))
+    end
+    return Dict("path" => abspath(path), "bytes" => filesize(path), "sha256" => digest)
+end
+
+const RUN_PROVENANCE = Dict{String,Any}(
+    "alphazero_commit" => _git_revision(dirname(@__DIR__)),
+    "alphazero_dirty" => _git_dirty(dirname(@__DIR__)),
+    "backgammonnet_version" => string(Base.pkgversion(BackgammonNet)),
+    "backgammonnet_commit" => _git_revision(dirname(pathof(BackgammonNet))),
+    "backgammonnet_dirty" => _git_dirty(dirname(pathof(BackgammonNet))),
+    "julia_version" => string(VERSION),
+    "contract_fingerprint" => CONTRACT_FINGERPRINT,
+    "config_fingerprint" => contract_fingerprint(SERVER_CONFIG),
+    "seed" => ARGS["seed"],
+    "artifacts" => Dict(
+        "bootstrap" => _artifact_identity(ARGS["bootstrap_file"]),
+        "start_positions" => _artifact_identity(ARGS["start_positions_file"]),
+        "eval_positions" => _artifact_identity(ARGS["eval_positions_file"]),
+        "eval_manifest" => _artifact_identity(EVAL_MANIFEST_PATH),
+    ),
+)
+SERVER_CONFIG["run_provenance"] = RUN_PROVENANCE
+
+function _atomic_copy(source::AbstractString, destination::AbstractString)
+    temporary = destination * ".tmp"
+    cp(source, temporary; force=true)
+    mv(temporary, destination; force=true)
+    return destination
+end
+
+function save_training_checkpoint_bundle!(iteration::Int;
+                                          include_buffer::Bool=false,
+                                          reason::String="periodic")
+    published_contact, published_race = lock(server_state.weight_lock) do
+        (copy(server_state.contact_weight_bytes), copy(server_state.race_weight_bytes))
+    end
+    writers = Dict{String,Function}(
+        "contact_train.data" => path -> FluxLib.save_weights(path, Flux.cpu(contact_network)),
+        "race_train.data" => path -> FluxLib.save_weights(path, Flux.cpu(race_network)),
+        "optimizer_state.jls" => path -> Serialization.serialize(path, Dict(
+            "contact" => Flux.cpu(contact_opt_state),
+            "race" => Flux.cpu(race_opt_state))),
+        "rng_state.jls" => path -> Serialization.serialize(path, TRAIN_RNG[]),
+        "run_config.json" => path -> open(path, "w") do io
+            JSON.print(io, Dict("server_config" => SERVER_CONFIG,
+                                "provenance" => RUN_PROVENANCE))
+        end,
+        "contact_published.weights" => path -> write(path, published_contact),
+        "race_published.weights" => path -> write(path, published_race),
+    )
+    if GATE_ENABLED
+        writers["gate_state.json"] = path -> save_gate_state(
+            path, GATE_STATE[]; metric_name=GATE_METRIC_NAME,
+            tol_frac=GATE_TOL_FRAC, tol_abs=GATE_TOL_ABS)
+    end
+    include_buffer && (writers["buffer.jls"] = path -> save_buffer(replay_buffer, path))
+    metadata = merge(copy(RUN_PROVENANCE), Dict{String,Any}(
+        "reason" => reason,
+        "includes_buffer" => include_buffer,
+        "contact_version" => server_state.contact_version[],
+        "race_version" => server_state.race_version[],
+        "contact_width" => CONTACT_WIDTH,
+        "contact_blocks" => CONTACT_BLOCKS,
+        "race_width" => RACE_WIDTH,
+        "race_blocks" => RACE_BLOCKS,
+        "training_mode" => ARGS["training_mode"],
+    ))
+    bundle = write_checkpoint_bundle!(CHECKPOINT_DIR, iteration, writers; metadata)
+    return bundle
+end
+
+function perform_preflight!()
+    report_path = joinpath(DATA_DIR, "preflight_report.json")
+    checks = Pair{String,Function}[
+        "Julia version" => function()
+            VERSION >= v"1.12.6" || error("Julia >= 1.12.6 required, got $VERSION")
+            return string(VERSION)
+        end,
+        "BackgammonNet version" => function()
+            version = Base.pkgversion(BackgammonNet)
+            version >= v"0.7.0" || error("BackgammonNet >= 0.7.0 required, got $version")
+            return string(version)
+        end,
+        "BackgammonNet revision" => function()
+            package_root = dirname(dirname(pathof(BackgammonNet)))
+            revision = _git_revision(package_root)
+            revision == "unknown" && error(
+                "BackgammonNet source must be a Git checkout for reproducible validation")
+            dirty = _git_dirty(package_root)
+            dirty === false || error(
+                "BackgammonNet checkout must be clean before validation (dirty=$dirty)")
+            return revision
+        end,
+        "ML contract" => function()
+            contract_fingerprint(backgammon_ml_contract(gspec)) == CONTRACT_FINGERPRINT ||
+                error("ML contract fingerprint is unstable")
+            return Dict("fingerprint" => CONTRACT_FINGERPRINT,
+                        "state_dim" => _state_dim, "num_actions" => NUM_ACTIONS)
+        end,
+        "21 chance outcomes" => function()
+            GI.num_chance_outcomes(gspec) == 21 || error(
+                "wrapper reports $(GI.num_chance_outcomes(gspec)) chance outcomes")
+            length(BackgammonNet.DICE_OUTCOMES) == 21 || error(
+                "BackgammonNet reports $(length(BackgammonNet.DICE_OUTCOMES)) dice outcomes")
+            length(BackgammonNet.DICE_PROBS) == 21 || error("dice probability length mismatch")
+            isapprox(sum(BackgammonNet.DICE_PROBS), 1; atol=1e-12) || error(
+                "dice probabilities do not sum to one")
+            return 21
+        end,
+        "value-head probability contract" => function()
+            BackgammonNet.check_probability_contract(
+                (0.55, 0.15, 0.03, 0.12, 0.02); label="preflight")
+            return String(BackgammonNet.VALUE_HEAD_CONTRACT)
+        end,
+        "contact and race inference" => function()
+            env = GI.init(gspec)
+            state = Float32.(reshape(vec(GI.vectorize_state(gspec, GI.current_state(env))), :, 1))
+            input = USE_GPU ? Flux.gpu(state) : state
+            for (name, network) in (("contact", contact_network), ("race", race_network))
+                policy, value = Network.forward(network, input)
+                size(policy, 1) == NUM_ACTIONS || error("$name policy width mismatch")
+                all(isfinite, Flux.cpu(policy)) || error("$name policy is non-finite")
+                all(isfinite, Flux.cpu(value)) || error("$name value is non-finite")
+            end
+            return "finite"
+        end,
+        "distributed protocol round-trip" => function()
+            batch = SampleBatch(Int32(1), zeros(Float32, _state_dim, 1),
+                zeros(Float32, NUM_ACTIONS, 1), zeros(Float32, 1),
+                zeros(Float32, 5, 1), falses(1), trues(1), falses(1), falses(1))
+            envelope = unpack_samples_envelope(pack_samples(batch;
+                contract_fingerprint=CONTRACT_FINGERPRINT,
+                batch_id="preflight-1", source_iteration=START_ITER))
+            validate_sample_envelope!(envelope, CONTRACT_FINGERPRINT)
+            return DISTRIBUTED_PROTOCOL_VERSION
+        end,
+        "weight serialization checksum" => function()
+            bytes = serialize_weights_with_header(Flux.cpu(contact_network),
+                WeightHeader(0x01, Int32(START_ITER), Int32(CONTACT_WIDTH),
+                             Int32(CONTACT_BLOCKS), UInt64(0)))
+            header, _ = deserialize_weights_with_header(bytes)
+            return Dict("iteration" => Int(header.iteration), "bytes" => length(bytes))
+        end,
+        "configured artifacts" => function()
+            for (label, path) in (("bootstrap", ARGS["bootstrap_file"]),
+                                  ("start positions", ARGS["start_positions_file"]),
+                                  ("eval positions", ARGS["eval_positions_file"]))
+                isempty(path) || isfile(path) || error("$label artifact missing: $path")
+            end
+            return "present or intentionally disabled"
+        end,
+        "data directory writable" => function()
+            path, io = mktemp(DATA_DIR)
+            close(io)
+            rm(path)
+            return abspath(DATA_DIR)
+        end,
+    ]
+    report = run_preflight!(checks, report_path; metadata=RUN_PROVENANCE)
+    println("Preflight passed ($(length(report["checks"])) checks): $report_path")
+    return report
+end
+
+if ARGS["preflight"]
+    perform_preflight!()
+    exit(0)
+end
 
 # Start HTTP server
 http_server = start_server!(server_state, replay_buffer; port=ARGS["port"])
@@ -1697,6 +1817,13 @@ const SAMPLES_PER_ITERATION = ARGS["games_per_iteration"] * 200  # ~200 samples 
 # libuv event loop stays active for HTTP.jl to handle requests.
 training_task = Threads.@spawn begin
 
+# Observability snapshots are cumulative on the HTTP path. Taking one delta per
+# training iteration keeps TensorBoard series stable and avoids hot-path logging.
+metrics_previous = server_metrics_snapshot(server_state)
+metrics_previous_samples = server_state.total_samples[]
+metrics_previous_games = server_state.total_games[]
+metrics_previous_time = time()
+
 # Eval at iter 0 (bootstrap weights) — baseline before any self-play training
 if EVAL_ENABLED && START_ITER == 0
     lock(EVAL_LOCK) do
@@ -1716,10 +1843,12 @@ if EVAL_ENABLED && START_ITER == 0
 end
 
 for iter in (START_ITER + 1):ARGS["total_iterations"]
+    server_state.shutdown_requested[] && break
     # Wait for enough new samples (offset by START_ITER so resume works)
     if !ARGS["bootstrap_only"]
         target_samples = (iter - START_ITER) * SAMPLES_PER_ITERATION
-        while server_state.total_samples[] < target_samples
+        while server_state.total_samples[] < target_samples &&
+              !server_state.shutdown_requested[]
             cur = server_state.total_samples[]
             pct = round(100 * cur / target_samples, digits=1)
             n_clients = length(server_state.clients)
@@ -1727,6 +1856,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
             flush(stdout)
             sleep(5)
         end
+        server_state.shutdown_requested[] && break
         println()
     end
 
@@ -1756,7 +1886,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
 
     # Train on buffer (GPU)
     t0 = time()
-    train_result = train_on_buffer!()
+    train_result = train_on_buffer!(iter)
     t_train = time() - t0
 
     contact_loss = train_result.contact.avg_loss
@@ -1781,78 +1911,151 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
 
     # Log to console
     grad_steps = train_result.contact.num_batches + train_result.race.num_batches
-    @info "Iteration $iter" avg_loss contact_loss race_loss grad_steps buffer_size=buf_length(replay_buffer) total_samples=server_state.total_samples[] n_clients=length(server_state.clients) iter_time t_train t_reanalyze n_reanalyzed
+    skipped_batches = train_result.contact.skipped_batches + train_result.race.skipped_batches
+    nonfinite_batches = train_result.contact.nonfinite_batches + train_result.race.nonfinite_batches
+    @info "Iteration $iter" avg_loss contact_loss race_loss grad_steps skipped_batches nonfinite_batches buffer_size=buf_length(replay_buffer) total_samples=server_state.total_samples[] n_clients=length(server_state.clients) iter_time t_train t_reanalyze n_reanalyzed
 
     # Collect server and cluster stats
     server_stats = collect_server_stats()
     cluster_stats = get_cluster_stats(server_state)
+    metrics_now = server_metrics_snapshot(server_state)
+    metrics_now_time = time()
+    metrics_elapsed = max(metrics_now_time - metrics_previous_time, 1e-6)
+    metric_delta(name) = getproperty(metrics_now, name) - getproperty(metrics_previous, name)
+    new_samples = server_state.total_samples[] - metrics_previous_samples
+    new_games = server_state.total_games[] - metrics_previous_games
+    new_requests = metric_delta(:upload_requests)
+    new_simulations = metric_delta(:mcts_simulations)
+    new_tree_hits = metric_delta(:tree_hits)
+    new_tree_misses = metric_delta(:tree_misses)
+    new_nn_evals = metric_delta(:nn_evaluations)
+    new_oracle_calls = metric_delta(:oracle_calls)
+    new_bearoff_hits = metric_delta(:bearoff_hits)
+    new_bearoff_misses = metric_delta(:bearoff_misses)
+    new_search_ns = metric_delta(:search_ns)
 
     # Log to TensorBoard
     with_logger(TB_LOGGER) do
-        @info "loss/avg" value=avg_loss log_step_increment=0
-        @info "loss/contact" value=contact_loss log_step_increment=0
-        @info "loss/race" value=race_loss log_step_increment=0
+        @info "01_ml_loss/overall" value=avg_loss log_step_increment=0
+        @info "01_ml_loss/contact_total" value=contact_loss log_step_increment=0
+        @info "01_ml_loss/race_total" value=race_loss log_step_increment=0
         # Per-component losses
         if train_result.contact.num_batches > 0
-            @info "loss/contact_policy" value=train_result.contact.avg_Lp log_step_increment=0
-            @info "loss/contact_value" value=train_result.contact.avg_Lv log_step_increment=0
-            @info "loss/contact_invalid" value=train_result.contact.avg_Linv log_step_increment=0
+            @info "01_ml_loss/contact_policy" value=train_result.contact.avg_Lp log_step_increment=0
+            @info "01_ml_loss/contact_value" value=train_result.contact.avg_Lv log_step_increment=0
+            @info "01_ml_loss/contact_invalid" value=train_result.contact.avg_Linv log_step_increment=0
         end
         if train_result.race.num_batches > 0
-            @info "loss/race_policy" value=train_result.race.avg_Lp log_step_increment=0
-            @info "loss/race_value" value=train_result.race.avg_Lv log_step_increment=0
-            @info "loss/race_invalid" value=train_result.race.avg_Linv log_step_increment=0
+            @info "01_ml_loss/race_policy" value=train_result.race.avg_Lp log_step_increment=0
+            @info "01_ml_loss/race_value" value=train_result.race.avg_Lv log_step_increment=0
+            @info "01_ml_loss/race_invalid" value=train_result.race.avg_Linv log_step_increment=0
         end
-        @info "perf/train_s" value=t_train log_step_increment=0
-        @info "perf/reanalyze_s" value=t_reanalyze log_step_increment=0
-        @info "perf/iter_time" value=iter_time log_step_increment=0
-        @info "buffer/size" value=buf_length(replay_buffer) log_step_increment=0
-        @info "buffer/total_samples" value=server_state.total_samples[] log_step_increment=0
+        @info "02_ml_perf/train_seconds" value=t_train log_step_increment=0
+        @info "02_ml_perf/reanalyze_seconds" value=t_reanalyze log_step_increment=0
+        @info "02_ml_perf/iteration_seconds" value=iter_time log_step_increment=0
         buf_parts = partition_indices(replay_buffer)
-        @info "buffer/contact_samples" value=length(buf_parts.contact) log_step_increment=0
-        @info "buffer/race_samples" value=length(buf_parts.race) log_step_increment=0
-        if USE_PER
-            @info "per/beta" value=replay_buffer.beta log_step_increment=0
+        @info "04_data/contact_samples" value=length(buf_parts.contact) log_step_increment=0
+        @info "04_data/race_samples" value=length(buf_parts.race) log_step_increment=0
+        age_count = train_result.contact.sample_age_count + train_result.race.sample_age_count
+        if age_count > 0
+            age_mean = (
+                train_result.contact.sample_age_mean * train_result.contact.sample_age_count +
+                train_result.race.sample_age_mean * train_result.race.sample_age_count) / age_count
+            age_max = max(train_result.contact.sample_age_max,
+                          train_result.race.sample_age_max)
+            @info "04_data/train_sample_age_mean" value=age_mean log_step_increment=0
+            @info "04_data/train_sample_age_max" value=age_max log_step_increment=0
         end
-        @info "train/lr" value=current_lr log_step_increment=0
-        @info "train/gradient_steps" value=(train_result.contact.num_batches + train_result.race.num_batches) log_step_increment=0
+        if USE_PER
+            @info "02_ml_perf/per_beta" value=replay_buffer.beta log_step_increment=0
+        end
+        @info "02_ml_perf/learning_rate" value=current_lr log_step_increment=0
+        @info "02_ml_perf/samples_per_sec" value=(grad_steps * BATCH_SIZE / max(t_train, 1e-6)) log_step_increment=0
+        @info "02_ml_perf/skipped_batches" value=skipped_batches log_step_increment=0
+        @info "02_ml_perf/nonfinite_batches" value=nonfinite_batches log_step_increment=0
+        td_count = train_result.contact.td_error_count + train_result.race.td_error_count
+        if td_count > 0
+            td_mean = (
+                train_result.contact.td_error_mean * train_result.contact.td_error_count +
+                train_result.race.td_error_mean * train_result.race.td_error_count) / td_count
+            @info "02_ml_perf/per_td_error_mean" value=td_mean log_step_increment=0
+        end
 
         # Cluster performance
-        @info "cluster/total_samples_per_sec" value=cluster_stats.total_samples_per_sec log_step_increment=0
-        @info "cluster/total_clients" value=cluster_stats.total_clients log_step_increment=0
+        @info "03_selfplay_perf/samples_per_sec" value=(new_samples / metrics_elapsed) log_step_increment=0
+        @info "03_selfplay_perf/active_clients" value=cluster_stats.total_clients log_step_increment=0
 
-        # Per-client samples/sec
-        for (cid, cstats) in cluster_stats.per_client
-            @info "client/$(cid)/samples_per_sec" value=cstats["samples_per_sec"] log_step_increment=0
+        # Compact self-play/search dashboard. Detailed cumulative counters remain
+        # available via /api/status; dynamic per-client series stay in /api/clients.
+        @info "03_selfplay_perf/games_per_sec" value=(new_games / metrics_elapsed) log_step_increment=0
+        if new_search_ns > 0
+            @info "03_selfplay_perf/mcts_sims_per_sec" value=(new_simulations / (new_search_ns / 1e9)) log_step_increment=0
         end
+        if new_simulations > 0
+            @info "03_selfplay_perf/nn_evals_per_sim" value=(new_nn_evals / new_simulations) log_step_increment=0
+        end
+        if new_oracle_calls > 0
+            @info "03_selfplay_perf/oracle_batch_size" value=(new_nn_evals / new_oracle_calls) log_step_increment=0
+        end
+        tree_probes = new_tree_hits + new_tree_misses
+        if tree_probes > 0
+            @info "03_selfplay_perf/tree_hit_rate" value=(new_tree_hits / tree_probes) log_step_increment=0
+        end
+        bearoff_probes = new_bearoff_hits + new_bearoff_misses
+        if bearoff_probes > 0
+            @info "03_selfplay_perf/bearoff_hit_rate" value=(new_bearoff_hits / bearoff_probes) log_step_increment=0
+        end
+        if new_requests > 0
+            @info "08_reliability/upload_latency_ms" value=(metric_delta(:upload_ns) / new_requests / 1e6) log_step_increment=0
+        end
+        @info "08_reliability/duplicate_batches" value=metric_delta(:duplicate_batches) log_step_increment=0
+        @info "08_reliability/rejected_batches" value=metric_delta(:rejected_batches) log_step_increment=0
 
         # Server stats
-        @info "server/gpu_percent" value=server_stats["gpu_percent"] log_step_increment=0
-        @info "server/gpu_memory_gb" value=server_stats["gpu_memory_used_gb"] log_step_increment=0
-        @info "server/cpu_percent" value=server_stats["cpu_percent"] log_step_increment=0
+        @info "07_system/gpu_percent" value=server_stats["gpu_percent"] log_step_increment=0
+        @info "07_system/gpu_memory_gb" value=server_stats["gpu_memory_used_gb"] log_step_increment=0
+        @info "07_system/cpu_percent" value=server_stats["cpu_percent"] log_step_increment=0
 
         # Buffer reward distribution (sanity check: gammon/backgammon rates)
         n_buf = buf_length(replay_buffer)
         if n_buf > 0
-            vals = @view replay_buffer.values[1:n_buf]
-            n_bg_loss = count(v -> v <= -2.5f0, vals)
-            n_g_loss  = count(v -> -2.5f0 < v <= -1.5f0, vals)
-            n_loss    = count(v -> -1.5f0 < v < -0.5f0, vals)
-            n_win     = count(v -> 0.5f0 < v < 1.5f0, vals)
-            n_g_win   = count(v -> 1.5f0 <= v < 2.5f0, vals)
-            n_bg_win  = count(v -> v >= 2.5f0, vals)
-            @info "buffer/reward_bg_loss" value=n_bg_loss/n_buf log_step_increment=0
-            @info "buffer/reward_g_loss" value=n_g_loss/n_buf log_step_increment=0
-            @info "buffer/reward_loss" value=n_loss/n_buf log_step_increment=0
-            @info "buffer/reward_win" value=n_win/n_buf log_step_increment=0
-            @info "buffer/reward_g_win" value=n_g_win/n_buf log_step_increment=0
-            @info "buffer/reward_bg_win" value=n_bg_win/n_buf log_step_increment=0
-            @info "buffer/gammon_rate" value=(n_g_loss+n_bg_loss+n_g_win+n_bg_win)/n_buf log_step_increment=0
-            @info "buffer/backgammon_rate" value=(n_bg_loss+n_bg_win)/n_buf log_step_increment=1
+            n_bg_loss = 0; n_g_loss = 0; n_loss = 0
+            n_win = 0; n_g_win = 0; n_bg_win = 0
+            n_equity = 0; n_chance = 0; n_bearoff = 0
+            @inbounds for i in 1:n_buf
+                v = replay_buffer.values[i]
+                if v <= -2.5f0
+                    n_bg_loss += 1
+                elseif v <= -1.5f0
+                    n_g_loss += 1
+                elseif v < -0.5f0
+                    n_loss += 1
+                elseif 0.5f0 < v < 1.5f0
+                    n_win += 1
+                elseif 1.5f0 <= v < 2.5f0
+                    n_g_win += 1
+                elseif v >= 2.5f0
+                    n_bg_win += 1
+                end
+                n_equity += replay_buffer.has_equity[i]
+                n_chance += replay_buffer.is_chance[i]
+                n_bearoff += replay_buffer.is_bearoff[i]
+            end
+            @info "04_data/win_rate" value=(n_win+n_g_win+n_bg_win)/n_buf log_step_increment=0
+            @info "04_data/gammon_rate" value=(n_g_loss+n_bg_loss+n_g_win+n_bg_win)/n_buf log_step_increment=0
+            @info "04_data/equity_label_rate" value=n_equity/n_buf log_step_increment=0
+            @info "04_data/chance_sample_rate" value=n_chance/n_buf log_step_increment=0
+            @info "04_data/bearoff_sample_rate" value=n_bearoff/n_buf log_step_increment=0
+            @info "04_data/backgammon_rate" value=(n_bg_loss+n_bg_win)/n_buf log_step_increment=1
         else
-            @info "placeholder" value=0 log_step_increment=1
+            @info "04_data/backgammon_rate" value=0 log_step_increment=1
         end
     end
+
+    metrics_previous = metrics_now
+    metrics_previous_samples = server_state.total_samples[]
+    metrics_previous_games = server_state.total_games[]
+    metrics_previous_time = metrics_now_time
 
     # Bearoff accuracy: NN equity vs exact table targets on bearoff positions
     # Measures how well the NN has learned bearoff evaluation
@@ -1864,7 +2067,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
             n_sample = min(1000, n_bo)
             # Draw a random subset of ALL bearoff slots, not just the first n_sample
             # (randperm(n_sample) only permutes 1:n_sample → oldest slots only).
-            sample_idx = bearoff_mask[randperm(n_bo)[1:n_sample]]
+            sample_idx = bearoff_mask[randperm(TRAIN_RNG[], n_bo)[1:n_sample]]
 
             # Get states and targets
             bo_states = replay_buffer.states[:, sample_idx]
@@ -1897,10 +2100,9 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
             bo_corr = (nn_std > 0 && tbl_std > 0) ? cov_val / (nn_std * tbl_std) : 0.0f0
 
             with_logger(TB_LOGGER) do
-                @info "bearoff/nn_vs_table_mse" value=bo_mse log_step_increment=0
-                @info "bearoff/nn_vs_table_mae" value=bo_mae log_step_increment=0
-                @info "bearoff/nn_vs_table_corr" value=bo_corr log_step_increment=0
-                @info "bearoff/n_samples" value=n_bo log_step_increment=0
+                @info "06_eval_bearoff/learned_value_mae" value=bo_mae log_step_increment=0
+                @info "06_eval_bearoff/learned_value_corr" value=bo_corr log_step_increment=0
+                @info "06_eval_bearoff/learned_samples" value=n_bo log_step_increment=0
             end
             @info "Bearoff accuracy" mse=round(bo_mse, digits=6) mae=round(bo_mae, digits=4) corr=round(bo_corr, digits=4) n_bearoff=n_bo n_sampled=n_sample
         end
@@ -1915,27 +2117,19 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
             bo_result = run_bearoff_eval!(race_network, iter)
             if bo_result !== nothing
                 with_logger(TB_LOGGER) do
-                    @info "bearoff_fixed/value_mae" value=bo_result["value_mae"] log_step_increment=0
-                    @info "bearoff_fixed/value_rmse" value=bo_result["value_rmse"] log_step_increment=0
-                    @info "bearoff_fixed/value_bias" value=bo_result["value_bias"] log_step_increment=0
-                    @info "bearoff_fixed/value_corr" value=bo_result["value_corr"] log_step_increment=0
-                    @info "bearoff_fixed/policy_top1" value=100 * bo_result["policy_top1"] log_step_increment=0
-                    @info "bearoff_fixed/policy_top3" value=100 * bo_result["policy_top3"] log_step_increment=0
-                    @info "bearoff_fixed/policy_top5" value=100 * bo_result["policy_top5"] log_step_increment=0
-                    @info "bearoff_fixed/policy_best_rank" value=bo_result["policy_best_rank"] log_step_increment=0
-                    @info "bearoff_fixed/policy_opt_mass" value=100 * bo_result["policy_opt_mass"] log_step_increment=0
-                    @info "bearoff_fixed/policy_expected_regret" value=bo_result["policy_expected_regret"] log_step_increment=0
-                    @info "bearoff_fixed/policy_top1_prob" value=100 * bo_result["policy_top1_prob"] log_step_increment=0
-                    @info "bearoff_fixed/nn_top1" value=100 * bo_result["nn_top1"] log_step_increment=0
-                    @info "bearoff_fixed/nn_wrong" value=100 * bo_result["nn_wrong"] log_step_increment=0
-                    @info "bearoff_fixed/nn_regret" value=bo_result["nn_regret"] log_step_increment=0
-                    @info "bearoff_fixed/tie_rate" value=100 * bo_result["tie_rate"] log_step_increment=0
-                    @info "bearoff_fixed/avg_margin" value=bo_result["avg_margin"] log_step_increment=0
+                    @info "06_eval_bearoff/fixed_value_mae" value=bo_result["value_mae"] log_step_increment=0
+                    @info "06_eval_bearoff/fixed_value_bias" value=bo_result["value_bias"] log_step_increment=0
+                    @info "06_eval_bearoff/fixed_value_corr" value=bo_result["value_corr"] log_step_increment=0
+                    @info "06_eval_bearoff/fixed_policy_top1" value=100 * bo_result["policy_top1"] log_step_increment=0
+                    @info "06_eval_bearoff/fixed_policy_top3" value=100 * bo_result["policy_top3"] log_step_increment=0
+                    @info "06_eval_bearoff/fixed_policy_opt_mass" value=100 * bo_result["policy_opt_mass"] log_step_increment=0
+                    @info "06_eval_bearoff/fixed_policy_expected_regret" value=bo_result["policy_expected_regret"] log_step_increment=0
+                    @info "06_eval_bearoff/fixed_nn_top1" value=100 * bo_result["nn_top1"] log_step_increment=0
+                    @info "06_eval_bearoff/fixed_nn_regret" value=bo_result["nn_regret"] log_step_increment=0
                     if haskey(bo_result, "mcts_top1")
-                        @info "bearoff_fixed/mcts_top1" value=100 * bo_result["mcts_top1"] log_step_increment=0
-                        @info "bearoff_fixed/mcts_wrong" value=100 * bo_result["mcts_wrong"] log_step_increment=0
-                        @info "bearoff_fixed/mcts_regret" value=bo_result["mcts_regret"] log_step_increment=0
-                        @info "bearoff_fixed/mcts_regret_gt_001" value=100 * bo_result["mcts_regret_gt_001"] log_step_increment=0
+                        @info "06_eval_bearoff/fixed_mcts_top1" value=100 * bo_result["mcts_top1"] log_step_increment=0
+                        @info "06_eval_bearoff/fixed_mcts_regret" value=bo_result["mcts_regret"] log_step_increment=0
+                        @info "06_eval_bearoff/fixed_mcts_regret_gt_001" value=100 * bo_result["mcts_regret_gt_001"] log_step_increment=0
                     end
                 end
                 @info "Fixed bearoff eval" iter=iter value_mae=round(bo_result["value_mae"], digits=4) value_corr=round(bo_result["value_corr"], digits=4) policy_top1=round(100 * bo_result["policy_top1"], digits=1) nn_top1=round(100 * bo_result["nn_top1"], digits=1) mcts_top1=round(100 * get(bo_result, "mcts_top1", NaN), digits=1)
@@ -1950,11 +2144,11 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
                     GATE_STATE[] = dec.state
                     gate_updated_this_eval = true   # eval produced a decision; catch must not override
                     with_logger(TB_LOGGER) do
-                        @info "gate/metric" value=dec.metric log_step_increment=0
-                        @info "gate/best_metric" value=(isfinite(dec.best_metric) ? dec.best_metric : dec.metric) log_step_increment=0
-                        @info "gate/threshold" value=(isfinite(dec.threshold) ? dec.threshold : dec.metric) log_step_increment=0
-                        @info "gate/n_blocked" value=dec.state.n_blocked log_step_increment=0
-                        @info "gate/n_eval_failures" value=dec.state.n_eval_failures log_step_increment=0
+                        @info "09_promotion/metric" value=dec.metric log_step_increment=0
+                        @info "09_promotion/best_metric" value=(isfinite(dec.best_metric) ? dec.best_metric : dec.metric) log_step_increment=0
+                        @info "09_promotion/threshold" value=(isfinite(dec.threshold) ? dec.threshold : dec.metric) log_step_increment=0
+                        @info "09_promotion/blocked" value=dec.state.n_blocked log_step_increment=0
+                        @info "09_promotion/eval_failures" value=dec.state.n_eval_failures log_step_increment=0
                     end
                     if dec.publish
                         @info "Promotion gate PASS — publication allowed" iter=iter metric=round(dec.metric, digits=5) best=round(dec.best_metric, digits=5) threshold=round(dec.threshold, digits=5) improved=dec.improved
@@ -1983,8 +2177,8 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
                 dec = gate_on_eval_error(GATE_STATE[])
                 GATE_STATE[] = dec.state
                 with_logger(TB_LOGGER) do
-                    @info "gate/n_eval_failures" value=dec.state.n_eval_failures log_step_increment=0
-                    @info "gate/n_blocked" value=dec.state.n_blocked log_step_increment=0
+                    @info "09_promotion/eval_failures" value=dec.state.n_eval_failures log_step_increment=0
+                    @info "09_promotion/blocked" value=dec.state.n_blocked log_step_increment=0
                 end
                 if dec.publish
                     @warn "Promotion gate: eval signal FAILED, no baseline yet (cold start) — publishing (fail-open)" iter=iter n_eval_failures=dec.state.n_eval_failures
@@ -2007,7 +2201,7 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     end
     if GATE_ENABLED
         with_logger(TB_LOGGER) do
-            @info "gate/published" value=(publish_this_iter ? 1 : 0) log_step_increment=0
+            @info "09_promotion/published" value=(publish_this_iter ? 1 : 0) log_step_increment=0
         end
     end
 
@@ -2016,48 +2210,41 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
 
     # Checkpoint
     if iter % ARGS["checkpoint_interval"] == 0
-        # iter_N checkpoints are history — always written regardless of the gate.
-        FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "contact_iter_$iter.data"),
-                             Flux.cpu(contact_network))
-        FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "race_iter_$iter.data"),
-                             Flux.cpu(race_network))
-        # *_train_latest.data are the current TRAINING-state weights — written
-        # UNCONDITIONALLY every checkpoint (in lock-step with iter.txt). On a gate
-        # BLOCK the published *_latest.data stays at last-good while training and
-        # iter.txt advance; --resume prefers these so it restores the true current
-        # training state, not stale published weights under a newer iter count.
-        FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "contact_train_latest.data"),
-                             Flux.cpu(contact_network))
-        FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "race_train_latest.data"),
-                             Flux.cpu(race_network))
+        buf_interval = ARGS["buffer_checkpoint_interval"]
+        include_buffer = buf_interval > 0 && iter % buf_interval == 0
+        bundle = save_training_checkpoint_bundle!(iter; include_buffer)
+        _atomic_copy(joinpath(bundle, "contact_train.data"),
+                     joinpath(CHECKPOINT_DIR, "contact_iter_$iter.data"))
+        _atomic_copy(joinpath(bundle, "race_train.data"),
+                     joinpath(CHECKPOINT_DIR, "race_iter_$iter.data"))
         # *_latest.data are the PUBLISHED weights — only overwrite when the gate
         # permits publication this iteration (else keep serving last-good).
         if publish_this_iter
-            FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "contact_latest.data"),
-                                 Flux.cpu(contact_network))
-            FluxLib.save_weights(joinpath(CHECKPOINT_DIR, "race_latest.data"),
-                                 Flux.cpu(race_network))
+            _atomic_copy(joinpath(bundle, "contact_train.data"),
+                         joinpath(CHECKPOINT_DIR, "contact_latest.data"))
+            _atomic_copy(joinpath(bundle, "race_train.data"),
+                         joinpath(CHECKPOINT_DIR, "race_latest.data"))
         else
             @warn "Gate held publication — leaving race_latest.data / contact_latest.data at last-good weights" iter=iter
         end
-        open(joinpath(CHECKPOINT_DIR, "iter.txt"), "w") do f
-            print(f, iter)
-        end
-        # Persist gate state alongside checkpoints for --resume.
         if GATE_ENABLED
-            save_gate_state(joinpath(CHECKPOINT_DIR, "gate_state.json"), GATE_STATE[];
-                            metric_name=GATE_METRIC_NAME, tol_frac=GATE_TOL_FRAC, tol_abs=GATE_TOL_ABS)
+            _atomic_copy(joinpath(bundle, "gate_state.json"),
+                         joinpath(CHECKPOINT_DIR, "gate_state.json"))
         end
-        @info "Saved checkpoint at iteration $iter"
+        @info "Saved transactional checkpoint" iter bundle include_buffer
     end
 
-    # Buffer checkpoint (large — only every N iterations)
+    # If the buffer cadence does not coincide with the model cadence, retain a
+    # separately atomic buffer snapshot. Coincident snapshots live in the bundle.
     buf_interval = ARGS["buffer_checkpoint_interval"]
-    if buf_interval > 0 && iter % buf_interval == 0
+    if buf_interval > 0 && iter % buf_interval == 0 &&
+       iter % ARGS["checkpoint_interval"] != 0
         buf_path = joinpath(DATA_DIR, "buffer", "buffer_iter_$iter.jls")
         @info "Saving buffer checkpoint..." iter=iter size=replay_buffer.size
         t0 = time()
-        save_buffer(replay_buffer, buf_path)
+        temporary = buf_path * ".tmp"
+        save_buffer(replay_buffer, temporary)
+        mv(temporary, buf_path; force=true)
         @info "Buffer checkpoint saved" path=buf_path elapsed=round(time()-t0, digits=1)
     end
 
@@ -2094,7 +2281,13 @@ for iter in (START_ITER + 1):ARGS["total_iterations"]
     end
 end
 
-wait_for_final_eval!()
+server_state.shutdown_requested[] || wait_for_final_eval!()
+
+server_state.accepting_samples[] = false
+final_iteration = server_state.iteration[]
+final_bundle = save_training_checkpoint_bundle!(final_iteration;
+    include_buffer=true, reason=server_state.shutdown_requested[] ? "drain" : "complete")
+@info "Final transactional checkpoint ready" iteration=final_iteration bundle=final_bundle
 
 println("\nTraining complete!")
 println("Checkpoints at: $CHECKPOINT_DIR")
@@ -2109,5 +2302,10 @@ try
     wait(training_task)
 catch e
     e isa InterruptException || rethrow()
-    println("\nShutting down...")
+    println("\nDrain requested; waiting for a safe checkpoint boundary...")
+    server_state.accepting_samples[] = false
+    server_state.shutdown_requested[] = true
+    wait(training_task)
+finally
+    close(http_server)
 end

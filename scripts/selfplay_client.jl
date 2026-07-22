@@ -1,23 +1,5 @@
 #!/usr/bin/env julia
 
-# Auto-install dependencies on first run
-import Pkg
-let manifest = joinpath(dirname(@__DIR__), "Manifest.toml")
-    if !isfile(manifest) || filesize(manifest) < 100
-        println("First run — installing dependencies...")
-        # BackgammonNet.jl is not in the public registry — dev-link from sibling dir or clone
-        bgnet_dir = joinpath(dirname(@__DIR__), "..", "BackgammonNet.jl")
-        if !isdir(bgnet_dir)
-            println("Cloning BackgammonNet.jl...")
-            run(`git clone https://github.com/sile16/BackgammonNet.jl.git $bgnet_dir`)
-        end
-        Pkg.develop(path=bgnet_dir)
-        Pkg.resolve()
-        Pkg.instantiate()
-        println("Dependencies installed. Precompiling (this takes ~10 min on first run)...")
-    end
-end
-
 """
 Self-play client for distributed training.
 
@@ -41,8 +23,6 @@ using ArgParse
 using Dates
 using Random
 using Statistics
-
-include(joinpath(@__DIR__, "_backgammon_data_paths.jl"))
 
 const SelfPlayRNG = Random.Xoshiro
 
@@ -93,10 +73,6 @@ function parse_args()
         "--eval-only"
             help = "Run distributed eval chunks only; do not generate or upload self-play samples"
             action = :store_true
-        "--eval-mcts-iters"
-            help = "DEPRECATED — now controlled by server config"
-            arg_type = Int
-            default = 0
         "--wildbg-lib"
             help = "Path to wildbg shared library (for eval)"
             arg_type = String
@@ -104,7 +80,12 @@ function parse_args()
         "--eval-positions-file"
             help = "Path to fixed eval positions file (portable tuples)"
             arg_type = String
-            default = backgammonnet_eval_data_file("race_eval_2000.jls")
+            default = "race_eval_2000.jls"
+        "--data-cache-dir"
+            help = "Local cache for immutable files downloaded from the server"
+            arg_type = String
+            default = get(ENV, "ALPHAZERO_CLIENT_CACHE_DIR",
+                          joinpath(dirname(@__DIR__), "sessions", "client-cache"))
     end
 
     return ArgParse.parse_args(s)
@@ -117,6 +98,7 @@ const GPU_WORKERS = ARGS["gpu_workers"]
 const USE_GPU = GPU_WORKERS > 0
 const EVAL_CAPABLE = ARGS["eval_capable"]
 const EVAL_ONLY = ARGS["eval_only"]
+const DATA_CACHE_DIR = abspath(ARGS["data_cache_dir"])
 EVAL_ONLY && !EVAL_CAPABLE && error("--eval-only requires --eval-capable")
 
 println("=" ^ 60)
@@ -131,7 +113,7 @@ using AlphaZero: ConstSchedule
 using AlphaZero: GameLoop
 import Flux
 import BackgammonNet
-using BackgammonNet: BearoffK7, BearoffOneSided, CombinedBearoff
+using BackgammonNet: BearoffK7, BearoffOneSidedCompact, CombinedBearoff
 using BackgammonNet: bearoff_best_move_value, bearoff_covers, bearoff_equity, bearoff_lookup
 using BackgammonNet: bearoff_turn_value_equity, bearoff_value_to_nn_scale
 import JSON3
@@ -188,6 +170,15 @@ println("Registered as: $client_name")
 
 # Fetch config from server
 config = fetch_config!(client)
+Int(get(config, "protocol_version", 0)) == DISTRIBUTED_PROTOCOL_VERSION || error(
+    "Server protocol mismatch: client=$DISTRIBUTED_PROTOCOL_VERSION " *
+    "server=$(get(config, "protocol_version", "missing"))")
+server_fingerprint = String(get(config, "contract_fingerprint", ""))
+isempty(server_fingerprint) && error("Server config is missing contract_fingerprint")
+if reg.contract_fingerprint !== nothing && reg.contract_fingerprint != server_fingerprint
+    error("Registration/config contract fingerprint changed: " *
+          "registration=$(reg.contract_fingerprint) config=$server_fingerprint")
+end
 println("\nServer config:")
 for (k, v) in sort(collect(config), by=first)
     println("  $k: $v")
@@ -204,8 +195,12 @@ const MCTS_ITERS = Int(config["mcts_iters"])
 const INFERENCE_BATCH_SIZE = Int(config["inference_batch_size"])
 const NUM_ACTIONS = Int(config["num_actions"])
 const EVAL_MCTS_ITERS = Int(config["eval_mcts_iters"])
+const EVAL_BACKEND_QUALITY = BackgammonNet.backend_quality(config["eval_backend_quality"])
+const EVAL_WILDBG_NETS = BackgammonNet.backend_quality_settings(
+    :wildbg, EVAL_BACKEND_QUALITY).nets
 if EVAL_CAPABLE
     println("Eval MCTS iters: $EVAL_MCTS_ITERS")
+    println("Eval backend: WildBG quality=$EVAL_BACKEND_QUALITY nets=$EVAL_WILDBG_NETS")
 end
 
 # Temperature scheduling
@@ -237,13 +232,23 @@ const BEAROFF_TRUNCATION = Bool(config["bearoff_truncation"])
 
 # Game setup
 if GAME_NAME == "backgammon-deterministic"
-    ENV["BACKGAMMON_OBS_TYPE"] = get(ENV, "BACKGAMMON_OBS_TYPE", "min_plus_flat")
+    ENV["BACKGAMMON_OBS_TYPE"] = String(config["observation_type"])
+    ENV["BACKGAMMON_CUBE_ENABLED"] = string(Bool(config["cube_enabled"]))
+    ENV["BACKGAMMON_JACOBY_ENABLED"] = string(Bool(config["jacoby_enabled"]))
+    ENV["BACKGAMMON_TAVLA_ENABLED"] = string(Bool(config["tavla_enabled"]))
     include(joinpath(@__DIR__, "..", "games", "backgammon-deterministic", "game.jl"))
 else
     error("Unknown game: $GAME_NAME")
 end
 const gspec = GameSpec()
 const _state_dim = let env = GI.init(gspec); length(vec(GI.vectorize_state(gspec, GI.current_state(env)))); end
+const LOCAL_ML_CONTRACT = backgammon_ml_contract(gspec)
+validate_contract!(config["ml_contract"], LOCAL_ML_CONTRACT;
+                   label="server/client Backgammon ML contract")
+const CONTRACT_FINGERPRINT = contract_fingerprint(LOCAL_ML_CONTRACT)
+CONTRACT_FINGERPRINT == server_fingerprint || error(
+    "Server/client contract fingerprint mismatch after validation")
+client.contract_fingerprint = CONTRACT_FINGERPRINT
 const ORACLE_CFG = AlphaZero.BackgammonInference.OracleConfig(
     _state_dim, NUM_ACTIONS, gspec;
     vectorize_state! = vectorize_state_into!,
@@ -256,8 +261,8 @@ contact_network = FluxLib.FCResNetMultiHead(
 race_network = FluxLib.FCResNetMultiHead(
     gspec, FluxLib.FCResNetMultiHeadHP(width=RACE_WIDTH, num_blocks=RACE_BLOCKS))
 
-println("Contact model: $(CONTACT_WIDTH)w×$(CONTACT_BLOCKS)b ($(sum(length(p) for p in Flux.params(contact_network))) params)")
-println("Race model: $(RACE_WIDTH)w×$(RACE_BLOCKS)b ($(sum(length(p) for p in Flux.params(race_network))) params)")
+println("Contact model: $(CONTACT_WIDTH)w×$(CONTACT_BLOCKS)b ($(sum(length, Flux.trainables(contact_network))) params)")
+println("Race model: $(RACE_WIDTH)w×$(RACE_BLOCKS)b ($(sum(length, Flux.trainables(race_network))) params)")
 
 # Download initial weights from server
 println("\nDownloading initial weights from server...")
@@ -317,17 +322,18 @@ const BEAROFF_TABLE = let
         k7 = BearoffK7.BearoffTable(table_dir)
         println("  c14: $(round(length(k7.c14_data)/1e9, digits=1)) GB")
         println("  c15: $(round(length(k7.c15_data)/1e9, digits=1)) GB")
-        # Optional n=18 one-sided race table — extends EXACT coverage to disengaged
-        # races ≤18 pips/side. Present → COMBINED (exact race frontier for the contact
-        # curriculum); absent → k7-only (deep bearoff exact; >7pt races → NN).
-        os_dir = BackgammonNet.default_bearoff_onesided_dir()
-        if isdir(os_dir) && isfile(joinpath(os_dir, "onesided_all.bin"))
-            os = BearoffOneSided.OneSidedTable(os_dir)
-            println("Loaded n=18 one-sided race table from $os_dir → COMBINED bearoff (exact race frontier)")
+        # Optional n15 one-sided race bundle — extends EXACT race coverage beyond the
+        # k7 (<=7 from off) deep-bearoff frontier. Present → COMBINED (k7 → n15 tier,
+        # exact race frontier for the contact curriculum); absent → k7-only (deep
+        # bearoff exact; races outside k7 handled by the NN).
+        n15_dir = BackgammonNet.default_bearoff_n15_dir()
+        if isdir(n15_dir) && isfile(joinpath(n15_dir, "header.txt"))
+            n15 = BearoffOneSidedCompact.CompactBundle(n15_dir)
+            println("Loaded n15 race bundle from $n15_dir → COMBINED bearoff (k7 → n15 exact race frontier)")
             flush(stdout)
-            CombinedBearoff(k7, os)
+            CombinedBearoff(k7, n15)
         else
-            println("No n=18 one-sided table found — k7-only bearoff (>7pt races handled by NN)")
+            println("No n15 race bundle found — k7-only bearoff (races outside k7 handled by NN)")
             flush(stdout)
             k7
         end
@@ -428,6 +434,10 @@ function bearoff_post_dice_equity(game::BackgammonNet.BackgammonGame, table)
     if best_mover_equity === nothing
         return nothing
     end
+    # BackgammonNet's bearoff_turn_value_equity returns the 5-head equity as an
+    # NTuple; AlphaZero's sample/equity path is Vector-based (copy, serialization,
+    # and the AbstractVector-only flip_equity_perspective wrapper). Collect once.
+    best_mover_equity = collect(Float32, best_mover_equity)
     best_mover_value = Float32(best_mover_value)
 
     # Convert mover-relative to white-relative
@@ -515,15 +525,13 @@ function find_or_download(filename::String; required::Bool=true)
     # Search local paths
     candidates = [
         filename,  # full path (if provided)
-        joinpath(backgammonnet_eval_data_dir(), name),
-        joinpath(dirname(@__DIR__), "eval_data", name),
-        joinpath(homedir(), "eval_data", name),
+        joinpath(DATA_CACHE_DIR, name),
     ]
     for p in candidates
         isfile(p) && return p
     end
     # Download from server
-    local_path = joinpath(backgammonnet_eval_data_dir(), name)
+    local_path = joinpath(DATA_CACHE_DIR, name)
     mkpath(dirname(local_path))
     println("Downloading $name from server...")
     try
@@ -561,21 +569,19 @@ end
 
 """Initialize a game environment from configured starting positions or default opening."""
 function init_game(rng::AbstractRNG)
-    env = GI.init(gspec)
-    if hasproperty(env, :rng) && rng isa typeof(env.rng)
-        env.rng = rng
-    end
-    if START_POSITIONS !== nothing
+    if START_POSITIONS === nothing
+        return init_with_rng(gspec, rng)
+    else
         # Pick a random starting position, create a BackgammonGame at chance node (pre-dice)
         p0, p1, cp = START_POSITIONS[rand(rng, 1:length(START_POSITIONS))]
-        game = BackgammonNet.BackgammonGame(
+        game = backgammon_game(
             p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
-            obs_type=OBSERVATION_TYPE)
-        GI.set_state!(env, game)
+            observation_type=OBSERVATION_TYPE)
+        env = GameEnv(game, rng)
         # Roll initial dice
         BackgammonNet.sample_chance!(env.game, rng)
+        return env
     end
-    return env
 end
 
 #####
@@ -888,6 +894,20 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
                           rng::AbstractRNG;
                           player=nothing)
     n_bearoff_truncated = 0
+    search_totals = BatchedMCTS.SearchMetrics()
+
+    function accumulate_search!(dst, src)
+        dst.simulations += src.simulations
+        dst.tree_hits += src.tree_hits
+        dst.tree_misses += src.tree_misses
+        dst.nn_evaluations += src.nn_evaluations
+        dst.oracle_calls += src.oracle_calls
+        dst.bearoff_hits += src.bearoff_hits
+        dst.bearoff_misses += src.bearoff_misses
+        dst.search_ns += src.search_ns
+        dst.max_depth = max(dst.max_depth, src.max_depth)
+        return dst
+    end
 
     if player === nothing
         mcts_params = MctsParams(
@@ -981,6 +1001,7 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         end
 
         BatchedMCTS.reset_player!(player)
+        accumulate_search!(search_totals, BatchedMCTS.take_search_metrics!(player))
 
         if bearoff_truncated
             n_bearoff_truncated += 1
@@ -1006,7 +1027,8 @@ function _play_games_loop(vworker_id::Int, games_claimed::Threads.Atomic{Int}, t
         append!(all_samples, samples)
     end
 
-    return (samples=all_samples, n_bearoff_truncated=n_bearoff_truncated)
+    return (samples=all_samples, n_bearoff_truncated=n_bearoff_truncated,
+            search_metrics=search_totals)
 end
 
 """Play games on a worker thread with the shared CPU inference backend."""
@@ -1180,41 +1202,54 @@ const UPLOAD_INTERVAL = ARGS["upload_interval"]
 
 # Single background network thread handles uploads AND weight sync.
 # HTTP.jl deadlocks with multiple concurrent spawned threads doing HTTP.
-const UPLOAD_CHANNEL = Channel{Vector{UInt8}}(8)
+const UPLOAD_CHANNEL = Channel{Tuple{String,Vector{UInt8}}}(8)
 const EVAL_CHANNEL = Channel{Dict{String,Any}}(40)  # eval chunks from server upload response
 Threads.@spawn begin
     while true
         # Block waiting for upload data
-        bytes = take!(UPLOAD_CHANNEL)
+        batch_id, bytes = take!(UPLOAD_CHANNEL)
 
-        # Upload samples
-        try
-            headers = vcat(auth_headers(client),
-                           ["Content-Type" => "application/msgpack"])
-            t0 = time()
-            resp = HTTP.post("$(client.server_url)/api/samples",
-                             headers, bytes; status_exception=false,
-                             connect_timeout=10, readtimeout=60)
-            t_upload = time() - t0
-            if resp.status == 200
-                result = JSON.parse(String(resp.body))
-                println("  Uploaded $(result["accepted"]) samples ($(round(length(bytes)/1024, digits=1)) KB, $(round(t_upload, digits=2))s), buffer=$(result["buffer_size"]))")
-                if get(result, "restart", false)
-                    println("\n*** Server requested restart — exiting for update ***")
-                    flush(stdout)
-                    exit(0)
+        # Retry the SAME idempotent batch until acknowledged. Backpressure from
+        # the bounded channel stops workers before samples can be dropped.
+        uploaded = false
+        retry_delay = 1.0
+        while !uploaded
+            try
+                headers = vcat(auth_headers(client),
+                               ["Content-Type" => "application/msgpack"])
+                t0 = time()
+                resp = HTTP.post("$(client.server_url)/api/samples",
+                                 headers, bytes; status_exception=false,
+                                 connect_timeout=10, readtimeout=60)
+                t_upload = time() - t0
+                if resp.status == 200
+                    result = JSON.parse(String(resp.body))
+                    String(result["batch_id"]) == batch_id || error(
+                        "Server acknowledged unexpected batch $(result["batch_id"]); expected $batch_id")
+                    uploaded = true
+                    duplicate_note = get(result, "duplicate", false) ? " (retry acknowledged)" : ""
+                    println("  Uploaded $(result["accepted"]) samples$duplicate_note ($(round(length(bytes)/1024, digits=1)) KB, $(round(t_upload, digits=2))s), buffer=$(result["buffer_size"]))")
+                    if get(result, "restart", false)
+                        println("\n*** Server requested restart — exiting for update ***")
+                        flush(stdout)
+                        exit(0)
+                    end
+                    # Queue eval work if server assigned a chunk
+                    eval_chunk = get(result, "eval_chunk", nothing)
+                    if eval_chunk !== nothing
+                        put!(EVAL_CHANNEL, Dict{String,Any}(eval_chunk))
+                        println("  [EVAL] Chunk $(eval_chunk["chunk_id"]) queued (iter=$(eval_chunk["eval_iter"]))")
+                    end
+                else
+                    println("  Upload failed for $batch_id: HTTP $(resp.status); retrying")
                 end
-                # Queue eval work if server assigned a chunk
-                eval_chunk = get(result, "eval_chunk", nothing)
-                if eval_chunk !== nothing
-                    put!(EVAL_CHANNEL, Dict{String,Any}(eval_chunk))
-                    println("  [EVAL] Chunk $(eval_chunk["chunk_id"]) queued (iter=$(eval_chunk["eval_iter"]))")
-                end
-            else
-                println("  Upload failed: $(resp.status)")
+            catch e
+                println("  Upload error for $batch_id: $e; retrying")
             end
-        catch e
-            println("  Upload error: $e")
+            if !uploaded
+                sleep(retry_delay)
+                retry_delay = min(30.0, retry_delay * 2)
+            end
         end
 
         # Weight sync — runs on same thread as upload, after each upload
@@ -1241,7 +1276,7 @@ Threads.@spawn begin
 end
 
 # Shared sample channel: workers push completed game samples, main thread drains and uploads
-const SAMPLE_CHANNEL = Channel{Vector{Any}}(NUM_WORKERS * 2)
+const SAMPLE_CHANNEL = Channel{Any}(NUM_WORKERS * 2)
 
 """Continuous worker: plays games forever, pushing samples into SAMPLE_CHANNEL."""
 function continuous_worker(worker_id::Int, rng::AbstractRNG)
@@ -1271,7 +1306,7 @@ function continuous_worker(worker_id::Int, rng::AbstractRNG)
         result = _play_games_loop(worker_id, games_claimed, 1, sub_rng;
                                   player=player)
         if !isempty(result.samples)
-            put!(SAMPLE_CHANNEL, result.samples)
+            put!(SAMPLE_CHANNEL, result)
         end
         games_played += 1
         if games_played <= 3
@@ -1321,40 +1356,24 @@ else
     nothing
 end
 
-# Find wildbg library for eval
-function find_wildbg_lib_eval()
-    lib = ARGS["wildbg_lib"]
-    if !isempty(lib) && isfile(lib)
-        return lib
-    end
-    candidates = [
-        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg_main.dylib"),
-        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg_main.so"),
-        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg.dylib"),
-        joinpath(homedir(), "github", "wildbg", "target", "release", "libwildbg.so"),
-    ]
-    for c in candidates
-        isfile(c) && return c
-    end
-    return ""
-end
-
-const WILDBG_LIB_EVAL = EVAL_CAPABLE ? find_wildbg_lib_eval() : ""
+const WILDBG_LIB_EVAL = EVAL_CAPABLE ? BackgammonNet.wildbg_library_path(
+    EVAL_WILDBG_NETS; explicit=ARGS["wildbg_lib"]) : ""
+const WILDBG_AVAILABLE = EVAL_CAPABLE && isfile(WILDBG_LIB_EVAL)
 if EVAL_CAPABLE
-    if isempty(WILDBG_LIB_EVAL)
-        println("WARNING: wildbg library not found — eval disabled")
+    if !WILDBG_AVAILABLE
+        println("WARNING: configured WildBG library not found at $WILDBG_LIB_EVAL — eval disabled")
     else
-        println("Eval: wildbg lib = $WILDBG_LIB_EVAL")
+        println("Eval: WildBG library = $WILDBG_LIB_EVAL")
     end
 end
-if EVAL_ONLY && (EVAL_POSITIONS === nothing || isempty(WILDBG_LIB_EVAL))
+if EVAL_ONLY && (EVAL_POSITIONS === nothing || !WILDBG_AVAILABLE)
     error("--eval-only requested, but eval positions or wildbg are unavailable")
 end
 
 # Re-register with eval capability now that WILDBG_LIB_EVAL is known
 if EVAL_CAPABLE
     register!(client; name=client_name,
-              eval_capable=true, has_wildbg=!isempty(WILDBG_LIB_EVAL))
+              eval_capable=true, has_wildbg=WILDBG_AVAILABLE)
 end
 
 # Eval agent struct — holds a reusable MCTS player to avoid per-move allocation
@@ -1386,6 +1405,7 @@ end
 struct PositionValueSample
     nn_val::Float64
     wb_val::Float64
+    is_contact::Bool
 end
 
 """Play a single eval game from a fixed position. Returns (reward, value_samples)."""
@@ -1397,8 +1417,9 @@ function eval_game_from_position(az_agent::EvalAlphaZeroAgent,
     rng = new_selfplay_rng(seed)
     az_agent.player.benv.env.rng = rng
     p0, p1, cp = position_data
-    g = BackgammonNet.BackgammonGame(p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
-                                      obs_type=:minimal_flat)
+    g = backgammon_game(p0, p1, SVector{2,Int8}(0, 0), Int8(0), cp, false, 0.0f0;
+                        observation_type=:minimal_flat)
+    start_is_contact = BackgammonNet.is_contact_position(g)
     value_samples = PositionValueSample[]
 
     while !BackgammonNet.game_terminated(g)
@@ -1413,7 +1434,8 @@ function eval_game_from_position(az_agent::EvalAlphaZeroAgent,
                 # on the same (points) scale.
                 nn_v = Float64(value_batch_oracle([g])[1][2]) * Float64(GI.reward_scale(gspec))
                 wb_v = Float64(BackgammonNet.evaluate(wildbg_agent.backend, g))
-                push!(value_samples, PositionValueSample(nn_v, wb_v))
+                push!(value_samples, PositionValueSample(
+                    nn_v, wb_v, BackgammonNet.is_contact_position(g)))
             end
             agent = is_az_turn ? az_agent : wildbg_agent
             action = BackgammonNet.agent_move(agent, g)
@@ -1423,7 +1445,8 @@ function eval_game_from_position(az_agent::EvalAlphaZeroAgent,
 
     white_reward = Float64(g.reward)
     az_reward = az_is_white ? white_reward : -white_reward
-    return (reward=az_reward, value_samples=value_samples)
+    return (reward=az_reward, value_samples=value_samples,
+            is_contact=start_is_contact)
 end
 
 """Set up eval session for a new iteration (download weights, build shared oracles).
@@ -1474,9 +1497,7 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
         dirichlet_noise_ϵ=0.0,
         dirichlet_noise_α=0.3)
 
-    # Auto-detect wildbg nets variant
-    lib_size = filesize(WILDBG_LIB_EVAL)
-    nets_variant = lib_size > 16_000_000 ? :large : :small
+    nets_variant = EVAL_WILDBG_NETS
 
     # One call for both backends: in :flux mode eval_contact_fw/eval_race_fw are
     # nothing and make_cpu_oracles ignores them (it routes on the net); in :fast
@@ -1507,7 +1528,8 @@ function setup_eval_session!(eval_iter::Int, weights_version::Int)
                 eval_mcts_params, INFERENCE_BATCH_SIZE, gspec)
             vo = make_eval_oracles(1)
             value_batch_oracles[tid] = vo[2]
-            wb = BackgammonNet.WildbgBackend(; nets=nets_variant, lib_path=WILDBG_LIB_EVAL)
+            wb = BackgammonNet.open_backend(:wildbg; role=:validate,
+                quality=EVAL_BACKEND_QUALITY, open=false, lib_path=WILDBG_LIB_EVAL)
             push!(opened_wbs, wb)
             BackgammonNet.open!(wb)
             wb_agents[tid] = BackgammonNet.BackendAgent(wb)
@@ -1562,7 +1584,8 @@ function send_eval_heartbeat(chunk_id::Int)
 end
 
 """Submit eval results for a completed chunk."""
-function submit_eval_results(chunk_id::Int, rewards, val_nn, val_opp, val_is_contact)
+function submit_eval_results(chunk_id::Int, rewards, val_nn, val_opp,
+                             val_is_contact, reward_is_contact)
     result = Dict(
         "chunk_id" => chunk_id,
         "client_name" => client.client_id,
@@ -1570,6 +1593,7 @@ function submit_eval_results(chunk_id::Int, rewards, val_nn, val_opp, val_is_con
         "value_nn" => val_nn,
         "value_opp" => val_opp,
         "value_is_contact" => val_is_contact,
+        "reward_is_contact" => reward_is_contact,
     )
     body = MsgPack.pack(result)
     for attempt in 1:3
@@ -1631,7 +1655,7 @@ Pre-creates per-thread agents (mutable MCTS tree) and wildbg backends
 Threads.@threads. Shared oracles are thread-safe (per-task buffers)."""
 function process_eval_chunk!(chunk_data::Dict)
     EVAL_POSITIONS === nothing && return
-    isempty(WILDBG_LIB_EVAL) && return
+    !WILDBG_AVAILABLE && return
 
     chunk_id = Int(chunk_data["chunk_id"])
     eval_iter = Int(chunk_data["eval_iter"])
@@ -1658,9 +1682,11 @@ function process_eval_chunk!(chunk_data::Dict)
     n_threads = EVAL_SESSION.n_threads
 
     rewards = Vector{Float64}(undef, n_games)
+    reward_is_contact = Vector{Bool}(undef, n_games)
     # Per-thread value sample collection (no locks needed)
     thread_val_nn = [Float64[] for _ in 1:n_threads]
     thread_val_opp = [Float64[] for _ in 1:n_threads]
+    thread_val_is_contact = [Bool[] for _ in 1:n_threads]
     t0 = time()
 
     # Heartbeat task
@@ -1695,14 +1721,17 @@ function process_eval_chunk!(chunk_data::Dict)
                     pos_idx = pos_start + job - 1
                     if pos_idx > length(EVAL_POSITIONS)
                         rewards[job] = 0.0
+                        reward_is_contact[job] = false
                     else
                         result = eval_game_from_position(
                             agent, wb, EVAL_POSITIONS[pos_idx], vo;
                             seed=chunk_id * 10000 + job, az_is_white=az_is_white)
                         rewards[job] = result.reward
+                        reward_is_contact[job] = result.is_contact
                         for s in result.value_samples
                             push!(thread_val_nn[wid], s.nn_val)
                             push!(thread_val_opp[wid], s.wb_val)
+                            push!(thread_val_is_contact[wid], s.is_contact)
                         end
                     end
                 end
@@ -1716,19 +1745,20 @@ function process_eval_chunk!(chunk_data::Dict)
     # Merge per-thread results
     val_nn = reduce(vcat, thread_val_nn)
     val_opp = reduce(vcat, thread_val_opp)
+    val_is_contact = reduce(vcat, thread_val_is_contact)
     # Robustness: keep only FINITE, PAIRED value samples before submit. A single
     # non-finite value (e.g. wildbg returning NaN/Inf on a contact position) or any
     # length skew otherwise breaks the server-side submit boundary check / MsgPack
     # round-trip / cor() aggregate — which is what was 400'ing the contact eval.
-    let m = min(length(val_nn), length(val_opp))
+    let m = min(length(val_nn), length(val_opp), length(val_is_contact))
         keep = [i for i in 1:m if isfinite(val_nn[i]) && isfinite(val_opp[i])]
         if length(keep) != length(val_nn) || length(keep) != length(val_opp)
             println("[EVAL] dropped $(max(length(val_nn),length(val_opp)) - length(keep)) non-finite/unpaired value samples before submit")
         end
         val_nn = val_nn[keep]
         val_opp = val_opp[keep]
+        val_is_contact = val_is_contact[keep]
     end
-    val_is_contact = fill(false, length(val_nn))
 
     t_chunk = time() - t0
     gpm = n_games / t_chunk * 60
@@ -1737,7 +1767,8 @@ function process_eval_chunk!(chunk_data::Dict)
     println("[EVAL] Chunk $chunk_id done: equity=$(round(avg_reward, digits=3)), win=$(round(win_pct, digits=1))%, $(round(t_chunk, digits=1))s ($(round(gpm, digits=0)) games/min)")
     flush(stdout)
 
-    submit_eval_results(chunk_id, rewards, val_nn, val_opp, val_is_contact)
+    submit_eval_results(chunk_id, rewards, val_nn, val_opp,
+                        val_is_contact, reward_is_contact)
 end
 
 #####
@@ -1764,6 +1795,7 @@ function main_loop()
     batch_num = 0
     batch_samples = []
     batch_games = 0
+    batch_search = BatchedMCTS.SearchMetrics()
     t_session_start = time()
     t_batch_start = time()
 
@@ -1797,8 +1829,18 @@ function main_loop()
         end
         while batch_games < UPLOAD_INTERVAL
             if isready(SAMPLE_CHANNEL)
-                game_samples = take!(SAMPLE_CHANNEL)
-                append!(batch_samples, game_samples)
+                game_result = take!(SAMPLE_CHANNEL)
+                append!(batch_samples, game_result.samples)
+                sm = game_result.search_metrics
+                batch_search.simulations += sm.simulations
+                batch_search.tree_hits += sm.tree_hits
+                batch_search.tree_misses += sm.tree_misses
+                batch_search.nn_evaluations += sm.nn_evaluations
+                batch_search.oracle_calls += sm.oracle_calls
+                batch_search.bearoff_hits += sm.bearoff_hits
+                batch_search.bearoff_misses += sm.bearoff_misses
+                batch_search.search_ns += sm.search_ns
+                batch_search.max_depth = max(batch_search.max_depth, sm.max_depth)
                 batch_games += 1
                 games_played += 1
             elseif isready(EVAL_CHANNEL)
@@ -1825,12 +1867,23 @@ function main_loop()
 
         # Queue upload + weight sync on background network thread (non-blocking)
         batch = samples_to_batch(batch_samples)
-        bytes = pack_samples(batch)
-        put!(UPLOAD_CHANNEL, bytes)
+        batch_id = next_batch_id!(client)
+        wire_metrics = SelfPlayMetrics(
+            batch_games, batch_search.simulations, batch_search.tree_hits,
+            batch_search.tree_misses, batch_search.nn_evaluations,
+            batch_search.oracle_calls, batch_search.bearoff_hits,
+            batch_search.bearoff_misses, batch_search.search_ns,
+            batch_search.max_depth)
+        bytes = pack_samples(batch; contract_fingerprint=CONTRACT_FINGERPRINT,
+                             batch_id=batch_id, metrics=wire_metrics,
+                             source_iteration=min(client.contact_iteration,
+                                                  client.race_iteration))
+        put!(UPLOAD_CHANNEL, (batch_id, bytes))
 
         # Reset batch
         batch_samples = []
         batch_games = 0
+        batch_search = BatchedMCTS.SearchMetrics()
         flush(stdout)
     end
 end

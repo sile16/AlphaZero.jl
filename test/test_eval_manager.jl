@@ -223,6 +223,10 @@ end
 
     # Value correlation: nn and opp are perfectly linearly related (nn = opp + 0.1)
     @test stats.value_corr ≈ 1.0 atol=1e-3
+    @test stats.contact_value_n == 3
+    @test stats.race_value_n == 1
+    @test stats.contact_value_mse ≈ 0.01 atol=1e-10
+    @test stats.race_value_mse == 0.0
 end
 
 @testset "finalize_eval empty" begin
@@ -231,6 +235,30 @@ end
     @test stats.num_games == 0
     @test stats.equity == 0.0
     @test stats.win_pct == 0.0
+    @test stats.contact_value_n == 0
+    @test stats.race_value_n == 0
+end
+
+@testset "submit rejects skewed value metadata" begin
+    job = create_eval_job(1, 1, 1; chunk_size=1)
+    @test_throws ArgumentError submit_chunk!(job,
+        EvalChunkResult(1, true, [0.0], [0.1], [0.2], Bool[]))
+    @test !job.chunks[1].completed
+end
+
+@testset "contact/race outcome grouping" begin
+    job = create_eval_job(2, 2, 1; chunk_size=2)
+    submit_chunk!(job, EvalChunkResult(1, true, [1.0, -1.0],
+        Float64[], Float64[], Bool[], Bool[true, false]))
+    submit_chunk!(job, EvalChunkResult(2, false, [2.0, -2.0],
+        Float64[], Float64[], Bool[], Bool[true, false]))
+    stats = finalize_eval(job)
+    @test stats.contact_games == 2
+    @test stats.race_games == 2
+    @test stats.contact_equity == 1.5
+    @test stats.race_equity == -1.5
+    @test stats.contact_win_pct == 1.0
+    @test stats.race_win_pct == 0.0
 end
 
 end # testset

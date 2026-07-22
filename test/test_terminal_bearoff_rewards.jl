@@ -14,6 +14,12 @@ using BackgammonNet
 using StaticArrays
 using Random
 
+const _BG_GAMES_DIR_TR = joinpath(@__DIR__, "..", "games")
+if !isdefined(Main, :BackgammonDeterministic)
+  include(joinpath(_BG_GAMES_DIR_TR, "backgammon-deterministic", "main.jl"))
+end
+const BGD_TR = Main.BackgammonDeterministic
+
 @testset "Terminal bearoff reward carries gammon multiplier" begin
   # White (P0): 14 borne off, 1 checker on point 24 — any die bears off.
   p0 = (UInt128(14) << (25 * 4)) | (UInt128(1) << (24 * 4))
@@ -24,8 +30,8 @@ using Random
               (UInt128(1) << 0)  # IDX_P1_OFF = 0
 
   for (p1, expected_reward) in [(p1_gammon, 2.0f0), (p1_simple, 1.0f0)]
-    g = BackgammonGame(p0, p1, SVector{2, Int8}(0, 0), Int8(0), Int8(0), false, 0.0f0;
-                       obs_type=:minimal_flat)
+    g = BGD_TR.backgammon_game(p0, p1, SVector{2, Int8}(0, 0), Int8(0), Int8(0), false, 0.0f0;
+                                observation_type=:minimal_flat)
     @test is_chance_node(g)
     sample_chance!(g, MersenneTwister(7))
     found_terminal = false
@@ -51,16 +57,16 @@ end
       (p1_single, 1.0f0, Float32[1, 0, 0, 0, 0], 1.0f0),
       (p1_gammon, 2.0f0, Float32[1, 1, 0, 0, 0], 2.0f0),
       (p1_bg, 3.0f0, Float32[1, 1, 1, 0, 0], 3.0f0)]
-    g = BackgammonGame(p0_off, p1, SVector{2, Int8}(0, 0), Int8(0), Int8(0), true, reward;
-                       obs_type=:minimal_flat)
+    g = BGD_TR.backgammon_game(p0_off, p1, SVector{2, Int8}(0, 0), Int8(0), Int8(0), true, reward;
+                                observation_type=:minimal_flat)
     heads = BackgammonNet.terminal_heads_target(g, 0)
     eq = Float32[heads.p_win, heads.p_gammon_win, heads.p_bg_win, heads.p_gammon_loss, heads.p_bg_loss]
     @test eq == expected_eq
     @test BackgammonNet.compute_equity_joint(heads) == expected_points
   end
 
-  cubed_single = BackgammonGame(p0_off, p1_single, SVector{2, Int8}(0, 0), Int8(0), Int8(0), true, 4.0f0;
-                                obs_type=:minimal_flat)
+  cubed_single = BGD_TR.backgammon_game(p0_off, p1_single, SVector{2, Int8}(0, 0), Int8(0), Int8(0), true, 4.0f0;
+                                         observation_type=:minimal_flat)
   cubed_single.cube_enabled = true
   cubed_single.cube_value = Int16(4)
   cubed_heads = BackgammonNet.terminal_heads_target(cubed_single, 0)
@@ -73,24 +79,15 @@ end
   struct _DummySpec <: AlphaZero.GI.AbstractGameSpec end
   @test AlphaZero.GI.reward_scale(_DummySpec()) == 1.0
   # Backgammon overrides to 3.0 (win/gammon/backgammon = ±1/±2/±3)
-  games_dir = joinpath(@__DIR__, "..", "games")
-  if !isdefined(Main, :BackgammonDeterministic)
-    include(joinpath(games_dir, "backgammon-deterministic", "main.jl"))
-  end
   @test AlphaZero.GI.reward_scale(Main.BackgammonDeterministic.GameSpec()) == 3.0
 end
 
 @testset "Backgammon GameOutcome ignores cube multiplier" begin
-  games_dir = joinpath(@__DIR__, "..", "games")
-  if !isdefined(Main, :BackgammonDeterministic)
-    include(joinpath(games_dir, "backgammon-deterministic", "main.jl"))
-  end
-
   p0_off = UInt128(15) << (25 * 4)
   p1_single = ((UInt128(14) << (1 * 4)) | UInt128(1))
   env = Main.BackgammonDeterministic.GameEnv(
-    BackgammonGame(p0_off, p1_single, SVector{2, Int8}(0, 0), Int8(0), Int8(0), true, 4.0f0;
-                   obs_type=:minimal_flat),
+    BGD_TR.backgammon_game(p0_off, p1_single, SVector{2, Int8}(0, 0), Int8(0), Int8(0), true, 4.0f0;
+                            observation_type=:minimal_flat),
     MersenneTwister(1),
   )
   env.game.cube_enabled = true

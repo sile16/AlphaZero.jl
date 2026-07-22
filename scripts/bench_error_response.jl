@@ -23,12 +23,10 @@ THEORY UNDER TEST (designed to falsify):
 Rung 6: measure regret(injector, eps, sims) on ~400 fixed non-trivial bearoff
 decision states. Rung 7: place a real race NN on the frozen-value curve.
 
-NOT git-committed; coexists with eval_race.jl (use --threads 8).
+Use a freshly validated, immutable race-position file and `--threads 8`.
 """
 
 using ArgParse
-include(joinpath(@__DIR__, "_backgammon_data_paths.jl"))
-
 function parse_cli()
     s = ArgParseSettings(description="MCTS error-response curves (rungs 6-7)", autofix_names=true)
     @add_arg_table! s begin
@@ -46,7 +44,7 @@ function parse_cli()
         "--blocks";          arg_type=Int;    default=5
         "--nn-mcts-iters";   arg_type=Int;    default=600
         "--skip-nn";         action=:store_true
-        "--out";             arg_type=String; default=joinpath(dirname(@__DIR__), "scratchpad", "error_response_results.jls")
+        "--out";             arg_type=String; default=joinpath(dirname(@__DIR__), "sessions", "validation", "error_response_results.jls")
     end
     return ArgParse.parse_args(s)
 end
@@ -91,11 +89,11 @@ const NOISE_MASK = UInt(length(NOISE_POOL) - 1)
     (g.p0, g.p1, g.dice[1], g.dice[2], g.remaining_actions, g.current_player)
 
 # ── Exact evaluator (white-relative, /3 normalized), mirrors the MCTS
-#    bearoff evaluator in eval_table_vs_wildbg.jl / selfplay_client.jl ─────
+#    production bearoff evaluator in selfplay_client.jl ───────────────────
 @inline function exact_white(game)::Union{Float64, Nothing}
     BearoffK7.is_bearoff_position(game.p0, game.p1) || return nothing
     if BackgammonNet.is_chance_node(game)
-        eq = Float64(BearoffK7.compute_equity(BearoffK7.lookup(TABLE, game))) / 3.0
+        eq = Float64(BackgammonNet.bearoff_equity(BearoffK7.lookup(TABLE, game))) / 3.0
         return game.current_player == 0 ? eq : -eq
     end
     acts = BackgammonNet.legal_actions(game)
@@ -145,19 +143,10 @@ end
 
 # ── Fixed eval-state generation (rollout race starts to bearoff decisions) ─
 function find_positions_file()
-    isempty(ARGS_D["positions_file"]) || return ARGS_D["positions_file"]
-    for f in [
-        backgammonnet_eval_data_file("race_starts_tuples_bootstrap_no_eval_no_bo.jls"),
-        backgammonnet_eval_data_file("race_starts_tuples_bootstrap_no_eval.jls"),
-        backgammonnet_eval_data_file("race_starts_tuples_no_eval.jls"),
-        backgammonnet_eval_data_file("race_starts_tuples.jls"),
-        joinpath(@__DIR__, "..", "eval_data", "race_starts_tuples_bootstrap_no_eval_no_bo.jls"),
-        joinpath(@__DIR__, "..", "eval_data", "race_starts_tuples_no_eval.jls"),
-        joinpath(@__DIR__, "..", "eval_data", "race_starts_tuples.jls"),
-    ]
-        isfile(f) && return f
-    end
-    error("No race starts file found; pass --positions-file")
+    path = ARGS_D["positions_file"]
+    isempty(path) && error("--positions-file is required; use a validated immutable race artifact")
+    isfile(path) || error("race positions file does not exist: $path")
+    return path
 end
 
 function generate_states()
@@ -180,8 +169,8 @@ function generate_states()
     for tup in shuffle(rng, tuples)
         length(out) >= want && break
         p0, p1, cp = tup[1], tup[2], tup[3]
-        g = BackgammonGame(p0, p1, SVector{2, Int8}(0, 0), Int8(0), Int8(cp), false, 0.0f0;
-                           obs_type=:minimal_flat)
+        g = backgammon_game(p0, p1, SVector{2, Int8}(0, 0), Int8(0), Int8(cp), false, 0.0f0;
+                            observation_type=:minimal_flat)
         for _ in 1:400
             g.terminated && break
             if BackgammonNet.is_chance_node(g)
@@ -434,7 +423,7 @@ function rung7(states, rung6res)
     println("\n" * "="^72)
     println("RUNG 7 — placing race NN on the frozen-value curve: $ckpt")
 
-    # NN oracle (value) — mirror eval_bearoff_accuracy.jl loading path
+    # NN oracle (value)
     @eval begin
         using AlphaZero: Network, FluxLib
         import Flux

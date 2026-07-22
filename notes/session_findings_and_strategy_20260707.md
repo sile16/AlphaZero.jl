@@ -1,4 +1,11 @@
-# Session Findings & Strategy — 2026-07-06/07
+# Archived Session Findings & Strategy — 2026-07-06/07
+
+> **Historical record — not current evidence.** GNUBG label and equity issues
+> discovered after this note was written put all engine-derived measurements,
+> trained artifacts, PR estimates, and play-strength conclusions below in
+> quarantine. They may be correct, but must be reproduced with validated
+> BackgammonNet artifacts and immutable evaluation manifests. See
+> [`docs/backgammon_status.md`](../docs/backgammon_status.md).
 
 Durable consolidation so nothing is lost across sessions. Companion to the detailed milestone log
 in `notes/design_decisions_20260706.md` and the auto-memory `project-status.md`.

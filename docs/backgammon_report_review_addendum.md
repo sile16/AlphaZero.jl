@@ -1,4 +1,10 @@
-# Review & Addendum: SOTA AlphaZero-Style Backgammon Report
+# Archived Review & Addendum: SOTA AlphaZero-Style Backgammon Report
+
+> **Background only.** This review predates the current BackgammonNet contract
+> and the discovery of GNUBG label/equity problems. Its literature discussion
+> remains useful, but its engine calibration numbers and project recommendations
+> are not validated project status. Use [`backgammon_status.md`](backgammon_status.md)
+> for current decisions.
 
 **Verdict:** The report is technically strong and the core recommendation — explicit-chance AlphaZero with afterstates, exact dice, and Gumbel root search — is the right call. The tree structure (decision/afterstate/chance), the "never max over dice" rule, duplicate-afterstate collapse, candidate-afterstate scoring, and paired-dice evaluation are all correct and well-prioritized. The stratified chance-selection formula argmax P(r)/(N\_r+1) even matches what DeepMind's mctx library implements internally for Stochastic MuZero.
 
@@ -179,4 +185,3 @@ Keep the architecture; amend the plan:
 22. **Rick Janowski. *Take-Points in Money Games / cubeful equity formulas.* 1993\.** Basis of GNUbg's cubeful equity calculation (cube-efficiency parameter x). See GNUbg manual, "Cubeful equities."  
 23. **GNU Backgammon manual & bearoff database documentation.** Bearoff DBs, rollout truncation, variance reduction, METs, Python scripting. [https://www.gnu.org/software/gnubg/manual/gnubg.html](https://www.gnu.org/software/gnubg/manual/gnubg.html)  
 24. **OpenSpiel (DeepMind).** Reference backgammon environment with explicit chance nodes. [https://github.com/google-deepmind/open\_spiel](https://github.com/google-deepmind/open_spiel)
-

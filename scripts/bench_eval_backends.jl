@@ -53,9 +53,6 @@ function parse_args()
         "--obs-type"
             arg_type = String
             default = "minimal_flat"
-        "--wildbg-lib"
-            arg_type = String
-            default = ""
         "--raw-positions"
             help = "Random positions used for raw oracle throughput"
             arg_type = Int
@@ -197,7 +194,7 @@ function main()
     println("Batch size: $(ARGS["batch_size"])")
     println("Backends: $(join(string.(backends), ", "))")
     println("Dual-model: $(race_net !== nothing)")
-    println("Note: use eval_vs_wildbg.jl or eval_race.jl for end-to-end game throughput")
+    println("Note: distributed evaluation clients report end-to-end game throughput")
     println()
 
     for backend_name in backends

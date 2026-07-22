@@ -11,6 +11,7 @@ Connects to the training server to:
 using HTTP
 using JSON
 using MsgPack
+using Random
 
 mutable struct SelfPlayClient
     server_url::String
@@ -21,10 +22,18 @@ mutable struct SelfPlayClient
     # Weight versioning
     contact_version::Int
     race_version::Int
+    contact_iteration::Int
+    race_iteration::Int
 
     # Upload batching
     upload_buffer::Vector{Any}
     upload_threshold::Int
+    process_nonce::String
+    batch_sequence::Int
+    contract_fingerprint::String
+    pending_batch_id::Union{Nothing,String}
+    pending_upload_bytes::Union{Nothing,Vector{UInt8}}
+    pending_upload_count::Int
 
     # Config from server
     config::Dict{String, Any}
@@ -40,8 +49,15 @@ function SelfPlayClient(server_url::String, api_key::String;
         client_id,
         client_type,
         0, 0,
+        0, 0,
         Any[],
         upload_threshold,
+        string(rand(UInt128); base=16),
+        0,
+        "",
+        nothing,
+        nothing,
+        0,
         Dict{String, Any}(),
     )
 end
@@ -66,6 +82,7 @@ function register!(client::SelfPlayClient; name::String=client.client_id,
         "git_commit" => git_commit,
         "eval_capable" => eval_capable,
         "has_wildbg" => has_wildbg,
+        "protocol_version" => DISTRIBUTED_PROTOCOL_VERSION,
     ))
     resp = HTTP.post("$(client.server_url)/api/register",
                      auth_headers(client),
@@ -73,11 +90,19 @@ function register!(client::SelfPlayClient; name::String=client.client_id,
                      status_exception=false)
     if resp.status != 200
         @warn "Registration failed" status=resp.status body=String(resp.body)
-        return (success=false, assigned_seed=nothing)
+        return (success=false, assigned_seed=nothing,
+                contract_fingerprint=nothing)
     end
     result = JSON.parse(String(resp.body))
     seed = get(result, "assigned_seed", nothing)
-    return (success=true, assigned_seed=seed)
+    fingerprint = get(result, "contract_fingerprint", nothing)
+    return (success=true, assigned_seed=seed,
+            contract_fingerprint=fingerprint)
+end
+
+function next_batch_id!(client::SelfPlayClient)
+    client.batch_sequence += 1
+    return "$(client.client_id)-$(client.process_nonce)-$(client.batch_sequence)"
 end
 
 """Fetch self-play config from server."""
@@ -145,6 +170,7 @@ function sync_weights!(client::SelfPlayClient, contact_network, race_network)
             header, weights = result
             FluxLib.load_weights!(contact_network, weights)
             client.contact_version = version["contact_version"]
+            client.contact_iteration = Int(header.iteration)
             updated = true
             @info "Updated contact weights" version=client.contact_version iteration=header.iteration
         end
@@ -156,6 +182,7 @@ function sync_weights!(client::SelfPlayClient, contact_network, race_network)
             header, weights = result
             FluxLib.load_weights!(race_network, weights)
             client.race_version = version["race_version"]
+            client.race_iteration = Int(header.iteration)
             updated = true
             @info "Updated race weights" version=client.race_version iteration=header.iteration
         end
@@ -173,11 +200,40 @@ function buffer_samples!(client::SelfPlayClient, samples::Vector)
 end
 
 """Upload all buffered samples to server."""
-function flush_samples!(client::SelfPlayClient)
-    isempty(client.upload_buffer) && return 0
+function prepare_pending_upload!(client::SelfPlayClient)
+    isempty(client.upload_buffer) && return nothing
+    if isnothing(client.pending_upload_bytes)
+        client.pending_upload_count = length(client.upload_buffer)
+        batch = samples_to_batch(client.upload_buffer[1:client.pending_upload_count])
+        client.pending_batch_id = next_batch_id!(client)
+        client.pending_upload_bytes = pack_samples(
+            batch; contract_fingerprint=client.contract_fingerprint,
+            batch_id=client.pending_batch_id,
+            source_iteration=min(client.contact_iteration, client.race_iteration))
+    end
+    return (batch_id=client.pending_batch_id::String,
+            bytes=client.pending_upload_bytes::Vector{UInt8},
+            n=client.pending_upload_count)
+end
 
-    batch = samples_to_batch(client.upload_buffer)
-    bytes = pack_samples(batch)
+function acknowledge_pending_upload!(client::SelfPlayClient, batch_id::AbstractString,
+                                     accepted::Integer)
+    client.pending_batch_id == batch_id || error(
+        "Acknowledged batch $batch_id does not match pending $(client.pending_batch_id)")
+    accepted == client.pending_upload_count || error(
+        "Server acknowledged $accepted of $(client.pending_upload_count) samples " *
+        "for batch $batch_id")
+    deleteat!(client.upload_buffer, 1:Int(accepted))
+    client.pending_batch_id = nothing
+    client.pending_upload_bytes = nothing
+    client.pending_upload_count = 0
+    return Int(accepted)
+end
+
+function flush_samples!(client::SelfPlayClient)
+    pending = prepare_pending_upload!(client)
+    pending === nothing && return 0
+    batch_id, bytes, n_uploaded = pending
 
     headers = vcat(auth_headers(client),
                    ["Content-Type" => "application/msgpack"])
@@ -186,17 +242,16 @@ function flush_samples!(client::SelfPlayClient)
                      bytes;
                      status_exception=false)
 
-    n_uploaded = length(client.upload_buffer)
-    empty!(client.upload_buffer)
-
     if resp.status != 200
         @warn "Sample upload failed" status=resp.status n_samples=n_uploaded
         return 0
     end
 
     result = JSON.parse(String(resp.body))
+    accepted = Int(result["accepted"])
+    acknowledge_pending_upload!(client, batch_id, accepted)
     @debug "Uploaded samples" accepted=result["accepted"] buffer_size=result["buffer_size"]
-    return result["accepted"]
+    return accepted
 end
 
 """Get server status."""

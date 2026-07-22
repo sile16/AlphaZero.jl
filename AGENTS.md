@@ -5,11 +5,23 @@ BackgammonNet source files into AlphaZero or include them by path.
 
 ## Current Contract
 
-- Required BackgammonNet version: `0.6.4+`.
+- Required BackgammonNet version: `0.7.0+` (Julia 1.12.6+).
 - Backgammon value-head contract: use `BackgammonNet.VALUE_HEAD_CONTRACT`,
   `BackgammonNet.VALUE_HEAD_ORDER`, and `BackgammonNet.check_probability_contract`.
 - Equity perspective is side-to-move unless a local API explicitly says
   white-relative.
+- The AlphaZero ML wrapper always exposes the standard 21 dice outcomes,
+  including the first playable roll. Initial-player selection is resolved
+  uniformly during setup rather than represented as an MCTS chance node.
+- `BACKGAMMON_TAVLA_ENABLED=true` enables Tavla scoring independently of that
+  ML opening convention; it is disabled by default.
+- Distributed clients must match the server's versioned ML contract fingerprint
+  (observation/value/action/chance/rule settings) before producing samples.
+- Sample uploads use idempotent batch IDs and must be retried without discarding
+  local samples until the server acknowledges the batch.
+- GNUBG, Wildbg, and BGBlitz integration/capability logic belongs in
+  BackgammonNet. AlphaZero should call its public backend APIs rather than
+  copying or reimplementing bridge code.
 - Bearoff table generation and runtime lookup code belongs in BackgammonNet.
 - Canonical local bearoff artifact root is:
   - `../BackgammonNet.jl/data/bearoff/`
@@ -17,19 +29,30 @@ BackgammonNet source files into AlphaZero or include them by path.
 Expected table subdirectories:
 
 - `bearoff_k7_twosided`
-- `bearoff_n18`
+- `bearoff_n15_bundle_v3`
+
+Bearoff coverage is a two-tier `CombinedBearoff`: the exact money-optimal k7
+two-sided table (both sides' rearmost ≤ 7 from off) plus the n15 one-sided race
+bundle (`BearoffOneSidedCompact.CompactBundle`) that extends the exact race
+frontier beyond k7. The superseded n18 one-sided table and
+`default_bearoff_onesided_dir()` were removed from BackgammonNet.
 
 Use the BackgammonNet helpers instead of hardcoded paths:
 
 - `BackgammonNet.default_bearoff_root()`
 - `BackgammonNet.default_bearoff_k7_dir()`
-- `BackgammonNet.default_bearoff_onesided_dir()`
+- `BackgammonNet.default_bearoff_n15_dir()`
+
+Build the combined table with `BackgammonNet.load_combined_bearoff(; k7_dir,
+n15_dir)` when both tiers are required, or `CombinedBearoff(k7,
+BearoffOneSidedCompact.CompactBundle(n15_dir))` when the n15 tier is optional and
+k7-only is an acceptable fallback (the self-play client uses the latter).
 
 Environment overrides are reserved for unusual deployments:
 
 - `BACKGAMMONNET_BEAROFF_DIR`
 - `BACKGAMMONNET_BEAROFF_K7_DIR`
-- `BACKGAMMONNET_BEAROFF_ONESIDED_DIR`
+- `BACKGAMMONNET_BEAROFF_N15_DIR`
 
 ## Active Distributed Code
 
@@ -42,15 +65,18 @@ The active distributed training stack is:
 Legacy archive trees were removed. Use git history for old launchers and
 experiments.
 
+The authoritative project status, evidence policy, and revalidation queue are
+in `docs/backgammon_status.md`. Dated files under `notes/` are historical and
+must not be used as current evidence.
+
 ## Cube Scope
 
 BackgammonNet supports cube, match equity tables, Janowski conversion, and
 rule-aware search values. The current `games/backgammon-deterministic/`
-AlphaZero wrapper exposes BackgammonNet's unified 680-action space:
-checker actions `1:676` plus no-double/double/take/pass cube actions
-`677:680`. Money-play cube is disabled by default for initial checker-only
-training and can be enabled with `BACKGAMMON_CUBE_ENABLED=true`; the policy
-head size stays 680 either way.
+AlphaZero wrapper uses BackgammonNet's checker-policy head-local space:
+checker actions `1:676`. BackgammonNet's engine IDs remain unified at 680
+actions (cube IDs `677:680`), but the current AlphaZero network has no split
+cube-policy heads. Keep `BACKGAMMON_CUBE_ENABLED=false` for this wrapper.
 
 # Goal 1
 Train a NN that outputs value and policy for board positions for Race positions that uses MCTS for better tree search of best moves.

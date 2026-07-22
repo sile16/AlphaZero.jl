@@ -16,6 +16,35 @@ function dummy_oracle(state)
     return policy, 0.0f0
 end
 
+dummy_batch_oracle(states) = [dummy_oracle(state) for state in states]
+
+@testset "Batched MCTS observability counters" begin
+    params = MctsParams(
+        num_iters_per_turn=16, cpuct=1.5, temperature=ConstSchedule(0.0),
+        dirichlet_noise_ϵ=0.0, dirichlet_noise_α=1.0)
+    player = BatchedMCTS.BatchedMctsPlayer(
+        TTT, dummy_oracle, params; batch_size=4,
+        batch_oracle=dummy_batch_oracle,
+        rng=Random.Xoshiro(42))
+    env = GI.init(TTT)
+    actions, policy = BatchedMCTS.think(player, env)
+    @test length(actions) == length(policy)
+
+    metrics = BatchedMCTS.search_metrics(player)
+    @test metrics.simulations == 16
+    @test metrics.tree_hits > 0
+    @test metrics.tree_misses > 0
+    @test metrics.nn_evaluations > 0
+    @test metrics.oracle_calls > 0
+    @test metrics.nn_evaluations >= metrics.oracle_calls
+    @test metrics.search_ns > 0
+    @test metrics.max_depth > 0
+
+    taken = BatchedMCTS.take_search_metrics!(player)
+    @test taken.simulations == 16
+    @test BatchedMCTS.search_metrics(player).simulations == 0
+end
+
 @testset "play_game() Integration" begin
 
     @testset "MCTS vs MCTS completes game" begin

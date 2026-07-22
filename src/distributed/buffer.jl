@@ -8,6 +8,8 @@ Columnar storage with circular write semantics:
 - Lock held only during memcpy, not during deserialization
 """
 
+using Random
+
 """Columnar PER buffer with circular write semantics.
 
 Pre-allocates all storage at construction time. New samples overwrite
@@ -22,6 +24,7 @@ mutable struct PERBuffer
     is_chance::Vector{Bool}       # (capacity,)
     is_contact::Vector{Bool}      # (capacity,)
     is_bearoff::Vector{Bool}      # (capacity,)
+    source_iterations::Vector{Int32} # producing weight iteration (-1 = unknown/bootstrap)
 
     # PER priorities
     priorities::Vector{Float32}   # (capacity,)
@@ -58,6 +61,7 @@ function PERBuffer(capacity::Int, state_dim::Int, num_actions::Int;
         fill(false, capacity),
         fill(false, capacity),
         fill(false, capacity),
+        fill(Int32(-1), capacity),
         ones(Float32, capacity),     # Initial priority = 1.0
         zeros(UInt32, capacity),     # generation (0 = never written)
         capacity, 0, 1,
@@ -67,7 +71,7 @@ function PERBuffer(capacity::Int, state_dim::Int, num_actions::Int;
 end
 
 """
-    reset!(buf::PERBuffer)
+    reset_buffer!(buf::PERBuffer)
 
 Reset a PER buffer to a fully empty state, under the buffer lock.
 
@@ -76,6 +80,7 @@ Post-conditions (the reset invariant):
 - Every stored column is zeroed (states, policies, values, equities) and every
   boolean flag cleared (has_equity, is_chance, is_contact, is_bearoff), so no
   stale sample can be read even by a reader that ignores `size`.
+- `source_iterations` reset to -1 (unknown/bootstrap provenance).
 - `priorities` reset to 1.0 (uniform) — a partial reset that left stale
   priorities would bias PER sampling toward overwritten slots.
 - `generation` is INCREMENTED, not zeroed: an in-flight reanalysis that captured
@@ -89,7 +94,7 @@ only at rare transitions (the bootstrap→self-play flush), never per iteration,
 and it removes an entire class of stale-read bugs regardless of reader
 discipline — worth the one-time cost.
 """
-function reset!(buf::PERBuffer)
+function reset_buffer!(buf::PERBuffer)
     lock(buf.lock) do
         fill!(buf.states, 0.0f0)
         fill!(buf.policies, 0.0f0)
@@ -99,6 +104,7 @@ function reset!(buf::PERBuffer)
         fill!(buf.is_chance, false)
         fill!(buf.is_contact, false)
         fill!(buf.is_bearoff, false)
+        fill!(buf.source_iterations, Int32(-1))
         fill!(buf.priorities, 1.0f0)
         buf.generation .+= UInt32(1)
         buf.size = 0
@@ -112,13 +118,13 @@ end
 """
     clear_for_selfplay!(buf::PERBuffer)
 
-Semantic alias for [`reset!`](@ref), used at the bootstrap→self-play transition.
+Clear the replay buffer at the bootstrap→self-play transition.
 After the bootstrap-training phase the replay buffer still holds bootstrap-
 sourced samples that anchor the model to the teacher's level; clearing it forces
-subsequent training to draw only from fresh self-play data. See `reset!` for the
+subsequent training to draw only from fresh self-play data. See `reset_buffer!` for the
 exact invariant established.
 """
-clear_for_selfplay!(buf::PERBuffer) = reset!(buf)
+clear_for_selfplay!(buf::PERBuffer) = reset_buffer!(buf)
 
 """Add columnar samples directly from a SampleBatch (no NamedTuple allocation).
 
@@ -132,9 +138,13 @@ function per_add_batch!(buf::PERBuffer, batch_states::AbstractMatrix{Float32},
                         batch_is_chance::AbstractVector{Bool},
                         batch_is_contact::AbstractVector{Bool},
                         batch_is_bearoff::AbstractVector{Bool};
-                        initial_priority::Float32=1.0f0)
+                        initial_priority::Float32=1.0f0,
+                        source_iteration::Integer=-1)
     n = length(batch_values)
     n == 0 && return
+    -1 <= source_iteration <= typemax(Int32) || throw(ArgumentError(
+        "source_iteration must be -1 or a non-negative Int32 value (got $source_iteration)"))
+    source_iteration_i32 = Int32(source_iteration)
 
     # Validate dims BEFORE the @inbounds copy below. Batches arrive from
     # possibly-untrusted / stale clients (a worker on an older git commit or a
@@ -172,6 +182,7 @@ function per_add_batch!(buf::PERBuffer, batch_states::AbstractMatrix{Float32},
                 buf.is_chance[pos] = batch_is_chance[i]
                 buf.is_contact[pos] = batch_is_contact[i]
                 buf.is_bearoff[pos] = batch_is_bearoff[i]
+                buf.source_iterations[pos] = source_iteration_i32
                 buf.priorities[pos] = initial_priority
                 buf.generation[pos] += UInt32(1)
             end
@@ -193,7 +204,8 @@ end
 Uses precomputed cumulative sum + binary search for O(batch_size * log(n)) sampling.
 
 Indices are into the buffer's column positions (1:buf.size)."""
-function per_sample(buf::PERBuffer, batch_size::Int, alpha::Float32, epsilon::Float32)
+function per_sample(buf::PERBuffer, batch_size::Int, alpha::Float32, epsilon::Float32;
+                    rng::AbstractRNG=Random.default_rng())
     lock(buf.lock) do
         n = buf.size
         n < batch_size && error("Buffer too small ($n < $batch_size)")
@@ -211,7 +223,7 @@ function per_sample(buf::PERBuffer, batch_size::Int, alpha::Float32, epsilon::Fl
         # Proportional sampling via binary search on cumsum
         indices = Vector{Int}(undef, batch_size)
         for j in 1:batch_size
-            r = rand(Float32) * total
+            r = rand(rng, Float32) * total
             lo, hi = 1, n
             while lo < hi
                 mid = (lo + hi) >>> 1
@@ -245,7 +257,8 @@ Given `subset_indices` (e.g. contact-only or race-only indices from partition_in
 samples `batch_size` entries proportional to their PER priorities.
 Returns (sampled_buf_indices, importance_weights)."""
 function per_sample_partition(buf::PERBuffer, subset_indices::Vector{Int},
-                              batch_size::Int, alpha::Float32, epsilon::Float32)
+                              batch_size::Int, alpha::Float32, epsilon::Float32;
+                              rng::AbstractRNG=Random.default_rng())
     n = length(subset_indices)
     n < batch_size && error("Subset too small ($n < $batch_size)")
 
@@ -268,7 +281,7 @@ function per_sample_partition(buf::PERBuffer, subset_indices::Vector{Int},
     # Proportional sampling via binary search on cumsum
     local_indices = Vector{Int}(undef, batch_size)
     for j in 1:batch_size
-        r = rand(Float32) * total
+        r = rand(rng, Float32) * total
         lo, hi = 1, n
         while lo < hi
             mid = (lo + hi) >>> 1
@@ -336,8 +349,10 @@ function extract_batch(buf::PERBuffer, indices::Vector{Int})
         is_chance = buf.is_chance[indices]
         is_contact = buf.is_contact[indices]
         is_bearoff = buf.is_bearoff[indices]
+        source_iterations = buf.source_iterations[indices]
         generations = buf.generation[indices]
-        (; states, policies, values, equities, has_equity, is_chance, is_contact, is_bearoff, generations)
+        (; states, policies, values, equities, has_equity, is_chance, is_contact,
+           is_bearoff, source_iterations, generations)
     end
 end
 
@@ -422,6 +437,7 @@ function save_buffer(buf::PERBuffer, path::String)
     lock(buf.lock) do
         n = buf.size
         data = Dict{String, Any}(
+            "schema_version" => 1,
             "states"     => buf.states[:, 1:n],
             "policies"   => buf.policies[:, 1:n],
             "values"     => buf.values[1:n],
@@ -430,6 +446,7 @@ function save_buffer(buf::PERBuffer, path::String)
             "is_chance"   => buf.is_chance[1:n],
             "is_contact"  => buf.is_contact[1:n],
             "is_bearoff"  => buf.is_bearoff[1:n],
+            "source_iterations" => buf.source_iterations[1:n],
             "priorities"  => buf.priorities[1:n],
             "size"        => n,
             "write_pos"   => buf.write_pos,
@@ -446,8 +463,13 @@ end
 """Load buffer state from disk, restoring into an existing PERBuffer."""
 function load_buffer!(buf::PERBuffer, path::String)
     data = Serialization.deserialize(path)
+    get(data, "schema_version", 0) == 1 || throw(ArgumentError(
+        "unsupported replay-buffer checkpoint schema; legacy checkpoints cannot be resumed"))
+    haskey(data, "source_iterations") || throw(ArgumentError(
+        "replay-buffer checkpoint is missing sample provenance"))
     n = data["size"]::Int
-    @assert n <= buf.capacity "Saved buffer size ($n) exceeds capacity ($(buf.capacity))"
+    n <= buf.capacity || throw(ArgumentError(
+        "saved buffer size ($n) exceeds capacity ($(buf.capacity))"))
 
     lock(buf.lock) do
         buf.states[:, 1:n]    .= data["states"]
@@ -458,6 +480,7 @@ function load_buffer!(buf::PERBuffer, path::String)
         buf.is_chance[1:n]    .= data["is_chance"]
         buf.is_contact[1:n]   .= data["is_contact"]
         buf.is_bearoff[1:n]   .= data["is_bearoff"]
+        buf.source_iterations[1:n] .= data["source_iterations"]
         buf.priorities[1:n]   .= data["priorities"]
         buf.size = n
         buf.write_pos = data["write_pos"]::Int
