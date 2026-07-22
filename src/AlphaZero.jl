@@ -123,7 +123,7 @@ module AlphaZero
   # MuZero-style reanalysis for improved sample efficiency
   include("reanalyze.jl")
   export ReanalyzeConfig, ReanalyzeStats
-  export reanalyze_step!, get_reanalyze_metrics
+  export get_reanalyze_metrics
   export sample_for_reanalysis, sample_for_smart_reanalysis, count_stale_samples
 
   # Utilities to train the neural network based on collected samples

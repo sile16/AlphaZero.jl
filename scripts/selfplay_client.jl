@@ -142,7 +142,14 @@ include(joinpath(@__DIR__, "..", "src", "distributed", "protocol.jl"))
 include(joinpath(@__DIR__, "..", "src", "distributed", "client.jl"))
 
 # Connect to server and get config
-client_name = isempty(ARGS["client_name"]) ? lowercase(gethostname()) : ARGS["client_name"]
+# Default client_name MUST be unique per process: the server derives each
+# client's RNG seed from a hash of the client_id, so two default-named worker
+# processes on the same host would otherwise get identical seeds and generate
+# 100% duplicate games. Append the PID so concurrent processes differ; a stable
+# PID also keeps reconnects idempotent. Pass --client-name to override (e.g. for
+# a deliberately reproducible single-worker run).
+client_name = isempty(ARGS["client_name"]) ?
+    "$(lowercase(gethostname()))-$(Base.Libc.getpid())" : ARGS["client_name"]
 client = SelfPlayClient(SERVER_URL, ARGS["api_key"];
                         client_id=client_name, upload_threshold=ARGS["upload_interval"] * 200)
 

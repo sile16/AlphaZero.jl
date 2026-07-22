@@ -40,7 +40,7 @@ mutable struct SelfPlayClient
 end
 
 function SelfPlayClient(server_url::String, api_key::String;
-                        client_id::String="julia-$(gethostname())",
+                        client_id::String="julia-$(gethostname())-$(Base.Libc.getpid())",
                         client_type::String="julia",
                         upload_threshold::Int=5000)
     SelfPlayClient(

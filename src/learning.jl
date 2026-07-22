@@ -237,8 +237,10 @@ function losses(nn, params, Wmean, Hp, batch)
     zero(Lv) :
     creg * sum(sum(w .* w) for w in regws)
 
-  # Invalid action penalty: ONLY for decision nodes
-  Linv = iszero(cinv) ?
+  # Invalid action penalty: ONLY for decision nodes. Guard the zero-decision
+  # case like the policy loss above — an all-chance-node mini-batch makes
+  # sum(W_decision)==0, and wmean's 0/0 would return NaN and poison the loss.
+  Linv = (iszero(cinv) || sum(W_decision) == 0) ?
     zero(Lv) :
     cinv * wmean(p_invalid, W_decision)
 
