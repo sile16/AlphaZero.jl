@@ -12,7 +12,6 @@ module AlphaZero
   using DataStructures: CircularBuffer
   using Distributions: Categorical, Dirichlet
   using Statistics: mean
-  using Requires
 
 
   # Even when using the Knet backend, we use utilities from Flux such as
@@ -65,12 +64,8 @@ module AlphaZero
 
   # Training params
   include("params.jl")
-  export Params
   export MctsParams
-  export SimParams
-  export SelfPlayParams
   export LearningParams
-  export ArenaParams
   export MemAnalysisParams
   export ProgressiveSimParams, compute_sim_budget
   export TurnProgressiveSimParams, compute_turn_sim_budget, compute_ramp_turns

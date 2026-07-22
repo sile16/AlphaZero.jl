@@ -900,8 +900,8 @@ end
 """
     BatchedMctsPlayer{B} <: AbstractPlayer
 
-A player that uses batched MCTS for improved GPU utilization.
-Similar to MctsPlayer but batches neural network evaluations.
+A player that uses batched MCTS for improved GPU utilization, batching neural
+network evaluations across simulations.
 """
 mutable struct BatchedMctsPlayer{B, T, F} <: Function
     benv::B

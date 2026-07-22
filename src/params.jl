@@ -71,118 +71,6 @@ In the original AlphaGo Zero paper:
 end
 
 """
-    SimParams
-
-Parameters for parallel game simulations.
-
-These parameters are common to self-play data generation, neural network evaluation
-and benchmarking.
-
-| Parameter            | Type                  | Default        |
-|:---------------------|:----------------------|:---------------|
-| `num_games`          | `Int`                 |  -             |
-| `num_workers`        | `Int`                 |  -             |
-| `batch_size `        | `Int`                 |  -             |
-| `use_gpu`            | `Bool`                | `false`        |
-| `fill_batches`       | `Bool`                | `true`         |
-| `flip_probability`   | `Float64`             | `0.`           |
-| `reset_every`        | `Union{Nothing, Int}` | `1`            |
-| `alternate_colors`   | `Float64`             | `false`        |
-
-## Explanations
-
-  + On each machine (process), `num_workers` simulation tasks are spawned. Inference
-    requests are processed by an inference server by batch of size `batch_size`. Note that
-    we must have `batch_size <= num_workers`.
-  + If `fill_batches` is set to `true`, we make sure that batches sent to the
-    neural network for inference have constant size.
-  + Both players are reset (e.g. their MCTS trees are emptied)
-    every `reset_every` games (or never if `nothing` is passed).
-  + To add randomization and before every game turn, the game board is "flipped"
-    according to a symmetric transformation with probability `flip_probability`.
-  + In the case of (symmetric) two-player games and if `alternate_colors` is set to`true`,
-    then the colors of both players are swapped between each simulated game.
-"""
-@kwdef struct SimParams
-  num_games :: Int
-  num_workers :: Int
-  batch_size :: Int
-  use_gpu :: Bool = false
-  fill_batches :: Bool = true
-  reset_every :: Union{Nothing, Int} = 1
-  flip_probability :: Float64 = 0.
-  alternate_colors :: Bool = false
-  # Async batching parameters (for better parallelism)
-  use_async_batchifier :: Bool = false
-  async_min_batch :: Int = 1
-  async_timeout_ns :: Int = 1_000_000  # 1ms default
-end
-
-"""
-    ArenaParams
-
-Parameters that govern the evaluation process that compares
-the current neural network with the best one seen so far
-(which is used to generate data).
-
-| Parameter            | Type                  | Default        |
-|:---------------------|:----------------------|:---------------|
-| `mcts`               | [`MctsParams`](@ref)  |  -             |
-| `sim`                | [`SimParams`](@ref)   |  -             |
-| `update_threshold`   | `Float64`             |  -             |
-| `always_replace`     | `Bool`                | `false`        |
-
-# Explanation (two-player games)
-
-+ The two competing networks are instantiated into two MCTS players
-  of parameter `mcts` and then play `sim.num_games` games.
-+ The evaluated network replaces the current best one if its
-  average collected reward is greater or equal than `update_threshold`.
-
-# Explanation (single-player games)
-
-+ The two competing networks play `sim.num_games` games each.
-+ The evaluated network replaces the current best one if its average collected rewards
-  exceeds the average collected reward of the old one by `update_threshold` at least. 
-
-# Remarks
-
-+ See [`necessary_samples`](@ref) to make an informed choice for `sim.num_games`.
-
-# AlphaGo Zero Parameters
-
-In the original AlphaGo Zero paper, 400 games are played to evaluate a network
-and the `update_threshold` parameter is set to a value that corresponds to a
-55% win rate.
-"""
-@kwdef struct ArenaParams
-  mcts :: MctsParams
-  sim :: SimParams
-  update_threshold :: Float64
-  always_replace :: Bool = false  # If true, always replace network (eval is just for tracking)
-end
-
-"""
-    SelfPlayParams
-
-Parameters governing self-play.
-
-| Parameter            | Type                                 | Default        |
-|:---------------------|:-------------------------------------|:---------------|
-| `mcts`               | [`MctsParams`](@ref)                 |  -             |
-| `sim`                | [`SimParams`](@ref)                  |  -             |
-
-# AlphaGo Zero Parameters
-
-In the original AlphaGo Zero paper, `sim.num_games=25_000` (5 millions games
-of self-play across 200 iterations).
-"""
-@kwdef struct SelfPlayParams
-  mcts :: MctsParams
-  sim :: SimParams
-end
-
-"""
     SamplesWeighingPolicy
 
 During self-play, early board positions are possibly encountered many
@@ -226,9 +114,7 @@ batches of size `batch_size` drawn from memory, where `n` is defined as follows:
 n = min(max_batches_per_checkpoint, ntotal ÷ min_checkpoints_per_epoch)
 ```
 
-with `ntotal` the total number of batches in memory. Between each series,
-the current network is evaluated against the best network so far
-(see [`ArenaParams`](@ref)).
+with `ntotal` the total number of batches in memory.
 
 + `nonvalidity_penalty` is the multiplicative constant of a loss term that
    corresponds to the average probability weight that the network puts on
@@ -402,73 +288,8 @@ function compute_turn_sim_budget(params::TurnProgressiveSimParams, turn::Int, it
   end
 end
 
-"""
-    Params
 
-The AlphaZero training hyperparameters.
-
-| Parameter                  | Type                                         | Default   |
-|:---------------------------|:---------------------------------------------|:----------|
-| `self_play`                | [`SelfPlayParams`](@ref)                     |  -        |
-| `learning`                 | [`LearningParams`](@ref)                     |  -        |
-| `arena`                    | `Union{Nothing, ArenaParams}`                |  -        |
-| `memory_analysis`          | `Union{Nothing, MemAnalysisParams}`          | `nothing` |
-| `progressive_sim`          | `Union{Nothing, ProgressiveSimParams}`       | `nothing` |
-| `turn_progressive_sim`     | `Union{Nothing, TurnProgressiveSimParams}`   | `nothing` |
-| `num_iters`                | `Int`                                        |  -        |
-| `use_symmetries`           | `Bool`                                       | `false`   |
-| `ternary_outcome`          | `Bool`                                       | `false`   |
-| `mem_buffer_size`          | `PLSchedule{Int}`                            |  -        |
-
-# Explanation
-
-The AlphaZero training process consists in `num_iters` iterations. Each
-iteration can be decomposed into a self-play phase
-(see [`SelfPlayParams`](@ref)) and a learning phase
-(see [`LearningParams`](@ref)).
-
-  - `ternary_outcome`: set to `true` to enable the computation of ternary
-     (win/loss/draw) statistics, where the white player is considered a winner
-     if they obtain a positive discounted cumulative reward. This flag is used
-     by logging and profiling tools to display such statistics. When set to `false`,
-     only the average reward and redundancy statistics are computed and displayed.
-  - `use_symmetries`: if set to `true`, board symmetries are used for
-     data augmentation before learning.
-  - `mem_buffer_size`: size schedule of the memory buffer, in terms of number
-     of samples. It is typical to start with a small memory buffer that is grown
-     progressively so as to wash out the initial low-quality self-play data
-     more quickly.
-  - `memory_analysis`: parameters for the memory analysis step that is
-     performed at each iteration (see [`MemAnalysisParams`](@ref)), or
-     `nothing` if no analysis is to be performed.
-  - `progressive_sim`: parameters for iteration-based progressive simulation budget
-     (see [`ProgressiveSimParams`](@ref)), or `nothing` to use constant
-     simulation budget from `self_play.mcts.num_iters_per_turn`.
-  - `turn_progressive_sim`: parameters for turn-based progressive simulation budget
-     (see [`TurnProgressiveSimParams`](@ref)), which varies simulations based on
-     game turn number AND iteration. Takes precedence over `progressive_sim` if set.
-
-# AlphaGo Zero Parameters
-
-In the original AlphaGo Zero paper:
-- About 5 millions games of self-play are played across 200 iterations.
-- The memory buffer contains 500K games, which makes about 100M samples
-  as an average game of Go lasts about 200 turns.
-"""
-@kwdef struct Params
-  self_play :: SelfPlayParams
-  memory_analysis :: Union{Nothing, MemAnalysisParams} = nothing
-  progressive_sim :: Union{Nothing, ProgressiveSimParams} = nothing
-  turn_progressive_sim :: Union{Nothing, TurnProgressiveSimParams} = nothing
-  learning :: LearningParams
-  arena :: Union{Nothing, ArenaParams}
-  num_iters :: Int
-  use_symmetries :: Bool = false
-  ternary_outcome :: Bool = false
-  mem_buffer_size :: PLSchedule{Int}
-end
-
-for T in [MctsParams, SimParams, ArenaParams, SelfPlayParams, LearningParams, Params]
+for T in [MctsParams, LearningParams]
   Util.generate_update_constructor(T) |> eval
 end
 
@@ -489,34 +310,3 @@ This bound is based on [Hoeffding's inequality
 """
 necessary_samples(ϵ, β) = log(1 / β) / (2 * ϵ^2)
 
-#####
-##### Consistency checking
-#####
-
-# This function checks for inconsistencies in the parameters.
-# It returns a pair of lists of strings: `(errors, warnings)`.
-# TODO: add more consistency checks.
-function check_params(gspec::AbstractGameSpec, p::Params)
-  errors = String[]
-  warns = String[]
-  # Collecting all relevant params
-  mctss = [p.self_play.mcts]
-  sims = [p.self_play.sim]
-  if !isnothing(p.arena)
-    push!(mctss, p.arena.mcts)
-    push!(sims, p.arena.sim)
-  end
-  if any(sim.batch_size > sim.num_workers for sim in sims)
-    push!(errors,
-      "The number of simulation workers must be " *
-      "greater or equal than the inference batch size.")
-  end
-  # Detecing non-provided symmetries
-  if any(sim.flip_probability != 0 for sim in sims)
-    state = GI.current_state(GI.init(gspec))
-    if isempty(GI.symmetries(gspec, state))
-      push!(errors, "You must specify some game symmetries to use flip_probability>0.")
-    end
-  end
-  return (errors, warns)
-end

@@ -119,9 +119,9 @@ end
 """
     create_player(agent::MctsAgent)
 
-Create an MCTS player for the game. Uses `BatchedMctsPlayer` for the fast
-passthrough chance-mode path and falls back to the classic `MctsPlayer` when
-advanced stochastic chance handling is requested.
+Create a `BatchedMctsPlayer` for the game. Supports the batched chance modes
+(`:passthrough`, `:full`, `:exact_expectation`); any other mode fails loud (the
+classic single-threaded MctsPlayer was removed with the upstream framework).
 """
 function create_player(agent::MctsAgent; rng::Random.AbstractRNG=Random.Xoshiro(rand(UInt)))
     cm = agent.mcts_params.chance_mode

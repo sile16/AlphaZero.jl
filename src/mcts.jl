@@ -133,8 +133,7 @@ mechanism.
 A superior alternative is to add a random bias to the neural prior for the root
 node during MCTS exploration: instead of considering the policy ``p`` output
 by the neural network in the UCT formula, one uses ``(1-ϵ)p + ϵη`` where ``η``
-is drawn once per call to [`MCTS.explore!`](@ref) from a Dirichlet distribution
-of parameter ``α``.
+is drawn once per root search from a Dirichlet distribution of parameter ``α``.
 """
 mutable struct Env{State, Tree, ChanceTree, Oracle, R, Spec}
   # Store (nonterminal) state statistics assuming the white player is to play
@@ -216,8 +215,8 @@ end
 
 Return the recommended stochastic policy on the current state.
 
-A call to this function must always be preceded by
-a call to [`MCTS.explore!`](@ref).
+A call to this function must always be preceded by search that populates the
+tree for this state (e.g. `BatchedMCTS.batched_explore!`).
 """
 function policy(env::Env, game)
   state = GI.current_state(game)
@@ -225,7 +224,7 @@ function policy(env::Env, game)
     try env.tree[state]
     catch e
       if isa(e, KeyError)
-        error("MCTS.explore! must be called before MCTS.policy")
+        error("MCTS.policy called before the tree was populated for this state")
       else
         rethrow(e)
       end
