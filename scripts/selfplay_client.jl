@@ -460,7 +460,7 @@ function make_bearoff_evaluator(tables)
 
         best_value = table_kind === :k7 ?
             BackgammonNet.bearoff_best_move_value(tables.k7, bg) :
-            BearoffTables.n15_best_move_value(tables.n15, bg)
+            BearoffTables.n15_root_best_move_value(tables.k7, tables.n15, bg)
         if best_value == -Inf
             return nothing
         end

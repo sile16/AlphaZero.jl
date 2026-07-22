@@ -4,7 +4,8 @@ import BackgammonNet
 
 export RuntimeTables, parse_table_selection, validate_table_release,
        load_runtime_tables, exact_k7_covers, exact_k7_lookup,
-       n15_covers, n15_lookup, n15_turn_value_equity, n15_best_move_value
+       n15_covers, n15_lookup,
+       n15_root_turn_value_equity, n15_root_best_move_value
 
 const TABLE_SELECTIONS = ("none", "k7", "n15", "k7+n15")
 
@@ -152,8 +153,11 @@ end
     return Float64(BackgammonNet.compute_equity_joint(heads)), heads
 end
 
-function n15_turn_value_equity(table::BackgammonNet.BearoffOneSidedCompact.CompactBundle,
-                               game, mover::Integer)
+"""Score an n15-root continuation, preferring concrete k7 at every boundary."""
+function n15_root_turn_value_equity(
+        k7::Union{Nothing,BackgammonNet.BearoffK7.BearoffTable},
+        n15::BackgammonNet.BearoffOneSidedCompact.CompactBundle,
+        game, mover::Integer)
     boundary_value = function(state)
         if state.terminated
             heads = BackgammonNet.terminal_heads_target(state, mover)
@@ -161,26 +165,34 @@ function n15_turn_value_equity(table::BackgammonNet.BearoffOneSidedCompact.Compa
                      heads.p_gammon_loss, heads.p_bg_loss)
             return Float64(BackgammonNet.compute_equity_joint(tuple)), tuple
         end
-        BackgammonNet.BearoffOneSidedCompact.covers(table, state.p0, state.p1) || error(
-            "n15 does not cover a turn boundary reached from an n15-covered state")
-        result = BackgammonNet.BearoffOneSidedCompact.lookup(table, state)
+        result = if k7 !== nothing &&
+                    BackgammonNet.BearoffK7.is_bearoff_position(state.p0, state.p1)
+            BackgammonNet.BearoffK7.lookup(k7, state)
+        elseif BackgammonNet.BearoffOneSidedCompact.covers(n15, state.p0, state.p1)
+            BackgammonNet.BearoffOneSidedCompact.lookup(n15, state)
+        else
+            error("neither configured k7 nor n15 covers a turn boundary reached " *
+                  "from an n15-covered root")
+        end
         return _heads_for_mover(result, state, mover)
     end
     return BackgammonNet.turn_aware_best(game, mover, boundary_value; objective=first)
 end
 
-function n15_best_move_value(table::BackgammonNet.BearoffOneSidedCompact.CompactBundle,
-                             game)::Float64
+function n15_root_best_move_value(
+        k7::Union{Nothing,BackgammonNet.BearoffK7.BearoffTable},
+        n15::BackgammonNet.BearoffOneSidedCompact.CompactBundle,
+        game)::Float64
     (game.terminated || BackgammonNet.is_chance_node(game) ||
      game.phase != BackgammonNet.PHASE_CHECKER_PLAY) && error(
-        "n15_best_move_value requires a checker-play state")
+        "n15_root_best_move_value requires a checker-play state")
     mover = Int(game.current_player)
     best = -Inf
     work = BackgammonNet.clone(game)
     for action in BackgammonNet.legal_actions(game)
         BackgammonNet.copy_state!(work, game)
         BackgammonNet.apply_legal_action!(work, action)
-        value, _ = n15_turn_value_equity(table, work, mover)
+        value, _ = n15_root_turn_value_equity(k7, n15, work, mover)
         best = max(best, value)
     end
     return best

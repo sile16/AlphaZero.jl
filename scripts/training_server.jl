@@ -208,6 +208,10 @@ function parse_args()
             help = "Validated BackgammonNet backgammon_training_v4 artifact (raw checker action equities). Legacy sample formats are rejected."
             arg_type = String
             default = ""
+        "--bootstrap-rows"
+            help = "Checker rows to consume from --bootstrap-file: all, contact, race, or exact-race. Selection is explicit and artifact metadata is checked for compatibility."
+            arg_type = String
+            default = "all"
         "--bootstrap-max-samples"
             help = "Max samples to load from bootstrap file (0 = all, capped at buffer capacity)"
             arg_type = Int
@@ -302,6 +306,10 @@ end
 const ARGS = parse_args()
 ARGS["eval_backend_quality"] in ("min", "low", "high", "max") ||
     error("--eval-backend-quality must be min, low, high, or max")
+ARGS["training_mode"] in ("dual", "race") ||
+    error("--training-mode must be dual or race")
+ARGS["bootstrap_rows"] in ("all", "contact", "race", "exact-race") ||
+    error("--bootstrap-rows must be one of: all, contact, race, exact-race")
 ARGS["bearoff_tables"] in ("none", "k7", "n15", "k7+n15") ||
     error("--bearoff-tables must be one of: none, k7, n15, k7+n15")
 ARGS["mcts_budget_mode"] in ("constant", "progressive", "turn_progressive") ||
@@ -344,6 +352,7 @@ if !isempty(ARGS["eval_positions_file"])
 end
 if !isempty(ARGS["bootstrap_file"])
     println("Bootstrap: $(ARGS["bootstrap_file"])")
+    println("Bootstrap rows: $(ARGS["bootstrap_rows"])")
     if ARGS["bootstrap_max_samples"] > 0
         println("Bootstrap max: $(ARGS["bootstrap_max_samples"])")
     end
@@ -953,6 +962,7 @@ const LEARNING_PARAMS = LearningParams(
 # PER buffer (columnar, pre-allocated)
 replay_buffer = PERBuffer(BUFFER_CAPACITY, _state_dim, NUM_ACTIONS;
                            beta_init=PER_BETA_INIT, annealing_iters=ARGS["total_iterations"])
+const BOOTSTRAP_SELECTION_INFO = Ref{Any}(nothing)
 
 # Bootstrap artifacts are accepted only through BackgammonNet's fail-closed
 # backgammon_training_v4 loader. Historical vectors and raw columnar dumps are
@@ -965,8 +975,41 @@ if !isempty(ARGS["bootstrap_file"])
         println("\nLoading canonical bootstrap artifact from: $bootstrap_path")
         flush(stdout)
         artifact = BackgammonNet.load_training_artifact(bootstrap_path)
-        checker_indices = BootstrapContract.bootstrap_checker_indices(
-            artifact, ARGS["training_mode"])
+        selection = BootstrapContract.select_bootstrap_rows(
+            artifact, ARGS["training_mode"], ARGS["bootstrap_rows"])
+        checker_indices = selection.indices
+        BOOTSTRAP_SELECTION_INFO[] = Dict{String,Any}(
+            "selector" => selection.selector,
+            "artifact_kind" => selection.artifact_kind,
+            "artifact_role" => selection.artifact_role,
+            "teacher_policy" => selection.teacher_policy,
+            "teacher_ply" => selection.teacher_ply,
+            "engine_value" => selection.engine_value,
+            "engine_policy" => selection.engine_policy,
+            "engine_cube" => selection.engine_cube,
+            "game_mode" => selection.game_mode,
+            "source_mode" => selection.source_mode,
+            "source_selector" => selection.source_selector,
+            "exact_table_identity" => selection.exact_table_identity,
+            "variant_id" => selection.variant_id,
+            "block_id" => selection.block_id,
+            "producer_repo_commit" => selection.producer_repo_commit,
+            "selected_rows" => selection.selected_rows,
+            "selected_contact" => selection.selected_contact,
+            "selected_race" => selection.selected_race,
+            "artifact_rows" => selection.artifact_rows,
+        )
+        println("  Artifact kind=$(selection.artifact_kind), role=$(selection.artifact_role), " *
+                "teacher_policy=$(selection.teacher_policy)")
+        println("  Engines: value=$(selection.engine_value), " *
+                "policy=$(selection.engine_policy), cube=$(selection.engine_cube)")
+        println("  Dataset mode=$(selection.game_mode), source_mode=$(selection.source_mode), " *
+                "source_selector=$(selection.source_selector)")
+        println("  Artifact block=$(selection.block_id), variant=$(selection.variant_id), " *
+                "teacher_ply=$(selection.teacher_ply), " *
+                "producer_repo_commit=$(selection.producer_repo_commit)")
+        println("  Explicit selector=$(selection.selector): rows=$(selection.selected_rows), " *
+                "contact=$(selection.selected_contact), race=$(selection.selected_race)")
         if !isempty(artifact.cube_states)
             @warn "Skipping $(length(artifact.cube_states)) cube-policy samples: " *
                   "the current AlphaZero network has only the 676-way checker head"
@@ -1495,6 +1538,8 @@ const SERVER_CONFIG = Dict{String, Any}(
     "bearoff_hard_targets" => ARGS["bearoff_hard_targets"],
     "bearoff_truncation" => ARGS["bearoff_truncation"],
     "bootstrap_only" => ARGS["bootstrap_only"],
+    "bootstrap_rows" => ARGS["bootstrap_rows"],
+    "bootstrap_selection" => BOOTSTRAP_SELECTION_INFO[],
     "training_mode" => ARGS["training_mode"],
     "start_positions_file" => basename(ARGS["start_positions_file"]),
     "eval_positions_file" => basename(ARGS["eval_positions_file"]),

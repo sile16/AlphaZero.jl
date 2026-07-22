@@ -32,7 +32,32 @@ include(joinpath(@__DIR__, "..", "src", "distributed", "bootstrap_contract.jl"))
         @test BearoffTables.n15_covers(tables, n15_game)
         @test BearoffTables.n15_lookup(tables, n15_game) !== nothing
         BackgammonNet.set_dice!(n15_game, 3, 1)
-        @test isfinite(BearoffTables.n15_best_move_value(tables.n15, n15_game))
+        @test isfinite(BearoffTables.n15_root_best_move_value(
+            tables.k7, tables.n15, n15_game))
+
+        # Root is n15-only, but both completed-turn successors enter k7. The
+        # upstream recursion must re-check concrete coverage at each boundary
+        # and use exact k7 there instead of retaining the root's n15 tier.
+        transition = BackgammonNet.initial_state(first_player=0)
+        transition.p0 = (UInt128(1) << (17 << 2)) | # one checker at distance 8
+                        (UInt128(14) << (24 << 2))  # fourteen at distance 1
+        transition.p1 = UInt128(15) << (6 << 2)
+        transition.current_player = Int8(0)
+        BackgammonNet.set_dice!(transition, 2, 1)
+        @test !BearoffTables.exact_k7_covers(tables, transition)
+        @test BearoffTables.n15_covers(tables, transition)
+        exact_values = Float64[]
+        for action in BackgammonNet.legal_actions(transition)
+            successor = BackgammonNet.clone(transition)
+            BackgammonNet.apply_legal_action!(successor, action)
+            @test BackgammonNet.is_chance_node(successor)
+            @test BearoffTables.exact_k7_covers(tables, successor)
+            value, _ = BackgammonNet.bearoff_turn_value_equity(
+                tables.k7, successor, Int(transition.current_player))
+            push!(exact_values, value)
+        end
+        @test BearoffTables.n15_root_best_move_value(
+            tables.k7, tables.n15, transition) == maximum(exact_values)
 
         k7_game = BackgammonNet.initial_state(first_player=0)
         k7_game.p0 = UInt128(15) << (18 << 2) # distance 7
@@ -46,11 +71,25 @@ include(joinpath(@__DIR__, "..", "src", "distributed", "bootstrap_contract.jl"))
     end
 end
 
-function fixture_data(kind; role="train", race_indices=Int32[])
+function fixture_data(kind; role="train", race_indices=Int32[],
+                      teacher_policy="fixture_teacher",
+                      producer_repo_commit=repeat("a", 40),
+                      engine_value="gnubg-2ply", engine_policy="gnubg-2ply",
+                      engine_cube="gnubg-2ply", game_mode="money",
+                      source_mode="canonical_relabel",
+                      source_selector="contact_close_calls")
     return (
         metadata=Dict{String,Any}(
             "artifact_kind" => kind,
             "artifact_role" => role,
+            "teacher_policy" => teacher_policy,
+            "producer_repo_commit" => producer_repo_commit,
+            "engine_value" => engine_value,
+            "engine_policy" => engine_policy,
+            "engine_cube" => engine_cube,
+            "game_mode" => game_mode,
+            "source_mode" => source_mode,
+            "source_selector" => source_selector,
         ),
         race_candidate_indices=race_indices,
     )
@@ -58,20 +97,61 @@ end
 
 @testset "bootstrap family routing" begin
     states = fill(nothing, 5)
-    select(data, mode) = BootstrapContract._bootstrap_checker_indices(
-        data, states, mode; validate_positions=false)
+    select(data, mode, rows) = BootstrapContract._select_bootstrap_rows(
+        data, states, mode, rows; validate_positions=false)
 
-    @test select(fixture_data("race_exact_k7"), "race") == collect(1:5)
-    @test select(fixture_data("race_natural_exact_k7"), "dual") == collect(1:5)
-    @test_throws ArgumentError select(fixture_data("full_game_gnubg"), "race")
-    @test_throws ArgumentError select(fixture_data("contact_gnubg"), "race")
-    @test select(fixture_data("full_game_gnubg";
-                              race_indices=Int32[2, 5]), "dual") == [1, 3, 4]
-    @test select(fixture_data("contact_gnubg"), "dual") == collect(1:5)
+    exact = select(fixture_data("race_exact_k7"), "race", "exact-race")
+    @test exact.indices == collect(1:5)
+    @test exact.selected_race == 5
+    @test exact.teacher_policy == "fixture_teacher"
+    @test exact.producer_repo_commit == repeat("a", 40)
+    @test length(exact.producer_repo_commit) == 40
+    @test exact.engine_value == "gnubg-2ply"
+    @test exact.engine_policy == "gnubg-2ply"
+    @test exact.engine_cube == "gnubg-2ply"
+    @test exact.game_mode == "money"
+    @test exact.source_mode == "canonical_relabel"
+    @test exact.source_selector == "contact_close_calls"
+    @test select(fixture_data("race_natural_exact_k7"), "dual", "race").indices ==
+          collect(1:5)
+
+    full = fixture_data("full_game_gnubg"; race_indices=Int32[2, 5])
+    @test select(full, "dual", "all").indices == collect(1:5)
+    @test select(full, "dual", "contact").indices == [1, 3, 4]
+    @test select(full, "dual", "race").indices == [2, 5]
+    @test select(full, "race", "race").indices == [2, 5]
+    @test_throws ArgumentError select(full, "race", "all")
+    @test_throws ArgumentError select(full, "dual", "exact-race")
+
+    contact = fixture_data("contact_gnubg")
+    @test select(contact, "dual", "all").indices == collect(1:5)
+    @test select(contact, "dual", "contact").indices == collect(1:5)
+    @test_throws ArgumentError select(contact, "dual", "race")
+    @test_throws ArgumentError select(contact, "race", "all")
+
     @test_throws ErrorException select(fixture_data("full_game_gnubg";
-                                                    race_indices=Int32[2, 2]), "dual")
+                                                    race_indices=Int32[2, 2]),
+                                             "dual", "all")
     @test_throws ErrorException select(fixture_data("full_game_gnubg";
-                                                    race_indices=Int32[6]), "dual")
-    @test_throws ArgumentError select(fixture_data("race_exact_k7"; role="eval"), "race")
-    @test_throws ArgumentError select(fixture_data("unknown"), "dual")
+                                                    race_indices=Int32[6]),
+                                             "dual", "all")
+    for role in ("eval", "spot_eval")
+        @test_throws ArgumentError select(
+            fixture_data("race_exact_k7"; role), "race", "exact-race")
+    end
+    @test select(fixture_data("race_exact_k7"; role="bootstrap"),
+                 "race", "exact-race").artifact_role == "bootstrap"
+    @test_throws ArgumentError select(fixture_data("unknown"), "dual", "all")
+    @test_throws ArgumentError select(full, "dual", "automatic")
+
+    contact_game = BackgammonNet.initial_state(first_player=0)
+    race_game = BackgammonNet.initial_state(first_player=0)
+    race_game.p0 = UInt128(15) << (18 << 2)
+    race_game.p1 = UInt128(15) << (7 << 2)
+    BackgammonNet.set_dice!(race_game, 0, 0)
+    validated = BootstrapContract._select_bootstrap_rows(
+        fixture_data("full_game_gnubg"; race_indices=Int32[2]),
+        [contact_game, race_game], "dual", "all")
+    @test validated.selected_contact == 1
+    @test validated.selected_race == 1
 end

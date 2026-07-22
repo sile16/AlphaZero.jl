@@ -23,6 +23,14 @@ and live/independent audit lanes and verify the artifact is included in a
 `backgammon_artifact_manifest_v2` release. Pre-reset artifacts and reports are
 quarantined as documented in [`backgammon_status.md`](backgammon_status.md).
 
+Pair `--bootstrap-file` with an explicit `--bootstrap-rows` choice: `all`,
+`contact`, `race`, or `exact-race`. `race` accepts approved race rows from any
+compatible artifact teacher, including a full-game gnubg artifact;
+`exact-race` requires an exact-k7 race artifact. The server records the artifact
+kind, role, teacher policy/ply, descriptive value/policy/cube engines, game and
+source-selection modes, variant, block, producer repository commit, and selected
+contact/race row counts in its run configuration.
+
 ## Health and draining
 
 - `GET /api/health` is a liveness check.

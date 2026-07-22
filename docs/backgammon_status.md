@@ -20,10 +20,12 @@ Consumed changes (all landed, full test suite green except the deferred item):
   calls the selected concrete table directly; local optional-table discovery
   and combined fallback dispatch were removed. Only exact k7 may emit hard or
   truncation targets. Coherent E(R,R) n15 values are runtime MCTS leaves only.
-- **Bootstrap family routing.** Race-only bootstrap accepts only
-  `race_exact_k7` and `race_natural_exact_k7`. Dual-mode ingestion removes the
-  complete `race_candidate_indices` set from full-game gnubg artifacts, so
-  gnubg-labeled race rows cannot enter the race network.
+- **Bootstrap family routing.** Bootstrap ingestion uses rows explicitly chosen
+  with `--bootstrap-rows=all|contact|race|exact-race`.
+  `race` is teacher-neutral and may intentionally consume the authoritative
+  `race_candidate_indices` from a full-game gnubg artifact; `exact-race`
+  requires an exact-k7 race artifact. Artifact kind, role, teacher policy, and
+  selected contact/race counts are recorded in server configuration.
 - **Cubeless money `:auto`.** `search_value(g, heads; mode=:auto)` is now cubeless
   for money play even with the cube enabled. The 676-head wrapper keeps the cube
   disabled, so the oracle value is the cubeless money equity; the inference

@@ -46,7 +46,15 @@ Use the BackgammonNet helpers instead of hardcoded paths:
 
 Upstream code must check each concrete configured table's coverage and invoke
 that table's lookup directly. Do not recreate an implicit combined/fallback
-table. k7 takes precedence when both configured tables cover a position.
+table. k7 takes precedence when both configured tables cover a position,
+including a completed-turn boundary reached from an n15-only root.
+
+Bootstrap row choice is an explicit ML concern, separate from teacher approval.
+`training_server.jl --bootstrap-rows=all|contact|race|exact-race` selects rows
+from an artifact whose schema and provenance BackgammonNet has already accepted.
+`race` may intentionally consume gnubg-labeled full-game race rows;
+`exact-race` requires an exact-k7 race artifact. Evaluation roles are never
+training inputs, and `training_mode=race` must not select contact rows.
 
 Environment overrides are reserved for unusual deployments:
 

@@ -14,8 +14,6 @@ module AlphaZero
   using Statistics: mean
 
 
-  # Even when using the Knet backend, we use utilities from Flux such as
-  # `Flux.batch` and `Flux.DataLoader`
   import Flux
 
   # When running on a CPU, having multiple threads does not play
@@ -96,27 +94,10 @@ module AlphaZero
   include("learning.jl")
   export split_equity_targets
 
-  # We provide a library of standard network, both in Knet and Flux.
-  # Which backend is used to implement this library is determined during precompilation
-  # based on the value of the ALPHAZERO_DEFAULT_DL_FRAMEWORK environment variable.
-  const DEFAULT_DL_FRAMEWORK = get(ENV, "ALPHAZERO_DEFAULT_DL_FRAMEWORK", "FLUX")
-
-  if DEFAULT_DL_FRAMEWORK == "FLUX"
-    # @info "Using the Flux implementation of AlphaZero.NetLib."
-    @eval begin
-      include("networks/flux.jl")
-      const NetLib = FluxLib
-    end
-  elseif DEFAULT_DL_FRAMEWORK == "KNET"
-    error("The Knet backend is currently not available, due to Knet not supporting the latest versions of Julia and CUDA.")
-    @info "Using the Knet implementation of AlphaZero.NetLib."
-    @eval begin
-      include("networks/knet.jl")
-      const NetLib = KnetLib
-    end
-  else
-    error("Unknown DL framework: $(DEFAULT_DL_FRAMEWORK)")
-  end
+  # NetLib is the Flux-based standard network library. The historical Knet
+  # backend was removed with the upstream framework; only Flux is supported.
+  include("networks/flux.jl")
+  const NetLib = FluxLib
 
   using .NetLib
   export NetLib
