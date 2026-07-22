@@ -137,26 +137,31 @@ manifest remain authoritative.
 
 ## Current validation snapshot
 
-### 2026-07-22 — Jarvis compatibility (post-migration, BackgammonNet HEAD, NOT frozen)
+### 2026-07-22 — Jarvis + Neo compatibility (post-migration, BackgammonNet HEAD, NOT frozen)
 
-After the API consumption migration, the full AlphaZero test suite is green (0
-failures; the v4 artifact integration test is intentionally skipped) and the
-no-training Jarvis server preflight passed all **11 checks**:
+After the API consumption migration, **both machines are green and contract-matched**:
 
-- Julia `1.12.6`; AlphaZero clean.
-- BackgammonNet `0.7.0` at commit
-  `18e171875b0f166ecbd1841e11362cc45837658d`, clean checkout.
-- ML contract fingerprint
-  `8c3cc18431da9f58718025fc65f7f0c8c3a2988e9e66624eb6bca3486339a84c`;
-  config fingerprint `f2de25b8…`.
+- **Full test suite green on both** (0 failures; the v4 artifact integration test
+  is intentionally skipped) — Jarvis (x86/CUDA) and Neo (M3/ARM, CPU,
+  `--gcthreads=1`).
+- **No-training server preflight passed all 11 checks on both machines.**
+- Identical ML contract fingerprint on both:
+  `8c3cc18431da9f58718025fc65f7f0c8c3a2988e9e66624eb6bca3486339a84c`
+  (config fingerprint differs by machine, as expected).
+- Julia `1.12.6`; AlphaZero clean; BackgammonNet `0.7.0` at commit
+  `456beced8b9457e68307f0b6d3894e887dea7685` ("Validate relabel contract in
+  source lineage"), clean on both. The contract fingerprint is stable across the
+  `18e1718 → 456beced` validator commit (verified by re-running preflight), i.e.
+  that commit is contract-neutral.
 - state dimension **366** (was 352 — observation encoding changed in the
   BackgammonNet update), checker actions 676, chance outcomes 21.
 
 This is a compatibility check against **current BackgammonNet HEAD, which is NOT
-the frozen verified release**. It establishes plumbing/invariants only — no
-artifact quality or model strength. Re-pin the frozen release commit +
-fingerprint and re-run preflight on both machines once the release lands (P1
-TODO). **Neo preflight still pending.** The prior snapshot below is historical.
+the frozen verified release** (BackgammonNet is still in final artifact
+verification). It establishes plumbing/invariants and cross-machine client
+compatibility only — no artifact quality or model strength. Re-pin the frozen
+release commit + fingerprint and re-run preflight on both machines once the
+release lands (P1 TODO). The prior snapshot below is historical.
 
 > **SUPERSEDED (2026-07-16 snapshot).** Pins BackgammonNet `0.7.0` at commit
 > `65eb189…` with state dim 352 and fingerprint `a6e6cf10…` — both changed in the
