@@ -144,9 +144,10 @@ manifest remain authoritative.
 
 ## Current validation snapshot
 
-### 2026-07-22 — Jarvis + Neo compatibility (post-migration, BackgammonNet HEAD, NOT frozen)
+### 2026-07-23 — Jarvis + Neo compatibility (post-shed/dep-prune, BackgammonNet HEAD, NOT frozen)
 
-After the API consumption migration, **both machines are green and contract-matched**:
+After the framework shed + dependency prune, **both machines are green and
+contract-matched** against the current BackgammonNet HEAD:
 
 - **Full test suite green on both** (0 failures; the v4 artifact integration test
   is intentionally skipped) — Jarvis (x86/CUDA) and Neo (M3/ARM, CPU,
@@ -155,20 +156,27 @@ After the API consumption migration, **both machines are green and contract-matc
 - Identical ML contract fingerprint on both:
   `8c3cc18431da9f58718025fc65f7f0c8c3a2988e9e66624eb6bca3486339a84c`
   (config fingerprint differs by machine, as expected).
-- Julia `1.12.6`; AlphaZero clean; BackgammonNet `0.7.0` at commit
-  `456beced8b9457e68307f0b6d3894e887dea7685` ("Validate relabel contract in
-  source lineage"), clean on both. The contract fingerprint is stable across the
-  `18e1718 → 456beced` validator commit (verified by re-running preflight), i.e.
-  that commit is contract-neutral.
-- state dimension **366** (was 352 — observation encoding changed in the
-  BackgammonNet update), checker actions 676, chance outcomes 21.
+- Julia `1.12.6`; AlphaZero clean at `7b8c1e8`; BackgammonNet `0.7.0` at commit
+  `db6fed1a4e1e` ("Record current release validation evidence"), clean on both.
+  **The contract fingerprint has been stable across every BackgammonNet commit we
+  have checked** (`18e1718 → 456beced → db6fed1`, incl. "Harden teacher labels and
+  simplify release paths") — all contract-neutral. AlphaZero's direct deps were
+  also pruned 43 → 24 with no effect on the contract.
+- state dimension **366**, checker actions 676, chance outcomes 21.
+- **Bearoff tables validated** on both machines: the local `k7` + `n15` dirs match
+  BackgammonNet's `db6fed1` pinned release identity
+  (`K7_TABLE_RELEASE` / `N15_BUNDLE_V3_RELEASE`, size + hash) via
+  `BearoffTables.validate_table_release("k7+n15")`. (Neo also carries stray
+  `n12`/`n13` bundle dirs; they are correctly ignored — the explicit
+  `--bearoff-tables` selection never enables a table by mere file presence.)
 
 This is a compatibility check against **current BackgammonNet HEAD, which is NOT
-the frozen verified release** (BackgammonNet is still in final artifact
-verification). It establishes plumbing/invariants and cross-machine client
-compatibility only — no artifact quality or model strength. Re-pin the frozen
-release commit + fingerprint and re-run preflight on both machines once the
-release lands (P1 TODO). The prior snapshot below is historical.
+the frozen verified release** (BackgammonNet is still recording release-validation
+evidence). It establishes plumbing/invariants, cross-machine client compatibility,
+and bearoff-table integrity only — no artifact quality or model strength. Re-pin
+the frozen release commit + fingerprint and re-run preflight on both machines once
+the release lands (P1 TODO); training/eval corpora are not yet present. The prior
+snapshot below is historical.
 
 > **SUPERSEDED (2026-07-16 snapshot).** Pins BackgammonNet `0.7.0` at commit
 > `65eb189…` with state dim 352 and fingerprint `a6e6cf10…` — both changed in the
